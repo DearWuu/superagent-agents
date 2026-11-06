@@ -17,7 +17,6 @@ import plugin, {
   ctxWarningText,
   isContextOverLimit,
   readContextClaim,
-  resetCollabSwitchCache,
   shouldCheckContext,
 } from "./server"
 
@@ -44,7 +43,7 @@ type ScannerOptions = {
   roots?: Record<string, string>
   configured?: boolean
   claim?: (sessionID: string, tokens: number) => boolean
-  enabled?: () => boolean
+  rootIsEnabled?: (rootID: string) => Promise<boolean>
   sendError?: boolean
 }
 
@@ -61,7 +60,7 @@ function scannerHarness(options: ScannerOptions) {
       prompts.push({ sessionID, text })
     },
     claim: options.claim ?? (() => true),
-    enabled: options.enabled,
+    rootIsEnabled: options.rootIsEnabled,
     log: (record) => logs.push(record),
     now: () => NOW,
   })
@@ -76,7 +75,6 @@ function tempState() {
   process.env.SUPERAGENT_STATE_DIR = dir
   process.env.SUPERAGENT_HOOK_LOG = path.join(dir, "hook.log")
   process.env.XDG_CONFIG_HOME = dir
-  resetCollabSwitchCache()
   return dir
 }
 
@@ -85,7 +83,6 @@ afterEach(() => {
   delete process.env.SUPERAGENT_STATE_DIR
   delete process.env.SUPERAGENT_HOOK_LOG
   delete process.env.XDG_CONFIG_HOME
-  resetCollabSwitchCache()
 })
 
 beforeEach(() => {
@@ -160,7 +157,7 @@ describe("shouldCheckContext 跳过条件", () => {
 })
 
 describe("createCtxWarningScanner", () => {
-  test("总开关关闭时不列会话、不发提醒", async () => {
+  test("root 停用时跳过该 root，但整轮仍列会话（不按全局布尔整轮跳过）", async () => {
     let listed = 0
     const prompts: any[] = []
     const scanner = createCtxWarningScanner({
@@ -169,14 +166,14 @@ describe("createCtxWarningScanner", () => {
         return [child({ time: { busy: NOW - 500 } })]
       },
       resolveRoot: async () => "ses_root",
+      rootIsEnabled: async () => false,
       rootIsConfigured: async () => true,
       readTokens: async () => 400_000,
       sendWarn: async (root, text) => prompts.push({ root, text }),
       log: () => {},
-      enabled: () => false,
     })
     expect(await scanner.scan()).toBe(0)
-    expect(listed).toBe(0)
+    expect(listed).toBe(1)
     expect(prompts).toHaveLength(0)
   })
 

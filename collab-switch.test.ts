@@ -1,58 +1,40 @@
 /** @jsxImportSource @opentui/solid */
 /**
- * 协作模式总开关：TUI 与 server 两侧各自读同一份配置文件，
- * 停用时服务端钩子全部短路（不拦截、不计数、不切换、不复核、不探针）。
+ * 协作模式总开关按 family root 会话隔离：
+ *  - 开关值是该 root 的 `superagent.collab-enabled` 指令条目；
+ *  - root A 停用不影响 root B；同 root 子代理继承；
+ *  - 缺省、值异常、读取失败都按启用处理（fail-open）。
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
 import plugin, {
-  COLLAB_SWITCH_TTL_MS,
-  collabEnabled,
-  collabSwitchPath,
-  createProbeScanner,
-  readCollabSwitch,
-  readCollabSwitchState,
-  resetCollabSwitchCache,
+  COLLAB_ENABLED_KEY,
   PROBE_AFTER_MS,
+  collabEnabledFromEntries,
+  createCtxWarningScanner,
+  createProbeScanner,
+  readCollabState,
 } from "./server"
 
 mock.module("@opencode/plugin/tui", () => ({ Plugin: { define: (value: unknown) => value } }))
 const tui = await import("./index")
 
 let root: string
-const saved: Record<string, string | undefined> = {}
-
-function setEnv(key: string, value: string | undefined) {
-  saved[key] = process.env[key]
-  if (value === undefined) delete process.env[key]
-  else process.env[key] = value
-}
 
 beforeEach(() => {
   root = mkdtempSync(path.join(tmpdir(), "superagent-collab-"))
-  setEnv("XDG_CONFIG_HOME", path.join(root, "config"))
-  setEnv("XDG_STATE_HOME", path.join(root, "state"))
-  setEnv("SUPERAGENT_HOOK_LOG", path.join(root, "hook.log"))
-  setEnv("SUPERAGENT_STATE_DIR", path.join(root, "state-root"))
-  resetCollabSwitchCache()
-  tui.resetCollabSwitchCache()
+  process.env.SUPERAGENT_HOOK_LOG = path.join(root, "hook.log")
+  process.env.SUPERAGENT_STATE_DIR = path.join(root, "state-root")
 })
 
 afterEach(() => {
-  for (const [key, value] of Object.entries(saved)) setEnv(key, value)
-  resetCollabSwitchCache()
-  tui.resetCollabSwitchCache()
+  delete process.env.SUPERAGENT_HOOK_LOG
+  delete process.env.SUPERAGENT_STATE_DIR
   rmSync(root, { recursive: true, force: true })
 })
-
-function writeSwitch(value: string | Record<string, unknown>) {
-  const file = collabSwitchPath()
-  mkdirSync(path.dirname(file), { recursive: true })
-  writeFileSync(file, typeof value === "string" ? value : JSON.stringify(value), "utf8")
-}
 
 function hookLog(): any[] {
   try {
@@ -66,10 +48,37 @@ function hookLog(): any[] {
   }
 }
 
-/** 捕获 setup 注册的钩子，并统计服务端调用次数。 */
-function fakeCtx() {
+type SessionSpec = { parentID?: string; title?: string }
+type Entries = Record<string, Record<string, string | number | boolean>>
+
+/** 捕获 setup 注册的钩子，并按 sessionID 提供 root 链与指令条目。 */
+function fakeCtx(options: {
+  sessions?: Record<string, SessionSpec>
+  entries?: Entries
+  throwInstructions?: boolean
+  messages?: Record<string, any[]>
+} = {}) {
   const hooks: Record<string, any> = {}
-  const calls = { instructions: 0, switchModel: 0, prompt: 0, create: 0, list: 0 }
+  const calls = {
+    instructions: 0,
+    instructionSessions: [] as string[],
+    switchModel: 0,
+    prompt: 0,
+    create: 0,
+    list: 0,
+    remove: 0,
+    puts: [] as Array<{ sessionID: string; key: string; value: unknown }>,
+  }
+  const sessions =
+    options.sessions ??
+    ({
+      ses_a_root: {},
+      ses_a_child: { parentID: "ses_a_root" },
+      ses_b_root: {},
+      ses_b_child: { parentID: "ses_b_root" },
+    } as Record<string, SessionSpec>)
+  const entries: Entries = structuredClone(options.entries ?? {})
+  let instructionThrows = options.throwInstructions ? 1 : 0
   const buffered: any[] = []
   let notify: (() => void) | undefined
   const events = {
@@ -109,18 +118,28 @@ function fakeCtx() {
         return { dispose() {} }
       },
       async get({ sessionID }: { sessionID: string }) {
-        return { id: sessionID, parentID: sessionID === "ses_child" ? "ses_root" : undefined, time: {} }
+        if (sessionID === "ses_critic") {
+          return { id: sessionID, parentID: "ses_b_root", time: { busy: 1, idle: 2 }, outcome: "succeeded" }
+        }
+        const found = sessions[sessionID]
+        if (!found) throw new Error(`no session ${sessionID}`)
+        return { id: sessionID, parentID: found.parentID, title: found.title, time: {} }
       },
       async list() {
         calls.list++
         return { data: [] }
+      },
+      async context({ sessionID }: { sessionID: string }) {
+        return options.messages?.[sessionID] ?? []
       },
       async create(input: any) {
         calls.create++
         return { id: "ses_critic", parentID: input.parentID, time: { busy: 1, idle: 2 } }
       },
       async update() {},
-      async remove() {},
+      async remove() {
+        calls.remove++
+      },
       async prompt() {
         calls.prompt++
       },
@@ -129,124 +148,173 @@ function fakeCtx() {
       },
       instructions: {
         entry: {
-          async list() {
+          async list({ sessionID }: { sessionID: string }) {
             calls.instructions++
-            return []
+            calls.instructionSessions.push(sessionID)
+            if (instructionThrows > 0) {
+              instructionThrows -= 1
+              throw new Error("instructions down")
+            }
+            return Object.entries(entries[sessionID] ?? {}).map(([key, value]) => ({ key, value }))
           },
-          async put() {},
+          async put(input: { sessionID: string; key: string; value: unknown }) {
+            calls.puts.push(input)
+            entries[input.sessionID] = { ...(entries[input.sessionID] ?? {}), [input.key]: input.value as any }
+          },
+          async remove({ sessionID, key }: { sessionID: string; key: string }) {
+            if (entries[sessionID]) delete entries[sessionID][key]
+          },
         },
       },
     },
     event: { subscribe: () => events.iterable },
   }
-  return { ctx, hooks, calls, events }
+  return { ctx, hooks, calls, events, entries }
 }
 
 const quotaError = { message: "429 rate limit exceeded" }
 
-describe("readCollabSwitch", () => {
-  test("配置文件不存在时按启用处理", () => {
-    expect(readCollabSwitch()).toBe(true)
-    expect(readCollabSwitchState().reason).toBe("default")
+async function waitFor(check: () => boolean, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return true
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  return check()
+}
+
+describe("开关解析", () => {
+  test("缺省启用", () => {
+    expect(readCollabState([])).toEqual({ enabled: true, reason: "default" })
+    expect(collabEnabledFromEntries(undefined)).toBe(true)
   })
 
-  test("enabled=false 即停用", () => {
-    writeSwitch({ enabled: false })
-    expect(readCollabSwitch()).toBe(false)
-    expect(readCollabSwitchState().reason).toBe("configured")
+  test("false 停用、true 启用", () => {
+    expect(readCollabState([{ key: COLLAB_ENABLED_KEY, value: "false" }])).toEqual({
+      enabled: false,
+      reason: "configured",
+    })
+    expect(readCollabState([{ key: COLLAB_ENABLED_KEY, value: "true" }]).enabled).toBe(true)
   })
 
-  test("JSON 损坏时按启用处理，并在 hook.log 留记录", () => {
-    writeSwitch("{ not json")
-    expect(readCollabSwitch()).toBe(true)
-    expect(readCollabSwitchState().reason).toBe("corrupt")
-    expect(collabEnabled()).toBe(true)
-    expect(hookLog().some((record) => record.event === "collab-switch-corrupt")).toBe(true)
+  test("异常值按启用处理", () => {
+    expect(readCollabState([{ key: COLLAB_ENABLED_KEY, value: "no" }])).toEqual({
+      enabled: true,
+      reason: "corrupt",
+    })
+    expect(readCollabState([{ key: COLLAB_ENABLED_KEY, value: null }]).enabled).toBe(true)
   })
 
-  test("enabled 不是布尔值时按启用处理", () => {
-    writeSwitch({ enabled: "no" })
-    expect(readCollabSwitch()).toBe(true)
-  })
-
-  test("短缓存生效：TTL 内不重读，过期后跟随文件", () => {
-    writeSwitch({ enabled: false })
-    expect(readCollabSwitch(1_000)).toBe(false)
-    writeSwitch({ enabled: true })
-    expect(readCollabSwitch(1_001)).toBe(false)
-    expect(readCollabSwitch(1_000 + COLLAB_SWITCH_TTL_MS + 1)).toBe(true)
-  })
-
-  test("路径跟随 XDG_CONFIG_HOME", () => {
-    expect(collabSwitchPath()).toBe(path.join(root, "config", "opencode", "superagent.json"))
-  })
-})
-
-describe("TUI 侧读写", () => {
-  test("与 server 读同一路径：写 false 后两侧都读到停用", async () => {
-    await tui.writeCollabSwitch(false)
-    expect(tui.collabSwitchPath()).toBe(collabSwitchPath())
-    expect(tui.readCollabEnabled()).toBe(false)
-    resetCollabSwitchCache()
-    expect(readCollabSwitch()).toBe(false)
-    expect(JSON.parse(readFileSync(collabSwitchPath(), "utf8"))).toEqual({ enabled: false })
-  })
-
-  test("切换幂等：重复写同一状态结果一致，开启后恢复启用", async () => {
-    await tui.writeCollabSwitch(false)
-    await tui.writeCollabSwitch(false)
-    resetCollabSwitchCache()
-    expect(readCollabSwitch()).toBe(false)
-    await tui.writeCollabSwitch(true)
-    resetCollabSwitchCache()
-    expect(readCollabSwitch()).toBe(true)
+  test("TUI 与 server 同口径", () => {
+    expect(tui.collabEnabledFromInstructions({})).toBe(true)
+    expect(tui.collabEnabledFromInstructions({ [COLLAB_ENABLED_KEY]: "false" })).toBe(false)
+    expect(tui.collabEnabledFromInstructions({ [COLLAB_ENABLED_KEY]: "true" })).toBe(true)
+    expect(tui.collabEnabledFromInstructions({ [COLLAB_ENABLED_KEY]: "broken" })).toBe(true)
   })
 })
 
-describe("停用时服务端零副作用", () => {
-  test("硬拦截不执行：subagent 调用直接放行，不查会话、不拒绝", async () => {
-    writeSwitch({ enabled: false })
-    const { ctx, hooks, calls } = fakeCtx()
+describe("root A 停用时服务端短路", () => {
+  const entries = { ses_a_root: { [COLLAB_ENABLED_KEY]: "false" }, ses_b_root: { "superagent.max-subagents": 5 } }
+
+  test("硬拦截不执行：不查子会话、不占槽", async () => {
+    const { ctx, hooks, calls } = fakeCtx({ entries })
     const dispose = await (plugin as any).setup(ctx)
 
     await expect(
-      hooks["tool:execute.before"]({ tool: "subagent", sessionID: "ses_root", id: "call_1", agent: "build" }),
+      hooks["tool:execute.before"]({ tool: "subagent", sessionID: "ses_a_root", id: "call_1", agent: "build" }),
     ).resolves.toBeUndefined()
     expect(calls.list).toBe(0)
-    expect(calls.instructions).toBe(0)
+    expect(calls.instructionSessions).toEqual(["ses_a_root"])
 
     await dispose()
   })
 
-  test("备用模型切换不执行：限额错误不计数、不查配置、不切模型", async () => {
-    writeSwitch({ enabled: false })
-    const { ctx, hooks, calls } = fakeCtx()
+  test("steer 分支也不登记：不写 subagent-steer 日志", async () => {
+    const { ctx, hooks, calls } = fakeCtx({ entries })
     const dispose = await (plugin as any).setup(ctx)
 
-    await hooks["session:retry"]({ sessionID: "ses_root", error: quotaError, model: { providerID: "acme", id: "big" } })
-    expect(calls.instructions).toBe(0)
+    await hooks["tool:execute.before"]({
+      tool: "subagent",
+      sessionID: "ses_a_root",
+      id: "call_steer",
+      agent: "build",
+      input: { sessionID: "ses_a_child" },
+    })
+    expect(calls.list).toBe(0)
+    expect(hookLog().some((record) => record.event === "subagent-steer")).toBe(false)
+
+    await dispose()
+  })
+
+  test("同 root 子会话也停用", async () => {
+    const { ctx, hooks, calls } = fakeCtx({ entries })
+    const dispose = await (plugin as any).setup(ctx)
+
+    await hooks["tool:execute.before"]({
+      tool: "subagent",
+      sessionID: "ses_a_child",
+      id: "call_child",
+      agent: "build",
+    })
+    expect(calls.list).toBe(0)
+    expect(calls.instructionSessions).toEqual(["ses_a_root"])
+
+    await dispose()
+  })
+
+  test("root B 缺省仍执行硬拦截流程", async () => {
+    const { ctx, hooks, calls } = fakeCtx({ entries })
+    const dispose = await (plugin as any).setup(ctx)
+
+    await hooks["tool:execute.before"]({ tool: "subagent", sessionID: "ses_b_root", id: "call_b", agent: "build" })
+    expect(calls.list).toBeGreaterThan(0)
+
+    await dispose()
+  })
+
+  test("限额切换不执行：A 连续三次失败也不切模型", async () => {
+    const { ctx, hooks, calls } = fakeCtx({ entries })
+    const dispose = await (plugin as any).setup(ctx)
+
+    for (let i = 0; i < 3; i += 1) {
+      await hooks["session:retry"]({
+        sessionID: "ses_a_root",
+        error: quotaError,
+        model: { providerID: "acme", id: "big" },
+      })
+    }
     expect(calls.switchModel).toBe(0)
+    expect(calls.instructionSessions).toEqual(["ses_a_root", "ses_a_root", "ses_a_root"])
 
     await dispose()
   })
 
-  test("启用后同一 retry 钩子会去读配置（对照）", async () => {
-    const { ctx, hooks, calls } = fakeCtx()
+  test("root B 的同一 retry 会切换备用模型（对照）", async () => {
+    const { ctx, hooks, calls } = fakeCtx({
+      entries: {
+        ses_b_root: { "superagent.fallback-model": "acme/backup", "superagent.fallback-threshold": 3 },
+      },
+    })
     const dispose = await (plugin as any).setup(ctx)
 
-    await hooks["session:retry"]({ sessionID: "ses_root", error: quotaError, model: { providerID: "acme", id: "big" } })
-    expect(calls.instructions).toBeGreaterThan(0)
+    for (let i = 0; i < 3; i += 1) {
+      await hooks["session:retry"]({
+        sessionID: "ses_b_root",
+        error: quotaError,
+        model: { providerID: "acme", id: "big" },
+      })
+    }
+    expect(calls.switchModel).toBe(1)
 
     await dispose()
   })
 
-  test("critic 复核不触发：完成事件不发复核会话、不发提示词", async () => {
-    writeSwitch({ enabled: false })
-    const { ctx, events, calls } = fakeCtx()
+  test("critic 不触发：A 的子会话成功完成也不建复核会话", async () => {
+    const { ctx, events, calls } = fakeCtx({ entries })
     const dispose = await (plugin as any).setup(ctx)
 
-    events.push({ id: "evt_1", type: "session.execution.succeeded", data: { sessionID: "ses_child" } })
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    events.push({ id: "evt_1", type: "session.execution.succeeded", data: { sessionID: "ses_a_child" } })
+    await new Promise((resolve) => setTimeout(resolve, 80))
     expect(calls.create).toBe(0)
     expect(calls.prompt).toBe(0)
 
@@ -254,37 +322,110 @@ describe("停用时服务端零副作用", () => {
     await dispose()
   })
 
-  test("探针不发：整轮扫描不列会话", async () => {
-    writeSwitch({ enabled: false })
-    let listed = 0
-    let sent = 0
-    const scanner = createProbeScanner({
-      enabled: () => collabEnabled(),
-      listSessions: async () => {
-        listed++
-        return [{ id: "ses_child", busy: Date.now() - PROBE_AFTER_MS - 1 }]
+  test("critic 在 root B 仍然触发（对照）", async () => {
+    const { ctx, events, calls } = fakeCtx({
+      entries: { ses_b_root: { "superagent.critic-enabled": "true" } },
+      messages: {
+        ses_b_child: [{ type: "assistant", text: "完成：改了 a.ts" }],
+        ses_critic: [{ type: "assistant", text: "一致" }],
       },
-      resolveRoot: async () => "ses_root",
-      rootIsConfigured: async () => true,
-      sendProbe: async () => {
-        sent++
-      },
-      log: () => {},
     })
+    const dispose = await (plugin as any).setup(ctx)
 
-    expect(await scanner.scan()).toBe(0)
-    expect(listed).toBe(0)
-    expect(sent).toBe(0)
+    events.push({ id: "evt_2", type: "session.execution.succeeded", data: { sessionID: "ses_b_child" } })
+    expect(await waitFor(() => calls.create > 0)).toBe(true)
+    expect(calls.prompt).toBeGreaterThan(0)
+
+    events.close()
+    await dispose()
   })
 
-  test("开关翻转在 hook.log 留 disabled/enabled 记录", () => {
-    writeSwitch({ enabled: false })
-    expect(collabEnabled()).toBe(false)
-    writeSwitch({ enabled: true })
-    resetCollabSwitchCache()
-    expect(collabEnabled()).toBe(true)
-    const events = hookLog().map((record) => record.event)
-    expect(events).toContain("collab-switch-disabled")
-    expect(events).toContain("collab-switch-enabled")
+  test("读取失败 fail-open：仍走后续拦截流程并留日志", async () => {
+    const { ctx, hooks, calls } = fakeCtx({ throwInstructions: true })
+    const dispose = await (plugin as any).setup(ctx)
+
+    await hooks["tool:execute.before"]({ tool: "subagent", sessionID: "ses_a_root", id: "call_x", agent: "build" })
+    expect(calls.list).toBeGreaterThan(0)
+    expect(hookLog().some((record) => record.event === "collab-read-failed")).toBe(true)
+
+    await dispose()
+  })
+})
+
+describe("扫描器逐 root 判断", () => {
+  test("探针：A 停用不发，B 缺省照常发；整轮不会因 A 被跳过", async () => {
+    let listed = 0
+    const sent: string[] = []
+    const now = Date.now()
+    const scanner = createProbeScanner({
+      listSessions: async () => {
+        listed++
+        return [
+          { id: "ses_a_child", busy: now - PROBE_AFTER_MS - 1 },
+          { id: "ses_b_child", busy: now - PROBE_AFTER_MS - 1 },
+        ]
+      },
+      resolveRoot: async (sessionID) => (sessionID.startsWith("ses_a") ? "ses_a_root" : "ses_b_root"),
+      rootIsEnabled: async (rootID) => rootID !== "ses_a_root",
+      rootIsConfigured: async () => true,
+      sendProbe: async (sessionID) => {
+        sent.push(sessionID)
+      },
+      claim: () => true,
+      log: () => {},
+      now: () => now,
+    })
+
+    expect(await scanner.scan()).toBe(1)
+    expect(listed).toBe(1)
+    expect(sent).toEqual(["ses_b_child"])
+  })
+
+  test("上下文提醒：A 停用不发，B 照常向自己的 root 发", async () => {
+    const sent: Array<{ root: string; text: string }> = []
+    const now = Date.now()
+    const scanner = createCtxWarningScanner({
+      listSessions: async () => [
+        { id: "ses_a_child", title: "A", busy: now - 1 },
+        { id: "ses_b_child", title: "B", busy: now - 1 },
+      ],
+      resolveRoot: async (sessionID) => (sessionID.startsWith("ses_a") ? "ses_a_root" : "ses_b_root"),
+      rootIsEnabled: async (rootID) => rootID !== "ses_a_root",
+      rootIsConfigured: async () => true,
+      readTokens: async () => 350_000,
+      sendWarn: async (rootID, text) => {
+        sent.push({ root: rootID, text })
+      },
+      claim: () => true,
+      log: () => {},
+      now: () => now,
+    })
+
+    expect(await scanner.scan()).toBe(1)
+    expect(sent.map((item) => item.root)).toEqual(["ses_b_root"])
+  })
+
+  test("开关读取异常按启用处理并留日志", async () => {
+    const logs: any[] = []
+    const sent: string[] = []
+    const now = Date.now()
+    const scanner = createProbeScanner({
+      listSessions: async () => [{ id: "ses_child", busy: now - PROBE_AFTER_MS - 1 }],
+      resolveRoot: async () => "ses_root",
+      rootIsEnabled: async () => {
+        throw new Error("switch down")
+      },
+      rootIsConfigured: async () => true,
+      sendProbe: async (sessionID) => {
+        sent.push(sessionID)
+      },
+      claim: () => true,
+      log: (record) => logs.push(record),
+      now: () => now,
+    })
+
+    expect(await scanner.scan()).toBe(1)
+    expect(sent).toEqual(["ses_child"])
+    expect(logs.some((record) => record.event === "probe-collab-failed")).toBe(true)
   })
 })

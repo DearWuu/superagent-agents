@@ -4,7 +4,6 @@ import { Plugin as PluginDef } from "@opencode/plugin/tui"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import { appendFile, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
-import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import {
@@ -99,6 +98,7 @@ type AgentAction =
 
 /** Instruction entry keys are slash-free, so the logical namespaces use dots. */
 const INSTRUCTION_KEYS = {
+  collabEnabled: "superagent.collab-enabled",
   reportStyle: "superagent.report-style",
   sessionPrompt: "superagent.session-prompt",
   taskPrompt: "superagent.task-prompt",
@@ -216,44 +216,15 @@ function defaultModelPreferencePath() {
 }
 
 /**
- * 协作模式总开关：与 server 入口读同一个文件 `<XDG_CONFIG_HOME>/opencode/superagent.json`
- * （`{ "enabled": true }`）。TUI 侧独立实现一份带短缓存的读取，避免面板渲染时反复读盘。
- * 缺文件 / 读不懂一律按启用处理。
+ * 协作模式总开关的作用域是 root 会话本身：开关值就是该 root 的
+ * `superagent.collab-enabled` 指令条目（`"true"` / `"false"`）。
+ * 条目缺省、值不合法或读取失败都按启用处理，避免误配置把功能永久关死。
  */
-export const COLLAB_SWITCH_TTL_MS = 5000
-
-export function collabSwitchPath() {
-  const base = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config")
-  return join(base, "opencode", "superagent.json")
-}
-
-let collabSwitchCache: { checkedAt: number; enabled: boolean } | undefined
-
-export function resetCollabSwitchCache() {
-  collabSwitchCache = undefined
-}
-
-export function readCollabEnabled(now = Date.now()) {
-  if (collabSwitchCache && now - collabSwitchCache.checkedAt < COLLAB_SWITCH_TTL_MS) return collabSwitchCache.enabled
-  let enabled = true
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(collabSwitchPath(), "utf8"))
-    if (parsed && typeof parsed === "object" && typeof (parsed as Record<string, unknown>).enabled === "boolean") {
-      enabled = Boolean((parsed as Record<string, unknown>).enabled)
-    }
-  } catch {
-    enabled = true
-  }
-  collabSwitchCache = { checkedAt: now, enabled }
-  return enabled
-}
-
-/** 写开关并立即刷新本地缓存，面板无需等下一次轮询。 */
-export async function writeCollabSwitch(enabled: boolean) {
-  const file = collabSwitchPath()
-  await mkdir(dirname(file), { recursive: true })
-  await writeFile(file, JSON.stringify({ enabled }, null, 2) + "\n", "utf8")
-  collabSwitchCache = { checkedAt: Date.now(), enabled }
+export function collabEnabledFromInstructions(values: Readonly<Record<string, unknown>>): boolean {
+  const raw = values[INSTRUCTION_KEYS.collabEnabled]
+  if (typeof raw === "boolean") return raw
+  if (typeof raw !== "string") return true
+  return raw.trim().toLowerCase() !== "false"
 }
 
 /** 上下文偏长的提示阈值：子代理当前上下文超过它就把读数染成警示色。 */
@@ -869,20 +840,36 @@ export function SidebarAgents(props: {
     )
   }
 
-  const [instructions, setInstructions] = createSignal<Record<string, unknown>>({})
+  /**
+   * This root's instruction entries. The root id is stored with the values so a
+   * root switch never shows the previous root's switch state while the new
+   * entries are still loading.
+   */
+  const [instructions, setInstructions] = createSignal<{ rootID?: string; values: Record<string, unknown> }>({
+    values: {},
+  })
   /** True once this root's instructions (and thus its cap) are loaded. */
   const [ready, setReady] = createSignal(false)
-  const instructionText = (key: string) => {
-    const value = instructions()[key]
-    return typeof value === "string" ? value : typeof value === "number" ? String(value) : ""
-  }
-  const instructionPresent = (key: string) => {
-    const value = instructions()[key]
-    return value !== undefined && value !== null && String(value).trim() !== ""
-  }
 
   /** The family root of the session the user is looking at. */
   const rootSessionID = createMemo(() => props.context.data.session.root(props.sessionID))
+  const instructionValue = (key: string) => {
+    const state = instructions()
+    return state.rootID === rootSessionID() ? state.values[key] : undefined
+  }
+  const instructionText = (key: string) => {
+    const value = instructionValue(key)
+    return typeof value === "string" ? value : typeof value === "number" ? String(value) : ""
+  }
+  const instructionPresent = (key: string) => {
+    const value = instructionValue(key)
+    return value !== undefined && value !== null && String(value).trim() !== ""
+  }
+  /** Only this root's entry controls its switch; other roots are independent. */
+  const collabOn = createMemo(() =>
+    collabEnabledFromInstructions(instructions().rootID === rootSessionID() ? instructions().values : {}),
+  )
+
   /** The settings of that root; every root keeps its own copy. */
   const root = createMemo(() => readRootSettings(settings, rootSessionID()))
   /** The global model list, shared by every root. */
@@ -985,7 +972,9 @@ export function SidebarAgents(props: {
     const id = rootSessionID()
     if (!id) return
     const entries = await props.context.client.experimental.session.instructions.entry.list({ sessionID: id })
-    setInstructions(Object.fromEntries(entries.map((entry) => [entry.key, entry.value])))
+    // A slow response for a root the user already left must not overwrite the current root.
+    if (rootSessionID() !== id) return
+    setInstructions({ rootID: id, values: Object.fromEntries(entries.map((entry) => [entry.key, entry.value])) })
   }
   createEffect(() => {
     const id = rootSessionID()
@@ -1002,7 +991,10 @@ export function SidebarAgents(props: {
       key,
       value,
     })
-    setInstructions((current) => ({ ...current, [key]: value }))
+    setInstructions((current) => ({
+      rootID: id,
+      values: { ...(current.rootID === id ? current.values : {}), [key]: value },
+    }))
   }
   async function removeInstruction(key: string) {
     const id = rootSessionID()
@@ -1012,9 +1004,10 @@ export function SidebarAgents(props: {
       key,
     })
     setInstructions((current) => {
-      const next = { ...current }
-      delete next[key]
-      return next
+      if (current.rootID !== id) return current
+      const values = { ...current.values }
+      delete values[key]
+      return { rootID: id, values }
     })
   }
   async function saveInstructionText(key: string, value: string) {
@@ -1027,11 +1020,16 @@ export function SidebarAgents(props: {
     await loadInstructions()
     const id = rootSessionID()
     if (!id) return
+    // 停用状态只加载开关本身，不初始化/补写其他条目，也不写回开关。
+    if (!collabOn()) {
+      setReady(true)
+      return
+    }
     mergeKeptEntry()
     await ensureFallbackDefaults()
     if (!root().initialized[id]) {
       for (const [key, value] of defaultInstructionEntries()) {
-        if (instructions()[key] !== undefined) continue
+        if (instructionValue(key) !== undefined) continue
         await putInstruction(key, value)
       }
       await updateRoot((draft) => {
@@ -1051,7 +1049,7 @@ export function SidebarAgents(props: {
       INSTRUCTION_KEYS.criticEnabled,
     ])
     for (const [key, value] of defaultInstructionEntries()) {
-      if (!keys.has(key) || instructions()[key] !== undefined) continue
+      if (!keys.has(key) || instructionValue(key) !== undefined) continue
       await putInstruction(key, value)
     }
   }
@@ -1390,15 +1388,12 @@ export function SidebarAgents(props: {
   const clock = setInterval(() => setNow(Date.now()), 60_000)
   onCleanup(() => clearInterval(clock))
 
-  /** 协作模式总开关：1s 轮询一次带短缓存的读取，外部改动最迟 5s 生效。 */
-  const [collabOn, setCollabOn] = createSignal(readCollabEnabled())
-  const collabClock = setInterval(() => setCollabOn(readCollabEnabled()), 1_000)
-  onCleanup(() => clearInterval(collabClock))
-
+  /** 协作模式总开关：只写当前 root 的 `superagent.collab-enabled` 条目。 */
   async function setCollabEnabled(enabled: boolean) {
-    await writeCollabSwitch(enabled)
-    setCollabOn(enabled)
-    props.context.ui.toast.show({ message: enabled ? "agents协作已启用。" : "agents协作已停用。" })
+    await putInstruction(INSTRUCTION_KEYS.collabEnabled, String(enabled))
+    props.context.ui.toast.show({
+      message: enabled ? "本会话 agents协作已启用。" : "本会话 agents协作已停用。",
+    })
   }
 
   /** 一行的状态。root 行不带时长。 */
@@ -2079,8 +2074,8 @@ export function SidebarAgents(props: {
           value: { kind: "collabSwitch" },
           title: "协作模式总开关",
           description: collabOn()
-            ? "已启用 · 关闭后拦截、切换、复核、探针全部停止"
-            : "已停用 · 面板只留一行，左键可重新开启",
+            ? "已启用 · 仅当前会话；关闭后拦截、切换、复核、探针全部停止"
+            : "已停用 · 仅当前会话；面板只留一行，左键可重新开启",
         },
         {
           value: { kind: "oversight" },
@@ -2339,7 +2334,7 @@ export function SidebarAgents(props: {
               void setCollabEnabled(true)
             }}
           >
-            agents协作已停用 · 左键开启
+            agents协作已停用 · 本会话 · 左键开启
           </text>
         </box>
       }

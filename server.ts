@@ -57,7 +57,7 @@
  *    建议 compact 或删掉重建；不是发给子代理。
  *  - 每个子会话只提醒一次（`ctx-claims/` 落盘声明，记着上次提醒时的 token 数）；
  *    若当前长度较上次提醒下降 ≥30%（compact 过），清掉声明，允许再次提醒。
- *  - 总开关关闭、critic 会话、root 自身、已结束的子会话都跳过；发送失败只记日志。
+ *  - 该 root 的协作总开关关闭、critic 会话、root 自身、已结束的子会话都跳过；发送失败只记日志。
  */
 
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
@@ -175,75 +175,65 @@ export function log(record: Record<string, unknown>) {
 }
 
 /**
- * 协作模式总开关的配置文件：`<XDG_CONFIG_HOME>/opencode/superagent.json`，
- * 内容形如 `{ "enabled": true }`。文件不存在、字段缺失或 JSON 损坏都按启用处理，
- * 保证「装了插件就全开」的默认体验，也让误删/写坏配置不会把功能永久关死。
+ * 协作模式总开关的作用域是 root 会话：值就是该 root 的
+ * `superagent.collab-enabled` 指令条目（`"true"` / `"false"`）。
+ * 条目缺省、值不合法或读取失败都按启用处理（fail-open）。
  */
-export const COLLAB_SWITCH_TTL_MS = 5000
-
-export function collabSwitchPath(): string {
-  const xdg = process.env.XDG_CONFIG_HOME?.trim()
-  return path.join(xdg ? xdg : path.join(homedir(), ".config"), "opencode", "superagent.json")
-}
+export const COLLAB_ENABLED_KEY = "superagent.collab-enabled"
 
 export type CollabSwitchState = { enabled: boolean; reason: "configured" | "default" | "corrupt" }
 
-/** 开关的短缓存：钩子每次调用都会问，不能每次都同步读盘。 */
-let collabSwitchCache: { checkedAt: number; state: CollabSwitchState } | undefined
-/** 最近一次记过日志的开关状态，只在状态变化时落一条。 */
-let collabLastLogged: { enabled: boolean; reason: string } | undefined
-
-export function resetCollabSwitchCache() {
-  collabSwitchCache = undefined
-  collabLastLogged = undefined
+/** 从一个 root 的指令条目解析开关；只有明确的 false 才停用。 */
+export function readCollabState(entries: unknown): CollabSwitchState {
+  const entry = asArray(entries).find((item) => item?.key === COLLAB_ENABLED_KEY)
+  if (!entry) return { enabled: true, reason: "default" }
+  if (typeof entry.value === "boolean") return { enabled: entry.value, reason: "configured" }
+  if (typeof entry.value !== "string") return { enabled: true, reason: "corrupt" }
+  const value = entry.value.trim().toLowerCase()
+  if (value === "false") return { enabled: false, reason: "configured" }
+  if (value === "true") return { enabled: true, reason: "configured" }
+  return { enabled: true, reason: "corrupt" }
 }
 
-export function readCollabSwitchState(now = Date.now()): CollabSwitchState {
-  if (collabSwitchCache && now - collabSwitchCache.checkedAt < COLLAB_SWITCH_TTL_MS) {
-    return collabSwitchCache.state
-  }
-  let state: CollabSwitchState
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(collabSwitchPath(), "utf8"))
-    const configured = isObject(parsed) && typeof parsed.enabled === "boolean"
-    state = { enabled: configured ? (parsed as any).enabled : true, reason: configured ? "configured" : "default" }
-  } catch (cause: any) {
-    state = { enabled: true, reason: cause?.code === "ENOENT" ? "default" : "corrupt" }
-  }
-  collabSwitchCache = { checkedAt: now, state }
-  return state
-}
-
-export function readCollabSwitch(now = Date.now()): boolean {
-  return readCollabSwitchState(now).enabled
+export function collabEnabledFromEntries(entries: unknown): boolean {
+  return readCollabState(entries).enabled
 }
 
 /**
- * 服务端所有协作行为的入口判据：停用时每条钩子直接返回，零副作用。
- * 状态翻转（含配置损坏）在 hook.log 留一条记录，便于排查「为什么没拦截」。
+ * 读某个 root 家族的总开关。读失败按启用处理并留日志，
+ * 避免一次查询异常把整族协作行为关死。
  */
-export function collabEnabled(now = Date.now()): boolean {
-  const state = readCollabSwitchState(now)
-  const changed = !collabLastLogged || collabLastLogged.enabled !== state.enabled
-  if (changed) {
+async function readRootCollabEnabled(ctx: any, rootID: string): Promise<boolean> {
+  try {
+    const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+    return collabEnabledFromEntries(entries)
+  } catch (cause) {
     log({
-      event: state.enabled ? "collab-switch-enabled" : "collab-switch-disabled",
-      decision: state.enabled ? "allow" : "skip",
-      enabled: state.enabled,
-      path: collabSwitchPath(),
-    })
-  }
-  if (state.reason === "corrupt" && collabLastLogged?.reason !== "corrupt") {
-    log({
-      event: "collab-switch-corrupt",
+      event: "collab-read-failed",
       decision: "allow",
-      enabled: true,
-      path: collabSwitchPath(),
-      note: "配置读不懂，按启用处理",
+      root: rootID,
+      note: "开关读取失败，按启用处理",
+      cause: errorText(cause),
     })
+    return true
   }
-  collabLastLogged = { enabled: state.enabled, reason: state.reason }
-  return state.enabled
+}
+
+/** 按调用者所属 root 判断开关；上溯失败同样 fail-open。 */
+async function collabEnabledForSession(ctx: any, sessionID: string | undefined): Promise<boolean> {
+  if (!sessionID) return true
+  try {
+    return await readRootCollabEnabled(ctx, await findRoot(ctx, sessionID))
+  } catch (cause) {
+    log({
+      event: "collab-read-failed",
+      decision: "allow",
+      sessionID,
+      note: "root 上溯失败，按启用处理",
+      cause: errorText(cause),
+    })
+    return true
+  }
 }
 
 /** 一次性的跨实例声明：mkdir 原子，先创建成功者独占。 */
@@ -547,11 +537,11 @@ export type ProbeScannerDeps = {
   resolveRoot: (sessionID: string) => Promise<string | undefined>
   /** 该 root 是否带 superagent 配置（任意 `superagent.*` 指令条目）。 */
   rootIsConfigured: (rootID: string) => Promise<boolean>
+  /** 该 root 的协作总开关；缺省视为启用。 */
+  rootIsEnabled?: (rootID: string) => Promise<boolean>
   sendProbe: (sessionID: string, text: string) => Promise<void>
   /** 跨实例去重：返回 false 表示别的实例已经探过这个会话。 */
   claim?: (sessionID: string) => boolean
-  /** 总开关：返回 false 时整轮扫描不做任何事（不列会话、不发探针）。 */
-  enabled?: () => boolean
   log: (record: Record<string, unknown>) => void
   now?: () => number
 }
@@ -568,8 +558,6 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
   return {
     probed,
     async scan(): Promise<number> {
-      // 总开关关闭：不列会话、不查 root、不发探针。
-      if (deps.enabled && !deps.enabled()) return 0
       let candidates: ProbeCandidate[]
       try {
         candidates = await deps.listSessions()
@@ -577,6 +565,8 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
         deps.log({ event: "probe-scan-failed", decision: "error", cause: errorText(cause) })
         return 0
       }
+      /** root → 本轮是否启用；逐 root 判断，停用一个 root 不影响其他 root。 */
+      const enabled = new Map<string, boolean>()
       let sent = 0
       for (const candidate of candidates) {
         if (!shouldProbe(candidate, now(), probed)) continue
@@ -589,6 +579,17 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
         }
         // root 自己不是子代理。
         if (!rootID || rootID === candidate.id) continue
+        let collab = enabled.get(rootID)
+        if (collab === undefined) {
+          try {
+            collab = deps.rootIsEnabled ? await deps.rootIsEnabled(rootID) : true
+          } catch (cause) {
+            deps.log({ event: "probe-collab-failed", decision: "allow", root: rootID, cause: errorText(cause) })
+            collab = true
+          }
+          enabled.set(rootID, collab)
+        }
+        if (!collab) continue
         let managed = configured.get(rootID)
         if (managed === undefined) {
           try {
@@ -633,7 +634,6 @@ export function createCtxProbeScanner(
     claim?: (sessionID: string) => boolean
     log?: (record: Record<string, unknown>) => void
     limit?: number
-    enabled?: () => boolean
   } = {},
 ) {
   const write = options.log ?? log
@@ -659,9 +659,9 @@ export function createCtxProbeScanner(
       await ctx.session.prompt({ sessionID, text, delivery: "steer" })
     },
     claim: options.claim ?? claimProbe,
+    rootIsEnabled: (rootID) => readRootCollabEnabled(ctx, rootID),
     log: write,
     now: options.now,
-    enabled: options.enabled,
   })
 }
 
@@ -697,7 +697,7 @@ export function contextDropped(previous: number | undefined, current: number): b
 
 /**
  * 该子会话是否进入上下文检查：critic 会话、已结束且不在运行中的都跳过；
- * root 自身与总开关在扫描器里跳过。
+ * root 自身与所属 root 的开关在扫描器里跳过。
  */
 export function shouldCheckContext(candidate: ProbeCandidate): boolean {
   if (!candidate.id) return false
@@ -726,12 +726,12 @@ export type CtxWarningScannerDeps = {
   rootIsConfigured: (rootID: string) => Promise<boolean>
   /** 读该会话最近一次 assistant 调用的输入 token 数。 */
   readTokens: (sessionID: string) => Promise<number | undefined>
+  /** 该 root 的协作总开关；缺省视为启用。 */
+  rootIsEnabled?: (rootID: string) => Promise<boolean>
   /** 向 root 发 steer 提醒。 */
   sendWarn: (rootID: string, text: string) => Promise<void>
   /** 跨实例去重：返回 false 表示已经提醒过（且未 compact）。 */
   claim?: (sessionID: string, tokens: number) => boolean
-  /** 总开关：返回 false 时整轮扫描不做任何事。 */
-  enabled?: () => boolean
   log: (record: Record<string, unknown>) => void
   now?: () => number
 }
@@ -745,7 +745,6 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
   const configured = new Map<string, boolean>()
   return {
     async scan(): Promise<number> {
-      if (deps.enabled && !deps.enabled()) return 0
       let candidates: ProbeCandidate[]
       try {
         candidates = await deps.listSessions()
@@ -753,6 +752,8 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
         deps.log({ event: "ctx-scan-failed", decision: "error", cause: errorText(cause) })
         return 0
       }
+      /** root → 本轮是否启用；逐 root 判断，停用一个 root 不影响其他 root。 */
+      const enabled = new Map<string, boolean>()
       let sent = 0
       for (const candidate of candidates) {
         if (!shouldCheckContext(candidate)) continue
@@ -765,6 +766,17 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
         }
         // root 自己不是子代理。
         if (!rootID || rootID === candidate.id) continue
+        let collab = enabled.get(rootID)
+        if (collab === undefined) {
+          try {
+            collab = deps.rootIsEnabled ? await deps.rootIsEnabled(rootID) : true
+          } catch (cause) {
+            deps.log({ event: "ctx-collab-failed", decision: "allow", root: rootID, cause: errorText(cause) })
+            collab = true
+          }
+          enabled.set(rootID, collab)
+        }
+        if (!collab) continue
         let managed = configured.get(rootID)
         if (managed === undefined) {
           try {
@@ -833,7 +845,6 @@ export function createCtxContextWarningScanner(
     claim?: (sessionID: string, tokens: number) => boolean
     log?: (record: Record<string, unknown>) => void
     limit?: number
-    enabled?: () => boolean
   } = {},
 ) {
   const write = options.log ?? log
@@ -860,9 +871,9 @@ export function createCtxContextWarningScanner(
       await ctx.session.prompt({ sessionID: rootID, text, delivery: "steer" })
     },
     claim: options.claim ?? claimContextWarning,
+    rootIsEnabled: (rootID) => readRootCollabEnabled(ctx, rootID),
     log: write,
     now: options.now,
-    enabled: options.enabled,
   })
 }
 
@@ -1233,7 +1244,20 @@ export default {
       try {
         const child = await ctx.session.get({ sessionID })
         const rootID = await findRoot(ctx, sessionID)
-        const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+        let entries: any[] = []
+        try {
+          entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+        } catch (cause) {
+          log({
+            event: "collab-read-failed",
+            decision: "allow",
+            root: rootID,
+            note: "开关读取失败，按启用处理",
+            cause: errorText(cause),
+          })
+        }
+        // 总开关按 root 生效：本 root 停用时不发复核。
+        if (!collabEnabledFromEntries(entries)) return
         if (!shouldCriticReview({ eventType: "session.execution.succeeded", childSessionID: sessionID, rootID, child, entries })) {
           return
         }
@@ -1260,10 +1284,11 @@ export default {
     }
 
     const before = await ctx.tool.hook("execute.before", async (event: any) => {
-      // 总开关优先：停用时连是不是 subagent 都不判断，直接放行。
-      if (!collabEnabled()) return
       // 快路径：不是 subagent 立即返回，不做任何查询。
       if (event?.tool !== TOOL_NAME) return
+      // 总开关按 root 生效：本 root 停用时直接放行，steer 登记等副作用也不发生。
+      const callerSessionID = typeof event.sessionID === "string" ? event.sessionID : undefined
+      if (!(await collabEnabledForSession(ctx, callerSessionID))) return
       const input = isObject(event.input) ? event.input : undefined
       const steerTarget =
         typeof input?.sessionID === "string" && input.sessionID.length > 0 ? input.sessionID : undefined
@@ -1488,12 +1513,12 @@ export default {
     // 不会打断正在执行的轮次；切换成功时把决策翻成继续重试。钩子里的异常一律吞掉。
     const retry = await ctx.session.hook("retry", async (event: any) => {
       try {
-        // 停用时不计数、不切换，连 root 都不查。
-        if (!collabEnabled()) return
         if (!isQuotaFailure(event?.error)) return
         const sessionID = typeof event?.sessionID === "string" ? event.sessionID : undefined
         if (!sessionID) return
         const rootID = await findRoot(ctx, sessionID)
+        // 总开关按 root 生效：本 root 停用时不计失败、不切模型。
+        if (!(await readRootCollabEnabled(ctx, rootID))) return
         const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
         const outcome = await quotaFallback.onFailure({
           sessionID,
@@ -1530,8 +1555,8 @@ export default {
           const sessionID = eventSessionID(event)
           if (!sessionID) continue
           quotaFallback.reset(sessionID)
-          // 停用时复核不触发。
-          if (event?.type === "session.execution.succeeded" && collabEnabled()) {
+          // 复核在内部按该会话所属 root 的开关短路。
+          if (event?.type === "session.execution.succeeded") {
             void reviewAfterSuccess(sessionID, event?.id)
           }
         }
@@ -1541,10 +1566,10 @@ export default {
     })()
     void resetSubscription
 
-    // 超时状态探针：只探带 superagent 配置的 root 家族里的子会话。
-    const probeScanner = createCtxProbeScanner(ctx, { enabled: () => collabEnabled() })
-    // 超长上下文提醒：同一个 5 分钟周期内检查子代理的最近一次输入规模。
-    const ctxScanner = createCtxContextWarningScanner(ctx, { enabled: () => collabEnabled() })
+    // 超时状态探针：只探带 superagent 配置且当前 root 启用协作的家族里的子会话。
+    const probeScanner = createCtxProbeScanner(ctx)
+    // 超长上下文提醒：同一个 5 分钟周期内逐 root 判断开关。
+    const ctxScanner = createCtxContextWarningScanner(ctx)
     const probeTimer = startProbeTimer(async () => {
       await Promise.allSettled([probeScanner.scan(), ctxScanner.scan()])
     })
