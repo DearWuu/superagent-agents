@@ -39,6 +39,7 @@ import {
 import { planEviction, type SubagentChild } from "./subagent-limit"
 import { sessionRunning, sessionStatusView } from "./run-duration"
 import { migrateLegacyPluginStorage, storageDirectory } from "./storage-migration"
+import { buildHandoffSummary, type HandoffClient } from "./handoff"
 
 type ModelInfo = {
   providerID: string
@@ -113,6 +114,15 @@ const INSTRUCTION_KEYS = {
   keptSubagents: "superagent.kept-subagents",
 } as const
 
+/** 各级监管的实现程度：选择器里介绍"管到什么程度"，不写操作说明。 */
+export const OVERSIGHT_LEVEL_DESCRIPTIONS: Record<OversightLevel, string> = {
+  0: "只交结果：改动/测试/风险，完成时一次汇报",
+  1: "加命令清单与阶段小结，完成时一次汇报",
+  2: "加阅读记录与失败详情，证据可核查（默认）",
+  3: "加完整输出与代码摘录，每阶段中途简报",
+  4: "逐步汇报动机与假设，全程可审计",
+}
+
 /** Provider-neutral defaults: unset means follow the session's own model. */
 export const SUPERAGENT_DEFAULTS = {
   reportStyle: "concise",
@@ -128,6 +138,7 @@ export const SUPERAGENT_DEFAULTS = {
   sessionPrompt: [
     "主代理（Superagent）负责：分析需求、拆解任务、方案设计（架构/接口/交互/版面等具体设计）、编写任务书与验收标准、派工和验收。设计产物由主代理产出后交给 Subagent 实现，不让 Subagent 自行决定设计方向。",
     "主代理不做具体实现：改代码、写文件、调试、测试执行交给 Subagent；只读分析（读代码/查文档/调研）主代理可自己做。",
+    "派工新建与续跑：与既有子代理无关联的新任务一律新建 Subagent，避免无关上下文污染；仅同一模块/同一文件的后续修改、验收打回返工、类似任务迭代时才 steer 续跑已有子代理。续跑对象上下文较长（>300k）时先判断是否有必要保持：任务需要这些上下文则直接续跑；无必要则先 compact 再续跑。交接摘要仅用于删除重建场景，不是续跑的前置动作。",
     "验收：按报告协议逐项核查（状态三行、章节完整性、证据真实性）；排版/UI 类必须亲眼看实际渲染结果（截图）验收，不只信报告；证据不足或与 session 记录不符打回。",
   ].join("\n"),
   assignmentPrompt:
@@ -243,6 +254,51 @@ export async function writeCollabSwitch(enabled: boolean) {
   await mkdir(dirname(file), { recursive: true })
   await writeFile(file, JSON.stringify({ enabled }, null, 2) + "\n", "utf8")
   collabSwitchCache = { checkedAt: Date.now(), enabled }
+}
+
+/** 上下文偏长的提示阈值：子代理当前上下文超过它就把读数染成警示色。 */
+export const CONTEXT_WARN_TOKENS = 300_000
+
+export type SessionTokenUsage = {
+  input: number
+  output: number
+  reasoning: number
+  cache: { read: number; write: number }
+}
+
+type ContextMessage = { type?: string; status?: string; tokens?: SessionTokenUsage }
+
+/**
+ * 当前上下文长度：最近一次 assistant 调用的输入侧 tokens（input + cache read/write），
+ * 即这一次实际送进模型的提示规模。与原生 `lastAssistantWithUsage` 同口径：
+ * 跳过一次完成的 compact 之前的旧记录，compact 后新一步的输入变小，读数随之下降。
+ */
+export function contextTokens(messages: ReadonlyArray<ContextMessage> | undefined): number | undefined {
+  if (!messages || messages.length === 0) return undefined
+  const boundary = messages.findLastIndex((message) => message.type === "compaction" && message.status === "completed")
+  for (let index = messages.length - 1; index > boundary; index -= 1) {
+    const message = messages[index]
+    if (message.type !== "assistant" || !message.tokens) continue
+    const input = message.tokens.input + message.tokens.cache.read + message.tokens.cache.write
+    return input > 0 ? input : undefined
+  }
+  return undefined
+}
+
+/** `950` / `1.2k` / `32k` / `1.1m`：信息行里只占几列。 */
+export function formatTokenCount(tokens: number) {
+  if (!Number.isFinite(tokens) || tokens <= 0) return ""
+  if (tokens < 1_000) return String(Math.round(tokens))
+  if (tokens < 100_000) return `${(tokens / 1_000).toFixed(1).replace(/\.0$/, "")}k`
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`
+  return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
+}
+
+/** 信息行里的上下文读数：无数据返回 undefined，超过阈值带上警示标记。 */
+export function contextUsageView(messages: ReadonlyArray<ContextMessage> | undefined) {
+  const tokens = contextTokens(messages)
+  if (tokens === undefined) return undefined
+  return { tokens, text: `ctx ${formatTokenCount(tokens)}`, warning: tokens > CONTEXT_WARN_TOKENS }
 }
 
 
@@ -1232,6 +1288,7 @@ export function SidebarAgents(props: {
     }).catch(() => {})
   }
   createEffect(() => {
+    if (!collabOn()) return
     if (!session()) return
     void writeOversightInstruction(rootOversight()).catch(() => {})
   })
@@ -1240,6 +1297,7 @@ export function SidebarAgents(props: {
   createEffect(() => {
     const id = rootSessionID()
     if (!id) return
+    if (!collabOn()) return
     if (!root().initialized[id]) return
     if (instructionText(INSTRUCTION_KEYS.assignmentPrompt) === assignmentPromptEntry()) return
     void putInstruction(INSTRUCTION_KEYS.assignmentPrompt, assignmentPromptEntry()).catch(() => {})
@@ -1378,9 +1436,15 @@ export function SidebarAgents(props: {
     return `L${contract.level}`
   }
 
+  /** 子代理的上下文读数：最近一次 assistant 调用的输入规模，无数据时整段不显示。 */
+  const rowUsage = (row: FlatNode) =>
+    row.node.kind === "subagent" && row.node.sessionID
+      ? contextUsageView(props.context.data.session.message.list(row.node.sessionID))
+      : undefined
+
   /**
-   * 第二行：状态 · 模型全名 · 徽标。
-   * 模型名永不省略：状态与模型放不下时模型自己换行，徽标放不下时另起一行。
+   * 第二行：状态 · 模型全名 · token 用量 · 徽标。
+   * 模型名永不省略：状态与模型放不下时模型自己换行，用量与徽标放不下时另起一行。
    * 状态段单独返回，便于长时运行时给它上警示色。
    */
   const rowInfo = (row: FlatNode) => {
@@ -1389,17 +1453,22 @@ export function SidebarAgents(props: {
     const status = view?.text ?? ""
     const model = rowModel(row)
     const badge = rowBadge(row)
+    const usage = rowUsage(row)
+    const usageText = usage ? `${usage.text}${usage.warning ? " ⚠" : ""}` : undefined
     const room = Math.max(MIN_CONTENT_WIDTH, panelWidth() - displayWidth(indent))
     const head = status ? `${status}${SEPARATOR}${model}` : model
     const oneLine = displayWidth(head) <= room
     const stacked = Boolean(status) && !oneLine
-    const inline = oneLine && displayWidth(head) + displayWidth(`${SEPARATOR}${badge}`) <= room
+    const tail = [usageText, badge].filter(Boolean).join(SEPARATOR)
+    const inline = oneLine && displayWidth(head) + displayWidth(`${SEPARATOR}${tail}`) <= room
     return {
       status: status ? `${indent}${status}` : undefined,
       statusWarning: view?.longRunning ?? false,
       model: status && !stacked ? `${SEPARATOR}${model}` : `${indent}${model}`,
       stacked,
-      badge: inline ? `${SEPARATOR}${badge}` : `${indent}${badge}`,
+      usage: usageText ? (inline ? `${SEPARATOR}${usageText}` : `${indent}${usageText}`) : undefined,
+      usageWarning: usage?.warning ?? false,
+      badge: inline || usageText ? `${SEPARATOR}${badge}` : `${indent}${badge}`,
       ownLine: !inline,
     }
   }
@@ -1908,7 +1977,7 @@ export function SidebarAgents(props: {
         ...([0, 1, 2, 3, 4] as OversightLevel[]).map((level) => ({
           value: { kind: "pin" as const, level },
           title: `L${level} ${OVERSIGHT_LEVEL_NAMES[level]}`,
-          description: `点击固定为 L${level}（会话设置）`,
+          description: OVERSIGHT_LEVEL_DESCRIPTIONS[level],
         })),
       ],
       current: contract.source === "pin" ? { kind: "pin", level: contract.level } : { kind: "default" },
@@ -1963,7 +2032,7 @@ export function SidebarAgents(props: {
         ...([0, 1, 2, 3, 4] as OversightLevel[]).map((level) => ({
           value: { kind: "pin" as const, level },
           title: `L${level} ${OVERSIGHT_LEVEL_NAMES[level]}`,
-          description: `点击固定为 L${level}（只影响这个子代理）`,
+          description: OVERSIGHT_LEVEL_DESCRIPTIONS[level],
         })),
       ],
       current: pinned === undefined ? { kind: "default" } : { kind: "pin", level: pinned },
@@ -2107,6 +2176,11 @@ export function SidebarAgents(props: {
     })
     if (!confirmed) return
     const prompt = latestUserMessage(props.context, node.sessionID) ?? current.title ?? node.title
+    // 交接摘要取不到（读会话失败）不阻塞删除重建，降级为无交接直接重建。
+    const handoff = await buildHandoffSummary({
+      client: props.context.client as unknown as HandoffClient,
+      childSessionID: node.sessionID,
+    }).catch(() => undefined)
     await props.context.client.session.remove({ sessionID: node.sessionID })
     const created = await props.context.client.session.create({
       parentID: current.parentID,
@@ -2114,7 +2188,8 @@ export function SidebarAgents(props: {
       model: current.model,
       title: current.title,
     })
-    await props.context.client.session.prompt({ sessionID: created.id, text: prompt })
+    const brief = handoff ? `# 交接摘要\n${handoff}\n\n${prompt}` : prompt
+    await props.context.client.session.prompt({ sessionID: created.id, text: brief })
     props.context.ui.toast.show({ message: `${node.title} 已清空上下文并重建。` })
   }
 
@@ -2375,6 +2450,17 @@ export function SidebarAgents(props: {
                       </text>
                     </box>
                     <Show when={!rowInfo(row).ownLine}>
+                      <Show when={rowInfo(row).usage}>
+                        {(usage) => (
+                          <text
+                            id={`sidebar.agents.usage.${row.node.id}`}
+                            fg={rowInfo(row).usageWarning ? warningColor() : theme.text.muted}
+                            flexShrink={0}
+                          >
+                            {usage()}
+                          </text>
+                        )}
+                      </Show>
                       <text
                         id={`sidebar.agents.badge.${row.node.id}`}
                         fg={badgeColor(row)}
@@ -2392,6 +2478,17 @@ export function SidebarAgents(props: {
                   </box>
                   <Show when={rowInfo(row).ownLine}>
                     <box flexDirection="row" gap={0}>
+                      <Show when={rowInfo(row).usage}>
+                        {(usage) => (
+                          <text
+                            id={`sidebar.agents.usage.${row.node.id}`}
+                            fg={rowInfo(row).usageWarning ? warningColor() : theme.text.muted}
+                            flexShrink={0}
+                          >
+                            {usage()}
+                          </text>
+                        )}
+                      </Show>
                       <text
                         id={`sidebar.agents.badge.${row.node.id}`}
                         fg={badgeColor(row)}

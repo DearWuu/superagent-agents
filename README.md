@@ -2,14 +2,28 @@
 
 OpenCode 的 Superagent / Subagent 编排插件：把「主代理只做设计和验收、子代理并行实现」这套协作方式做成可操作的右栏面板，并在服务端兜住子代理数量、失败切换与超时卡死。
 
-- TUI 入口（`./tui` → `index.tsx`）：右栏「agents协作」面板，展示子代理树、状态、模型与监管等级，点标题打开设置、点行看子代理操作。
-- Server 入口（`./server` → `server.ts`）：子代理数量上限、限额自动切换备用模型、critic 复核、超时状态探针，全部判定写入 `hook.log`。
+- TUI 入口（`./tui` → `index.tsx`）：右栏「agents协作」面板，展示子代理树、状态、模型、上下文读数与监管等级，点标题打开设置、点行看子代理操作。
+- Server 入口（`./server` → `server.ts`）：子代理数量上限、限额自动切换备用模型、critic 复核、超时状态探针、超长上下文提醒，全部判定写入 `hook.log`。
 
 两个入口共用一份存储，装好即用，不需要额外配置。
 
 ## 安装
 
-### 方式一：GitHub 仓库（推荐）
+### 方式一：git clone 到插件目录（推荐，已实测）
+
+```sh
+git clone https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugins/superagent-agents
+```
+
+重启 OpenCode 即生效。需要固定版本时 clone 对应 tag：
+
+```sh
+git clone --branch v0.1.2 --depth 1 https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugins/superagent-agents
+```
+
+升级时进入该目录 `git pull`，再重启 OpenCode。
+
+### 方式二：GitHub 插件 spec（备选）
 
 ```sh
 opencode plugin add github:DearWuu/superagent-agents
@@ -23,29 +37,19 @@ opencode plugin add github:DearWuu/superagent-agents
 }
 ```
 
-OpenCode 启动时由 Bun 从 GitHub 拉取仓库、装进自己的缓存（`~/.cache/opencode/`），随后 `opencode reload` 或重启即生效。升级用 `opencode plugin update`。
-
-当前 opencode 2.2.5 上 `plugin add` 可能报 `git dep preparation failed`（内嵌安装器的已知问题）。遇到时改用目录插件方式，已实测可用：
+OpenCode 启动时由 Bun 从 GitHub 拉取仓库、装进自己的缓存（`~/.cache/opencode/`），随后 `opencode reload` 或重启即生效。升级用 `opencode plugin update`。固定版本时在 spec 后加 ref：
 
 ```sh
-git clone https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugins/superagent-agents
-```
-
-然后重启 OpenCode。
-
-需要固定版本时在 spec 后加 ref（分支、tag 或 commit 都行）：
-
-```sh
-opencode plugin add github:DearWuu/superagent-agents#v0.1.1
+opencode plugin add github:DearWuu/superagent-agents#v0.1.2
 ```
 
 ```jsonc
-{ "plugins": ["github:DearWuu/superagent-agents#v0.1.1"] }
+{ "plugins": ["github:DearWuu/superagent-agents#v0.1.2"] }
 ```
 
-访问不了 GitHub 的环境用方式二。
+当前 opencode 2.2.5 上 `plugin add` / GitHub spec 可能报 `git dep preparation failed`（内嵌安装器的已知问题）。遇到时改用方式一，已实测可用。
 
-### 方式二：目录插件（离线可用）
+### 方式三：手动放目录（离线可用）
 
 把整个目录放到插件目录，由 OpenCode 启动时自动发现：
 
@@ -64,17 +68,17 @@ opencode plugin add github:DearWuu/superagent-agents#v0.1.1
 
 Windows 下全局目录是 `%USERPROFILE%\.config\opencode\plugins\superagent-agents\`。
 
-### 方式三：npm 包（尚未发布到 npm）
+### 方式四：npm 包（尚未发布到 npm）
 
 GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线后才可用。
 
 ```jsonc
 {
-  "plugins": ["superagent-agents@0.1.1"]
+  "plugins": ["superagent-agents@0.1.2"]
 }
 ```
 
-以包名引用时，OpenCode 用 Bun 在启动时把包装进自己的缓存（`~/.cache/opencode/` 下），因此该包必须能从本机 bun 的 registry 取到；离线或内网环境请用方式二。
+以包名引用时，OpenCode 用 Bun 在启动时把包装进自己的缓存（`~/.cache/opencode/` 下），因此该包必须能从本机 bun 的 registry 取到；离线或内网环境请用方式三。
 
 ### 不要用 `file:` 协议
 
@@ -112,6 +116,8 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 **Superagent**（主代理）负责分析需求、拆解任务、方案设计、写任务书与验收标准、派工和验收，不自己写实现代码；**Subagent** 只按任务书实现并回报。面板就是这两者的调度台。
 
+**默认派工规则**：与现有子代理没有关联的新任务一律新建 Subagent，避免无关上下文互相污染；只有同一模块/同一文件的后续修改、验收打回后的返工、类似任务的迭代，才 steer 续跑已有子代理。
+
 **监管等级 L0–L4** 只决定子代理报告要写到多细，不限制它能做什么：
 
 | 等级 | 名称 | 必填章节（逐级累加） | 交付节奏 |
@@ -128,13 +134,19 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 **僵尸兜底**：开了工（有 `time.busy`）但既没有结果也没有 `time.idle` 的子会话（典型是被 shutdown 打断）永远进不了淘汰候选，超过 6 小时按僵死处理，放回淘汰候选。
 
+**子代理行的 `ctx N`**：显示最近一次 assistant 调用的输入侧规模（`input` + `cache read/write`），代表这一次实际送进模型的提示大小，不是累计 token 成本；已完成的 compact 之前的旧记录会跳过，compact 后新一步的读数随之下降。没有用量数据时整段不显示。**严格超过 300K tokens** 才把读数染成警示色并追加 `⚠`，恰好 300K 不警示。
+
+**超长上下文提醒**：服务端每 5 分钟随探针一起扫描，子代理当前上下文严格超过 300K 时，向 root（主代理）发一条 steer 提醒，建议对该子代理执行 compact 或删除重建，不打断子代理本身。每个子代理只提醒一次；compact 后长度较上次提醒下降 ≥30% 会清掉去重记录，允许再次提醒。总开关停用时整轮扫描不执行。
+
+**删除重建与交接**：删除并重建子代理时，插件会尽力注入一页交接摘要（目标、已完成、关键文件、未决项、下一步），读不到会话或生成失败都不阻塞重建，只是退回无交接直接新建。compact 与续跑按内容价值判断：任务需要长上下文时可直接续跑，交接摘要只服务于删除重建，不是续跑的前置动作。
+
 **备用模型**：同一会话内连续 3 次限额类失败（阈值可调 1–10）后自动切到备用模型，每个会话只切一次、切完不回切；切换时子代理上限同步降一档（5→4→3→2，下限 2），不自动恢复。
 
 **critic 他监督复核**：默认关闭。开启后，子代理完成时由一个独立会话复核它的报告，结果写 `~/.local/state/opencode/superagent/critic/`，失败只记日志、不影响主流程。
 
 **超时状态探针**：每 5 分钟扫一次，子代理连续运行满 30 分钟仍未收尾的，发一条只要求回一行状态的探针，避免主代理一直干等；每个会话只探一次。
 
-**协作模式总开关**：下面这些行为可以一键全部停用——硬拦截、限额自动切换、critic 复核、超时探针。开关是全局的，写入 `~/.config/opencode/superagent.json`（`{ "enabled": true }`，尊重 `XDG_CONFIG_HOME`）；文件不存在或内容损坏都按启用处理。停用后右栏只剩一行「agents协作已停用 · 左键开启」，点一下即恢复；服务端切换后最多 5 秒内生效，不需要 `opencode reload`。停用不会改动 `opencode.jsonc`，也不会清理已写入会话的指令条目——提示词存量会保留，重新开启后照常使用。
+**协作模式总开关**：下面这些行为可以一键全部停用——硬拦截、限额自动切换、critic 复核、超时探针、超长上下文提醒。开关是全局的，写入 `~/.config/opencode/superagent.json`（`{ "enabled": true }`，尊重 `XDG_CONFIG_HOME`）；文件不存在或内容损坏都按启用处理。停用后右栏只剩一行「agents协作已停用 · 左键开启」，点一下即恢复；服务端切换后最多 5 秒内生效，不需要 `opencode reload`。停用不会改动 `opencode.jsonc`，也不会清理已写入会话的指令条目——提示词存量会保留，重新开启后照常使用。
 
 ## 设置项
 
@@ -142,7 +154,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 | 设置项 | 作用 |
 | --- | --- |
-| 协作模式总开关 | 已启用/已停用；停用后拦截、切换、复核、探针全部停止，面板只留一行可点回 |
+| 协作模式总开关 | 已启用/已停用；停用后拦截、切换、复核、探针、上下文提醒全部停止，面板只留一行可点回 |
 | 监管力度 | root 默认 L0–L4，或恢复默认 L2 |
 | 当前会话策略 | 报告风格（简洁/详细）、会话补充提示词 |
 | 最大子代理数量 | 1–20，超出自动淘汰最旧已完成 |
@@ -156,7 +168,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 | 配置全局自动模型 | 所有会话共用的自动模型候选列表 |
 | 恢复默认编排策略 | 把默认值重新写入当前会话 |
 
-子代理行上的 `Lx` 徽标：点击可单独固定该子代理的监管等级（root 上的徽标打开最近 20 条监管审计）；点标题打开行操作菜单：修改模型、打开子会话、压缩上下文、保护/取消保护、删除并重建。
+子代理行上的 `Lx` 徽标：点击可单独固定该子代理的监管等级（root 上的徽标打开最近 20 条监管审计）；点标题打开行操作菜单：修改模型、打开子会话、压缩上下文、保护/取消保护、删除并重建（重建时尽力注入交接摘要）。
 
 ## 已知限制
 
@@ -172,7 +184,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 ```sh
 bun install
 sh build.sh     # 校验入口 + 产出 dist/index.js
-bun test        # 7 个测试文件，128 个用例
+bun test        # 10 个测试文件，165 个用例
 ```
 
 - `build.sh` 是**入口守卫**：`package.json` 的 `exports["./tui"]` 必须是 `./index.tsx`，否则直接失败——运行时只认源码入口，改到 `dist` 会让面板失效。
@@ -184,7 +196,7 @@ bun test        # 7 个测试文件，128 个用例
 ## 兼容
 
 - OpenCode **≥ 2.2.5**（目前只在 2.2.5 上实测，更低版本未验证）。
-- 版本 **0.1.1**，0.x 阶段不承诺存储格式兼容。升级前建议清掉旧状态：删除 `~/.local/state/opencode/superagent/` 与 `~/.local/state/opencode/latest/tui/plugin.superagent.agents.*.json`（会丢设置与审计记录）。
+- 版本 **0.1.2**，0.x 阶段不承诺存储格式兼容。升级前建议清掉旧状态：删除 `~/.local/state/opencode/superagent/` 与 `~/.local/state/opencode/latest/tui/plugin.superagent.agents.*.json`（会丢设置与审计记录）。
 - 设置与审计都落在本地状态目录，不联网、不上传。
 
 ## 卸载

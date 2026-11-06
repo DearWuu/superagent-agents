@@ -141,6 +141,10 @@ const HEARTBEAT_LINE =
 /** Inline budgets; anything longer travels as a pointer, not as inline text. */
 const BUDGET_LINE = `预算（内联+指针）：派工任务书内联上限 ${TASK_BRIEF_INLINE_LIMIT} 字，超出部分放文件/消息并在任务书里给指针；报告中单条命令输出内联上限 ${COMMAND_OUTPUT_INLINE_LIMIT} 字，超出给 path:行号 或日志文件指针，不整段粘贴。`
 
+/** Reading discipline while the Subagent works; applies to every level. */
+const CONTEXT_DISCIPLINE_LINE =
+  "上下文纪律（工作过程）：读文件先 grep 定位、再读 path:行号 片段，不整文件粘贴；命令输出超 600 字写日志文件，上下文只留结论+指针；不重复读已读内容；接近上下文窗口时先交一页交接再继续，不硬撑到 compact。"
+
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 
 /**
@@ -265,5 +269,6 @@ export function renderReportProtocol(contract: OversightContract) {
     ...contract.sections.map((section) => `- ${section}`),
     "说明：行为不受限制；证据必须真实（真实执行输出、真实文件引用）；Superagent 可随时翻查 session 完整记录核查。",
     BUDGET_LINE,
+    CONTEXT_DISCIPLINE_LINE,
   ].join("\n")
 }

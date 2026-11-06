@@ -49,9 +49,18 @@
  *    （与 TUI `LONG_RUNNING_THRESHOLD_MS` 同语义），发一条 steer 探针要一行状态。
  *  - 每个子会话只探一次（`probe-claims/` 落盘声明，跨插件实例同样只发一次）；
  *    critic 会话与 root 自身跳过。
+ *
+ * 超长上下文提醒（与面板 ctx 读数同口径）：
+ *  - 复用同一个 5 分钟扫描周期：对带 `superagent.*` 指令条目的 root 家族里的子会话，
+ *    取其最近一次 assistant 调用的输入 token 数（input + cache 读写，跳过 compact 之前的旧记录）。
+ *  - 超过 `CONTEXT_WARN_TOKENS`（300k）就向 **root**（主会话）发一条 steer 提醒，
+ *    建议 compact 或删掉重建；不是发给子代理。
+ *  - 每个子会话只提醒一次（`ctx-claims/` 落盘声明，记着上次提醒时的 token 数）；
+ *    若当前长度较上次提醒下降 ≥30%（compact 过），清掉声明，允许再次提醒。
+ *  - 总开关关闭、critic 会话、root 自身、已结束的子会话都跳过；发送失败只记日志。
  */
 
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -88,6 +97,10 @@ export const QUOTA_TIER_DOWN = true
 export const QUOTA_LIMIT_FLOOR = 2
 /** 僵尸子会话的判定阈值：开了工又没等到收尾，超过这么久就按僵死处理。 */
 export const STALE_AFTER_MS = 6 * 60 * 60 * 1000
+/** 上下文告警阈值：最近一次 assistant 调用的输入侧 token 数超过它才提醒（与面板同口径）。 */
+export const CONTEXT_WARN_TOKENS = 300_000
+/** 视为「compact 过」的下降比例：当前长度较上次提醒时下降 ≥30% 就清掉声明。 */
+export const CONTEXT_DROP_RATIO = 0.3
 /** 判定日志默认落盘位置。 */
 export const DEFAULT_LOG_FILE = path.join(homedir(), ".local", "state", "opencode", "superagent", "hook.log")
 /**
@@ -112,6 +125,10 @@ function criticClaimDir(): string {
 /** 探针声明目录：同一子会话只允许一个插件实例发探针。 */
 function probeClaimDir(): string {
   return path.join(stateRoot(), "probe-claims")
+}
+/** 上下文提醒声明目录：同一子会话只提醒一次，并记着上次提醒时的长度。 */
+function ctxClaimDir(): string {
+  return path.join(stateRoot(), "ctx-claims")
 }
 
 export type Child = {
@@ -252,10 +269,73 @@ export function claimProbe(sessionID: string | undefined, dir: string = probeCla
   return claimOnce(dir, sessionID)
 }
 
+/** 上下文提醒声明文件的路径；sessionID 里不允许出现路径分隔符。 */
+export function contextClaimFile(sessionID: string, dir: string = ctxClaimDir()): string | undefined {
+  const safe = (sessionID ?? "").replace(/[^A-Za-z0-9._-]/g, "")
+  return safe ? path.join(dir, safe) : undefined
+}
+
+/** 读上次提醒时的上下文长度；没有声明或文件读不懂都返回 undefined。 */
+export function readContextClaim(sessionID: string, dir: string = ctxClaimDir()): number | undefined {
+  const file = contextClaimFile(sessionID, dir)
+  if (!file) return undefined
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"))
+    const tokens = isObject(parsed) ? parsed.tokens : undefined
+    return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 清掉上下文提醒声明（compact 之后允许再次提醒）。 */
+export function clearContextClaim(sessionID: string, dir: string = ctxClaimDir()) {
+  const file = contextClaimFile(sessionID, dir)
+  if (!file) return
+  try {
+    rmSync(file, { force: true })
+  } catch {}
+}
+
+/**
+ * 上下文提醒声明：`wx` 独占创建，先写成者独占；已有声明时只有
+ * 「当前长度较上次提醒下降 ≥30%」才清掉重来，避免多实例重复提醒。
+ */
+export function claimContextWarning(
+  sessionID: string,
+  tokens: number,
+  dir: string = ctxClaimDir(),
+): boolean {
+  const file = contextClaimFile(sessionID, dir)
+  if (!file) return true
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    return false
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(file, JSON.stringify({ tokens, at: new Date().toISOString() }), { flag: "wx" })
+      return true
+    } catch (cause) {
+      if ((cause as any)?.code !== "EEXIST") return false
+      const claimed = readContextClaim(sessionID, dir)
+      // 声明文件读不懂（旧格式/半写）：清掉重试一次。
+      if (claimed === undefined) {
+        clearContextClaim(sessionID, dir)
+        continue
+      }
+      if (!contextDropped(claimed, tokens)) return false
+      clearContextClaim(sessionID, dir)
+    }
+  }
+  return false
+}
+
 /** 清掉过期的声明，避免声明目录无限增长。 */
 function pruneClaims(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
   const cutoff = Date.now() - maxAgeMs
-  for (const dir of [criticClaimDir(), probeClaimDir()]) {
+  for (const dir of [criticClaimDir(), probeClaimDir(), ctxClaimDir()]) {
     try {
       for (const name of readdirSync(dir)) {
         const full = path.join(dir, name)
@@ -579,6 +659,207 @@ export function createCtxProbeScanner(
       await ctx.session.prompt({ sessionID, text, delivery: "steer" })
     },
     claim: options.claim ?? claimProbe,
+    log: write,
+    now: options.now,
+    enabled: options.enabled,
+  })
+}
+
+/** 最近一次 assistant 调用的输入侧 token 数；无数据返回 undefined。 */
+export function contextTokens(messages: ReadonlyArray<any> | undefined): number | undefined {
+  if (!messages || messages.length === 0) return undefined
+  // 与 TUI 面板同口径：跳过已经完成的 compact 之前的旧记录，取新一步的输入。
+  const boundary = messages.findLastIndex((message) => message?.type === "compaction" && message?.status === "completed")
+  for (let index = messages.length - 1; index > boundary; index -= 1) {
+    const message = messages[index]
+    if (message?.type !== "assistant" || !isObject(message.tokens)) continue
+    const tokens = message.tokens
+    const cache = isObject(tokens.cache) ? tokens.cache : {}
+    const input = numberOrZero(tokens.input) + numberOrZero(cache.read) + numberOrZero(cache.write)
+    return input > 0 ? input : undefined
+  }
+  return undefined
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+/** 是否已超过上下文告警阈值（严格大于 300k）。 */
+export function isContextOverLimit(tokens: number | undefined): tokens is number {
+  return typeof tokens === "number" && Number.isFinite(tokens) && tokens > CONTEXT_WARN_TOKENS
+}
+
+/** 当前长度较上次提醒时是否下降 ≥30%（视为 compact 过）。 */
+export function contextDropped(previous: number | undefined, current: number): boolean {
+  return previous !== undefined && previous > 0 && previous - current >= previous * CONTEXT_DROP_RATIO
+}
+
+/**
+ * 该子会话是否进入上下文检查：critic 会话、已结束且不在运行中的都跳过；
+ * root 自身与总开关在扫描器里跳过。
+ */
+export function shouldCheckContext(candidate: ProbeCandidate): boolean {
+  if (!candidate.id) return false
+  if (isCriticSession(candidate)) return false
+  if (candidate.outcome != null) {
+    const running = candidate.busy !== undefined && (candidate.idle === undefined || candidate.busy > candidate.idle)
+    if (!running) return false
+  }
+  return true
+}
+
+/** 发给 root 的提醒文案：指向具体子代理，给出 compact / 删除重建两条路。 */
+export function ctxWarningText(title: string | undefined, sessionID: string, tokens: number): string {
+  const label = typeof title === "string" && title.trim().length > 0 ? title.trim() : "未命名"
+  const k = Math.round(tokens / 1000)
+  const limitK = Math.round(CONTEXT_WARN_TOKENS / 1000)
+  return `[上下文提醒] 子代理「${label}」(${sessionID}) 当前上下文约 ${k}k tokens（>${limitK}k）。建议：对其执行 compact，或删除重建（可用交接摘要续接）。`
+}
+
+export type CtxWarningScannerDeps = {
+  /** 列出全部会话（root 与各层子会话都在内）。 */
+  listSessions: () => Promise<ProbeCandidate[]>
+  /** 沿 parentID 上溯到 family root。 */
+  resolveRoot: (sessionID: string) => Promise<string | undefined>
+  /** 该 root 是否带 superagent 配置（任意 `superagent.*` 指令条目）。 */
+  rootIsConfigured: (rootID: string) => Promise<boolean>
+  /** 读该会话最近一次 assistant 调用的输入 token 数。 */
+  readTokens: (sessionID: string) => Promise<number | undefined>
+  /** 向 root 发 steer 提醒。 */
+  sendWarn: (rootID: string, text: string) => Promise<void>
+  /** 跨实例去重：返回 false 表示已经提醒过（且未 compact）。 */
+  claim?: (sessionID: string, tokens: number) => boolean
+  /** 总开关：返回 false 时整轮扫描不做任何事。 */
+  enabled?: () => boolean
+  log: (record: Record<string, unknown>) => void
+  now?: () => number
+}
+
+/**
+ * 超长上下文扫描器。每个子会话只提醒一次；长度下降 ≥30% 后清声明、允许再次提醒。
+ * 失败一律只记日志：读不到长度或发不出提醒都不影响会话本身。
+ */
+export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
+  /** root → 是否带 superagent 配置；一个 root 只查一次。 */
+  const configured = new Map<string, boolean>()
+  return {
+    async scan(): Promise<number> {
+      if (deps.enabled && !deps.enabled()) return 0
+      let candidates: ProbeCandidate[]
+      try {
+        candidates = await deps.listSessions()
+      } catch (cause) {
+        deps.log({ event: "ctx-scan-failed", decision: "error", cause: errorText(cause) })
+        return 0
+      }
+      let sent = 0
+      for (const candidate of candidates) {
+        if (!shouldCheckContext(candidate)) continue
+        let rootID: string | undefined
+        try {
+          rootID = await deps.resolveRoot(candidate.id)
+        } catch (cause) {
+          deps.log({ event: "ctx-root-failed", decision: "error", childSessionID: candidate.id, cause: errorText(cause) })
+          continue
+        }
+        // root 自己不是子代理。
+        if (!rootID || rootID === candidate.id) continue
+        let managed = configured.get(rootID)
+        if (managed === undefined) {
+          try {
+            managed = await deps.rootIsConfigured(rootID)
+          } catch (cause) {
+            deps.log({ event: "ctx-config-failed", decision: "error", root: rootID, cause: errorText(cause) })
+            continue
+          }
+          configured.set(rootID, managed)
+        }
+        if (!managed) continue
+
+        let tokens: number | undefined
+        try {
+          tokens = await deps.readTokens(candidate.id)
+        } catch (cause) {
+          deps.log({ event: "ctx-read-failed", decision: "error", childSessionID: candidate.id, root: rootID, cause: errorText(cause) })
+          continue
+        }
+        if (tokens === undefined) continue
+
+        const claimed = readContextClaim(candidate.id)
+        const dropped = contextDropped(claimed, tokens)
+        // compact 过：清掉声明，允许当前这轮重新提醒。
+        if (dropped) clearContextClaim(candidate.id)
+        if (!isContextOverLimit(tokens)) continue
+        if (claimed !== undefined && !dropped) continue
+
+        const claim = deps.claim ?? claimContextWarning
+        if (!claim(candidate.id, tokens)) continue
+        try {
+          await deps.sendWarn(rootID, ctxWarningText(candidate.title, candidate.id, tokens))
+          sent++
+          deps.log({ event: "ctx-warn", decision: "allow", childSessionID: candidate.id, tokens, root: rootID })
+        } catch (cause) {
+          // 先登记再发：发送失败也不在 5 分钟后重复轰炸同一个会话。
+          deps.log({
+            event: "ctx-warn-failed",
+            decision: "error",
+            childSessionID: candidate.id,
+            tokens,
+            root: rootID,
+            cause: errorText(cause),
+          })
+        }
+      }
+      return sent
+    },
+  }
+}
+
+/** 读会话消息列表：V2 插件 ctx 走 `session.context`，兼容顶层 `message.list`。 */
+async function readSessionMessages(ctx: any, sessionID: string): Promise<any[]> {
+  if (typeof ctx?.session?.context === "function") return asArray(await ctx.session.context({ sessionID }))
+  if (typeof ctx?.message?.list === "function") return asArray(await ctx.message.list({ sessionID }))
+  return []
+}
+
+/**
+ * 从插件 ctx 建出超长上下文扫描器（真实接线）。抽出来让集成测试能用假的 ctx 驱动。
+ */
+export function createCtxContextWarningScanner(
+  ctx: any,
+  options: {
+    now?: () => number
+    claim?: (sessionID: string, tokens: number) => boolean
+    log?: (record: Record<string, unknown>) => void
+    limit?: number
+    enabled?: () => boolean
+  } = {},
+) {
+  const write = options.log ?? log
+  return createCtxWarningScanner({
+    listSessions: async () => {
+      const items = asArray(await ctx.session.list({ limit: options.limit ?? 200, order: "desc" }))
+      return items
+        .filter((item) => isObject(item) && item.time?.archived === undefined)
+        .map((item) => toProbeCandidate(item))
+    },
+    resolveRoot: async (sessionID) => {
+      try {
+        return await findRoot(ctx, sessionID)
+      } catch {
+        return undefined
+      }
+    },
+    rootIsConfigured: async (rootID) => {
+      const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+      return entries.some((entry) => typeof entry?.key === "string" && entry.key.startsWith("superagent."))
+    },
+    readTokens: async (sessionID) => contextTokens(await readSessionMessages(ctx, sessionID)),
+    sendWarn: async (rootID, text) => {
+      await ctx.session.prompt({ sessionID: rootID, text, delivery: "steer" })
+    },
+    claim: options.claim ?? claimContextWarning,
     log: write,
     now: options.now,
     enabled: options.enabled,
@@ -1262,7 +1543,11 @@ export default {
 
     // 超时状态探针：只探带 superagent 配置的 root 家族里的子会话。
     const probeScanner = createCtxProbeScanner(ctx, { enabled: () => collabEnabled() })
-    const probeTimer = startProbeTimer(() => probeScanner.scan())
+    // 超长上下文提醒：同一个 5 分钟周期内检查子代理的最近一次输入规模。
+    const ctxScanner = createCtxContextWarningScanner(ctx, { enabled: () => collabEnabled() })
+    const probeTimer = startProbeTimer(async () => {
+      await Promise.allSettled([probeScanner.scan(), ctxScanner.scan()])
+    })
 
     pruneClaims()
 
