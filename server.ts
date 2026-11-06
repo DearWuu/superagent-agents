@@ -51,7 +51,7 @@
  *    critic 会话与 root 自身跳过。
  */
 
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -155,6 +155,78 @@ export function log(record: Record<string, unknown>) {
   } catch {
     // 日志失败不能影响拦截本身。
   }
+}
+
+/**
+ * 协作模式总开关的配置文件：`<XDG_CONFIG_HOME>/opencode/superagent.json`，
+ * 内容形如 `{ "enabled": true }`。文件不存在、字段缺失或 JSON 损坏都按启用处理，
+ * 保证「装了插件就全开」的默认体验，也让误删/写坏配置不会把功能永久关死。
+ */
+export const COLLAB_SWITCH_TTL_MS = 5000
+
+export function collabSwitchPath(): string {
+  const xdg = process.env.XDG_CONFIG_HOME?.trim()
+  return path.join(xdg ? xdg : path.join(homedir(), ".config"), "opencode", "superagent.json")
+}
+
+export type CollabSwitchState = { enabled: boolean; reason: "configured" | "default" | "corrupt" }
+
+/** 开关的短缓存：钩子每次调用都会问，不能每次都同步读盘。 */
+let collabSwitchCache: { checkedAt: number; state: CollabSwitchState } | undefined
+/** 最近一次记过日志的开关状态，只在状态变化时落一条。 */
+let collabLastLogged: { enabled: boolean; reason: string } | undefined
+
+export function resetCollabSwitchCache() {
+  collabSwitchCache = undefined
+  collabLastLogged = undefined
+}
+
+export function readCollabSwitchState(now = Date.now()): CollabSwitchState {
+  if (collabSwitchCache && now - collabSwitchCache.checkedAt < COLLAB_SWITCH_TTL_MS) {
+    return collabSwitchCache.state
+  }
+  let state: CollabSwitchState
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(collabSwitchPath(), "utf8"))
+    const configured = isObject(parsed) && typeof parsed.enabled === "boolean"
+    state = { enabled: configured ? (parsed as any).enabled : true, reason: configured ? "configured" : "default" }
+  } catch (cause: any) {
+    state = { enabled: true, reason: cause?.code === "ENOENT" ? "default" : "corrupt" }
+  }
+  collabSwitchCache = { checkedAt: now, state }
+  return state
+}
+
+export function readCollabSwitch(now = Date.now()): boolean {
+  return readCollabSwitchState(now).enabled
+}
+
+/**
+ * 服务端所有协作行为的入口判据：停用时每条钩子直接返回，零副作用。
+ * 状态翻转（含配置损坏）在 hook.log 留一条记录，便于排查「为什么没拦截」。
+ */
+export function collabEnabled(now = Date.now()): boolean {
+  const state = readCollabSwitchState(now)
+  const changed = !collabLastLogged || collabLastLogged.enabled !== state.enabled
+  if (changed) {
+    log({
+      event: state.enabled ? "collab-switch-enabled" : "collab-switch-disabled",
+      decision: state.enabled ? "allow" : "skip",
+      enabled: state.enabled,
+      path: collabSwitchPath(),
+    })
+  }
+  if (state.reason === "corrupt" && collabLastLogged?.reason !== "corrupt") {
+    log({
+      event: "collab-switch-corrupt",
+      decision: "allow",
+      enabled: true,
+      path: collabSwitchPath(),
+      note: "配置读不懂，按启用处理",
+    })
+  }
+  collabLastLogged = { enabled: state.enabled, reason: state.reason }
+  return state.enabled
 }
 
 /** 一次性的跨实例声明：mkdir 原子，先创建成功者独占。 */
@@ -398,6 +470,8 @@ export type ProbeScannerDeps = {
   sendProbe: (sessionID: string, text: string) => Promise<void>
   /** 跨实例去重：返回 false 表示别的实例已经探过这个会话。 */
   claim?: (sessionID: string) => boolean
+  /** 总开关：返回 false 时整轮扫描不做任何事（不列会话、不发探针）。 */
+  enabled?: () => boolean
   log: (record: Record<string, unknown>) => void
   now?: () => number
 }
@@ -414,6 +488,8 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
   return {
     probed,
     async scan(): Promise<number> {
+      // 总开关关闭：不列会话、不查 root、不发探针。
+      if (deps.enabled && !deps.enabled()) return 0
       let candidates: ProbeCandidate[]
       try {
         candidates = await deps.listSessions()
@@ -477,6 +553,7 @@ export function createCtxProbeScanner(
     claim?: (sessionID: string) => boolean
     log?: (record: Record<string, unknown>) => void
     limit?: number
+    enabled?: () => boolean
   } = {},
 ) {
   const write = options.log ?? log
@@ -504,6 +581,7 @@ export function createCtxProbeScanner(
     claim: options.claim ?? claimProbe,
     log: write,
     now: options.now,
+    enabled: options.enabled,
   })
 }
 
@@ -901,6 +979,8 @@ export default {
     }
 
     const before = await ctx.tool.hook("execute.before", async (event: any) => {
+      // 总开关优先：停用时连是不是 subagent 都不判断，直接放行。
+      if (!collabEnabled()) return
       // 快路径：不是 subagent 立即返回，不做任何查询。
       if (event?.tool !== TOOL_NAME) return
       const input = isObject(event.input) ? event.input : undefined
@@ -1110,6 +1190,7 @@ export default {
     })
 
     const after = await ctx.tool.hook("execute.after", async (event: any) => {
+      // 停用时 before 从未登记，这里只需清理可能残留的登记（纯内部簿记，无外部副作用）。
       if (event?.tool !== TOOL_NAME) return
       try {
         const entry = pending.get(event.id)
@@ -1126,6 +1207,8 @@ export default {
     // 不会打断正在执行的轮次；切换成功时把决策翻成继续重试。钩子里的异常一律吞掉。
     const retry = await ctx.session.hook("retry", async (event: any) => {
       try {
+        // 停用时不计数、不切换，连 root 都不查。
+        if (!collabEnabled()) return
         if (!isQuotaFailure(event?.error)) return
         const sessionID = typeof event?.sessionID === "string" ? event.sessionID : undefined
         if (!sessionID) return
@@ -1166,7 +1249,10 @@ export default {
           const sessionID = eventSessionID(event)
           if (!sessionID) continue
           quotaFallback.reset(sessionID)
-          if (event?.type === "session.execution.succeeded") void reviewAfterSuccess(sessionID, event?.id)
+          // 停用时复核不触发。
+          if (event?.type === "session.execution.succeeded" && collabEnabled()) {
+            void reviewAfterSuccess(sessionID, event?.id)
+          }
         }
       } catch {
         // 事件流断开只是不再清零计数，不影响拦截与切换。
@@ -1175,7 +1261,7 @@ export default {
     void resetSubscription
 
     // 超时状态探针：只探带 superagent 配置的 root 家族里的子会话。
-    const probeScanner = createCtxProbeScanner(ctx)
+    const probeScanner = createCtxProbeScanner(ctx, { enabled: () => collabEnabled() })
     const probeTimer = startProbeTimer(() => probeScanner.scan())
 
     pruneClaims()

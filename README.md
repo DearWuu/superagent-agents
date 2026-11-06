@@ -25,14 +25,22 @@ opencode plugin add github:DearWuu/superagent-agents
 
 OpenCode 启动时由 Bun 从 GitHub 拉取仓库、装进自己的缓存（`~/.cache/opencode/`），随后 `opencode reload` 或重启即生效。升级用 `opencode plugin update`。
 
+当前 opencode 2.2.5 上 `plugin add` 可能报 `git dep preparation failed`（内嵌安装器的已知问题）。遇到时改用目录插件方式，已实测可用：
+
+```sh
+git clone https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugins/superagent-agents
+```
+
+然后重启 OpenCode。
+
 需要固定版本时在 spec 后加 ref（分支、tag 或 commit 都行）：
 
 ```sh
-opencode plugin add github:DearWuu/superagent-agents#v0.1.0
+opencode plugin add github:DearWuu/superagent-agents#v0.1.1
 ```
 
 ```jsonc
-{ "plugins": ["github:DearWuu/superagent-agents#v0.1.0"] }
+{ "plugins": ["github:DearWuu/superagent-agents#v0.1.1"] }
 ```
 
 访问不了 GitHub 的环境用方式二。
@@ -62,7 +70,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 ```jsonc
 {
-  "plugins": ["superagent-agents@0.1.0"]
+  "plugins": ["superagent-agents@0.1.1"]
 }
 ```
 
@@ -126,12 +134,15 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 **超时状态探针**：每 5 分钟扫一次，子代理连续运行满 30 分钟仍未收尾的，发一条只要求回一行状态的探针，避免主代理一直干等；每个会话只探一次。
 
+**协作模式总开关**：下面这些行为可以一键全部停用——硬拦截、限额自动切换、critic 复核、超时探针。开关是全局的，写入 `~/.config/opencode/superagent.json`（`{ "enabled": true }`，尊重 `XDG_CONFIG_HOME`）；文件不存在或内容损坏都按启用处理。停用后右栏只剩一行「agents协作已停用 · 左键开启」，点一下即恢复；服务端切换后最多 5 秒内生效，不需要 `opencode reload`。停用不会改动 `opencode.jsonc`，也不会清理已写入会话的指令条目——提示词存量会保留，重新开启后照常使用。
+
 ## 设置项
 
 点击面板标题「agents协作」打开设置：
 
 | 设置项 | 作用 |
 | --- | --- |
+| 协作模式总开关 | 已启用/已停用；停用后拦截、切换、复核、探针全部停止，面板只留一行可点回 |
 | 监管力度 | root 默认 L0–L4，或恢复默认 L2 |
 | 当前会话策略 | 报告风格（简洁/详细）、会话补充提示词 |
 | 最大子代理数量 | 1–20，超出自动淘汰最旧已完成 |
@@ -161,7 +172,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 ```sh
 bun install
 sh build.sh     # 校验入口 + 产出 dist/index.js
-bun test        # 6 个测试文件，114 个用例
+bun test        # 7 个测试文件，128 个用例
 ```
 
 - `build.sh` 是**入口守卫**：`package.json` 的 `exports["./tui"]` 必须是 `./index.tsx`，否则直接失败——运行时只认源码入口，改到 `dist` 会让面板失效。
@@ -173,7 +184,7 @@ bun test        # 6 个测试文件，114 个用例
 ## 兼容
 
 - OpenCode **≥ 2.2.5**（目前只在 2.2.5 上实测，更低版本未验证）。
-- 版本 **0.1.0**，0.x 阶段不承诺存储格式兼容。升级前建议清掉旧状态：删除 `~/.local/state/opencode/superagent/` 与 `~/.local/state/opencode/latest/tui/plugin.superagent.agents.*.json`（会丢设置与审计记录）。
+- 版本 **0.1.1**，0.x 阶段不承诺存储格式兼容。升级前建议清掉旧状态：删除 `~/.local/state/opencode/superagent/` 与 `~/.local/state/opencode/latest/tui/plugin.superagent.agents.*.json`（会丢设置与审计记录）。
 - 设置与审计都落在本地状态目录，不联网、不上传。
 
 ## 卸载

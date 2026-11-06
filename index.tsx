@@ -4,6 +4,7 @@ import { Plugin as PluginDef } from "@opencode/plugin/tui"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import { appendFile, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import {
@@ -69,6 +70,7 @@ type ModelChoice =
   | { kind: "configure" }
 
 type SettingsAction =
+  | { kind: "collabSwitch" }
   | { kind: "oversight" }
   | { kind: "policy" }
   | { kind: "maxSubagents" }
@@ -200,6 +202,47 @@ type ModelPreference = {
 function defaultModelPreferencePath() {
   const state = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")
   return join(state, "opencode", "model.json")
+}
+
+/**
+ * 协作模式总开关：与 server 入口读同一个文件 `<XDG_CONFIG_HOME>/opencode/superagent.json`
+ * （`{ "enabled": true }`）。TUI 侧独立实现一份带短缓存的读取，避免面板渲染时反复读盘。
+ * 缺文件 / 读不懂一律按启用处理。
+ */
+export const COLLAB_SWITCH_TTL_MS = 5000
+
+export function collabSwitchPath() {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config")
+  return join(base, "opencode", "superagent.json")
+}
+
+let collabSwitchCache: { checkedAt: number; enabled: boolean } | undefined
+
+export function resetCollabSwitchCache() {
+  collabSwitchCache = undefined
+}
+
+export function readCollabEnabled(now = Date.now()) {
+  if (collabSwitchCache && now - collabSwitchCache.checkedAt < COLLAB_SWITCH_TTL_MS) return collabSwitchCache.enabled
+  let enabled = true
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(collabSwitchPath(), "utf8"))
+    if (parsed && typeof parsed === "object" && typeof (parsed as Record<string, unknown>).enabled === "boolean") {
+      enabled = Boolean((parsed as Record<string, unknown>).enabled)
+    }
+  } catch {
+    enabled = true
+  }
+  collabSwitchCache = { checkedAt: now, enabled }
+  return enabled
+}
+
+/** 写开关并立即刷新本地缓存，面板无需等下一次轮询。 */
+export async function writeCollabSwitch(enabled: boolean) {
+  const file = collabSwitchPath()
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, JSON.stringify({ enabled }, null, 2) + "\n", "utf8")
+  collabSwitchCache = { checkedAt: Date.now(), enabled }
 }
 
 
@@ -1287,6 +1330,17 @@ export function SidebarAgents(props: {
   const clock = setInterval(() => setNow(Date.now()), 60_000)
   onCleanup(() => clearInterval(clock))
 
+  /** 协作模式总开关：1s 轮询一次带短缓存的读取，外部改动最迟 5s 生效。 */
+  const [collabOn, setCollabOn] = createSignal(readCollabEnabled())
+  const collabClock = setInterval(() => setCollabOn(readCollabEnabled()), 1_000)
+  onCleanup(() => clearInterval(collabClock))
+
+  async function setCollabEnabled(enabled: boolean) {
+    await writeCollabSwitch(enabled)
+    setCollabOn(enabled)
+    props.context.ui.toast.show({ message: enabled ? "agents协作已启用。" : "agents协作已停用。" })
+  }
+
   /** 一行的状态。root 行不带时长。 */
   const rowStatus = (row: FlatNode) =>
     row.node.sessionID
@@ -1951,6 +2005,13 @@ export function SidebarAgents(props: {
       title: "agents协作设置",
       options: [
         {
+          value: { kind: "collabSwitch" },
+          title: "协作模式总开关",
+          description: collabOn()
+            ? "已启用 · 关闭后拦截、切换、复核、探针全部停止"
+            : "已停用 · 面板只留一行，左键可重新开启",
+        },
+        {
           value: { kind: "oversight" },
           title: "监管力度",
           description: `${oversightLabel(rootOversight())} · ${rootOversight().source === "pin" ? "已固定" : "默认"}`,
@@ -2018,6 +2079,7 @@ export function SidebarAgents(props: {
       ],
     })
     if (!selected) return
+    if (selected.kind === "collabSwitch") return setCollabEnabled(!collabOn())
     if (selected.kind === "oversight") return openOversight()
     if (selected.kind === "policy") return openPolicyEditor()
     if (selected.kind === "maxSubagents") return editMaxSubagents()
@@ -2143,6 +2205,7 @@ export function SidebarAgents(props: {
   }
   createEffect(() => {
     if (!ready()) return
+    if (!collabOn()) return
     directSubagents().length
     subagentLimit()
     void evictExcessSubagents()
@@ -2187,7 +2250,24 @@ export function SidebarAgents(props: {
   }
 
   return (
-    <Show when={tree()}>
+    <Show
+      when={collabOn()}
+      fallback={
+        <box id="sidebar.agents" flexDirection="column">
+          <text
+            id="sidebar.agents.disabled"
+            fg={theme.text.muted}
+            onMouseUp={(event) => {
+              if (event.button !== 0) return
+              void setCollabEnabled(true)
+            }}
+          >
+            agents协作已停用 · 左键开启
+          </text>
+        </box>
+      }
+    >
+      <Show when={tree()}>
       {(value) => (
         <box
           id="sidebar.agents"
@@ -2351,6 +2431,7 @@ export function SidebarAgents(props: {
           </Show>
         </box>
       )}
+      </Show>
     </Show>
   )
 }
