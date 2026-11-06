@@ -1,0 +1,47 @@
+{
+  "name": "superagent-agents",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./tui": "./index.tsx",
+    "./server": "./server.ts"
+  },
+  "files": [
+    "index.tsx",
+    "server.ts",
+    "agent-tree.ts",
+    "critic.ts",
+    "model-policy.ts",
+    "oversight.ts",
+    "run-duration.ts",
+    "session-scope.ts",
+    "storage-migration.ts",
+    "subagent-limit.ts",
+    "build.sh",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "sh ./build.sh"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.2.5",
+    "@opentui/solid": "^0.8.2",
+    "solid-js": "^1.9.18"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.2.5",
+    "@opentui/solid": ">=0.8.0",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  }
+}
