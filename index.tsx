@@ -934,6 +934,8 @@ export function SidebarAgents(props: {
   createEffect(() => {
     const id = rootSessionID()
     if (!id) return
+    // 停用时不为会话初始化/补写指令条目；重新开启后本 effect 会再跑。
+    if (!collabOn()) return
     void initializeInstructions().catch(() => {})
   })
   async function putInstruction(key: string, value: string | number) {
