@@ -132,9 +132,9 @@ describe("阈值与下降判定", () => {
     expect(contextDropped(undefined, 100_000)).toBe(false)
   })
 
-  test("提醒文案指向子代理并给出两条处置路径", () => {
+  test("提醒文案指向子代理并区分 compact 与删除边界", () => {
     expect(ctxWarningText("修复登录", "ses_child", 301_400)).toBe(
-      "[上下文提醒] 子代理「修复登录」(ses_child) 当前上下文约 301k tokens（>300k）。建议：对其执行 compact，或删除重建（可用交接摘要续接）。",
+      "[上下文提醒] 子代理「修复登录」(ses_child) 当前上下文约 301k tokens（>300k）。建议：需要保留上下文时对其执行 compact；不再需要上下文时才删除。",
     )
     expect(ctxWarningText("  ", "ses_child", 350_000)).toContain("「未命名」")
   })

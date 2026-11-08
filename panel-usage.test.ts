@@ -105,16 +105,29 @@ describe("contextUsageView", () => {
       warning: true,
     })
   })
+
+  test("128K 模型窗口按 80% 收紧，严格超过 102400 才警示", () => {
+    const model = { limit: { context: 128_000 } }
+    expect(tui.contextUsageView([assistant(102_400)], model)!.warning).toBe(false)
+    expect(tui.contextUsageView([assistant(102_401)], model)!.warning).toBe(true)
+  })
+
+  test("无窗口数据保持 300K；大于 375K 的窗口也封顶 300K", () => {
+    expect(tui.contextUsageView([assistant(300_000)], {})!.warning).toBe(false)
+    expect(tui.contextUsageView([assistant(300_001)], {})!.warning).toBe(true)
+    expect(tui.contextUsageView([assistant(300_000)], { limit: { context: 1_000_000 } })!.warning).toBe(false)
+    expect(tui.contextUsageView([assistant(300_001)], { limit: { context: 1_000_000 } })!.warning).toBe(true)
+  })
 })
 
 describe("OVERSIGHT_LEVEL_DESCRIPTIONS", () => {
   test("五级都介绍管到什么程度，不再是操作说明", () => {
     expect(tui.OVERSIGHT_LEVEL_DESCRIPTIONS).toEqual({
-      0: "只交结果：改动/测试/风险，完成时一次汇报",
-      1: "加命令清单与阶段小结，完成时一次汇报",
-      2: "加阅读记录与失败详情，证据可核查（默认）",
-      3: "加完整输出与代码摘录，每阶段中途简报",
-      4: "逐步汇报动机与假设，全程可审计",
+      0: "只交结果：改动/测试/风险，完成时一次汇报 · 结果验收（低风险）",
+      1: "加命令清单与阶段小结，完成时一次汇报 · 摘要验收（常规）",
+      2: "加阅读记录与失败详情，证据可核查（默认） · 证据验收（默认）",
+      3: "加完整输出与代码摘录，每阶段中途简报 · 全量验收（严格）",
+      4: "逐步汇报动机与假设，全程可审计 · 审计验收（独立 critic）",
     })
     for (const text of Object.values(tui.OVERSIGHT_LEVEL_DESCRIPTIONS)) {
       expect(text).not.toContain("点击固定")
@@ -122,14 +135,25 @@ describe("OVERSIGHT_LEVEL_DESCRIPTIONS", () => {
   })
 })
 describe("SUPERAGENT_DEFAULTS.sessionPrompt", () => {
-  test("在「主代理不做具体实现」之后、验收之前给出派工新建与续跑规则", () => {
+  test("保留硬约束并引用编排、验收、上下文技能", () => {
     const prompt = tui.SUPERAGENT_DEFAULTS.sessionPrompt
-    expect(prompt).toContain("派工新建与续跑：")
-    expect(prompt).toContain("一律新建 Subagent")
-    expect(prompt).toContain("任务需要这些上下文则直接续跑；无必要则先 compact 再续跑")
-    expect(prompt).toContain("交接摘要仅用于删除重建场景，不是续跑的前置动作")
-    expect(prompt).not.toContain("则新建并附交接摘要")
-    expect(prompt.indexOf("派工新建与续跑")).toBeGreaterThan(prompt.indexOf("主代理不做具体实现"))
-    expect(prompt.indexOf("派工新建与续跑")).toBeLessThan(prompt.indexOf("验收："))
+    expect(prompt).toContain("主代理不做具体实现")
+    expect(prompt).toContain("只读分析")
+    expect(prompt).toContain("亲眼看实际渲染结果")
+    expect(prompt).toContain("superagent-orchestration")
+    expect(prompt).toContain("superagent-acceptance")
+    expect(prompt).toContain("superagent-context")
+    expect(prompt).toContain("先判断任务是否适合 Flash")
+    expect(prompt).toContain("默认上限 2")
+    expect(prompt).toContain("限额切换不等于能力升级")
+    expect(prompt).not.toContain("七字段")
+    expect(prompt.length).toBeLessThan(1800)
+  })
+
+  test("taskPrompt 精简并引用任务契约与升级触发", () => {
+    const prompt = tui.SUPERAGENT_DEFAULTS.taskPrompt
+    expect(prompt).toContain("任务契约")
+    expect(prompt).toContain("能力升级")
+    expect(prompt.length).toBeLessThan(200)
   })
 })

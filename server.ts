@@ -35,9 +35,28 @@
  *  - 切换触发时把 root 的 `superagent.max-subagents` 降一档（5→4→3→2，下限 2），
  *    由常量 `QUOTA_TIER_DOWN` 控制；不自动恢复。
  *
+ * 旗舰子代理：
+ *  - 新 root key `superagent.max-flagship-subagents`（默认 2，合法 0..20，非法回退 2，
+ *    实际再受 `superagent.max-subagents` 总上限约束）；旗舰 = 与 root 同
+ *    provider/model/variant，未知模型不按旗舰计。
+ *  - 新建与 steer 前预测有效模型（`input.model ?? agent.model ?? parent.model`），
+ *    存在数 + 在途数（含本次）分别计数；旗舰超限先淘汰最旧已完成旗舰，
+ *    运行中/steer/保护名单不删，无可淘汰则明确拒绝。
+ *  - `session.created` / `session.model.selected` 在 child 自身写或清
+ *    `metadata["superagent.flagship"] = { model, at }`；root 切模型不清洗旧 child 标记。
+ *
+ * 保护子会话的模型硬约束：
+ *  - 命中保护名单（`superagent.kept-subagents`）的子会话，steer 到它时模型也不可改：
+ *    显式 `input.model`、或切换 agent 时 `agent.model` 带来的模型变化都被拒绝（ToolError，
+ *    提示先取消保护）；同模型续跑、未指定模型且不换 agent 的普通 steer 照常放行。
+ *  - 限额备用切换同样跳过保护中的会话：不计失败、不切模型、不强制重试（记 `fallback-kept-model`）。
+ *  - 保护名单读不到时按无保护处理（fail-open）并记 `kept-read-failed`。
+ *  - TUI 直接调 `session.switchModel` 的路径不在这里拦截，也不做模型回滚。
+ *
  * 子代理复核（critic）：
  *  - 监听 `session.execution.succeeded`；只有 root 的 `superagent.critic-enabled`
- *    为真、且完成的是「root 家族里的非 root、非 critic 子会话」时才复核。
+ *    为真、且完成的是「root 家族里的非 root、非 critic 子会话」时才复核；
+ *    `superagent.oversight-level`（child 优先，其次 root，默认 L2）为 L4 时强制复核。
  *  - 复核在后台异步跑（`critic.ts`），失败只记日志，绝不影响会话主流程；
  *    结果写 critic 审计 JSONL，另外在 hook.log 留一条 `critic-finished`。
  *  - 同一完成事件可能被多个插件实例收到（reload 后旧订阅未必及时释放），
@@ -53,8 +72,10 @@
  * 超长上下文提醒（与面板 ctx 读数同口径）：
  *  - 复用同一个 5 分钟扫描周期：对带 `superagent.*` 指令条目的 root 家族里的子会话，
  *    取其最近一次 assistant 调用的输入 token 数（input + cache 读写，跳过 compact 之前的旧记录）。
- *  - 超过 `CONTEXT_WARN_TOKENS`（300k）就向 **root**（主会话）发一条 steer 提醒，
- *    建议 compact 或删掉重建；不是发给子代理。
+ *  - 阈值复用 `context-policy.ts`：有模型窗口时 `min(300K, floor(window * 0.8))`，
+ *    否则 300K；窗口经 `session.model` + `ctx.model.list` 的 `limit.context` 读取并缓存，
+ *    查询失败回退 300K。严格超过阈值才向 **root**（主会话）发 steer 提醒，
+ *    建议 compact；不再需要上下文时才删除，不是发给子代理。
  *  - 每个子会话只提醒一次（`ctx-claims/` 落盘声明，记着上次提醒时的 token 数）；
  *    若当前长度较上次提醒下降 ≥30%（compact 过），清掉声明，允许再次提醒。
  *  - 该 root 的协作总开关关闭、critic 会话、root 自身、已结束的子会话都跳过；发送失败只记日志。
@@ -65,6 +86,27 @@ import { homedir } from "node:os"
 import path from "node:path"
 
 import { criticReview, isCriticSession, lastAssistantText } from "./critic"
+import { DEFAULT_CONTEXT_WARN_TOKENS, contextWarnThreshold, modelContextWindow } from "./context-policy"
+import { isFlagshipSession } from "./flagship"
+import {
+  FLAGSHIP_METADATA_KEY,
+  effectiveFlagshipLimit,
+  flagshipDenyMessage,
+  flagshipFormula,
+  hasFlagshipMarker,
+  isFlagshipModel,
+  isFlagshipOverLimit,
+  normalizeFlagshipModel,
+  pickFlagshipVictim,
+  readMaxFlagshipSubagents,
+  resolveNewSubagentModel,
+  resolveSteerSubagentModel,
+  sameFlagshipModel,
+  withFlagshipMarker,
+  withoutFlagshipMarker,
+} from "./flagship-admission"
+import { DEFAULT_OVERSIGHT_LEVEL } from "./oversight"
+import { SUPERAGENT_SKILLS } from "./skills"
 
 const PLUGIN_ID = "superagent-agents-hardlimit"
 const TOOL_NAME = "subagent"
@@ -82,6 +124,9 @@ const FALLBACK_ENABLED_KEY = "superagent.fallback-enabled"
 const DEFAULT_FALLBACK_THRESHOLD = 3
 /** 子代理完成后的独立复核开关，缺省关闭。 */
 export const CRITIC_ENABLED_KEY = "superagent.critic-enabled"
+
+/** 监管等级：优先子会话条目，缺省 root，再缺省 L2。 */
+export const OVERSIGHT_LEVEL_KEY = "superagent.oversight-level"
 /** 超时探针的扫描间隔。 */
 export const PROBE_INTERVAL_MS = 5 * 60 * 1000
 /** 超时探针阈值：与 TUI `LONG_RUNNING_THRESHOLD_MS`（run-duration.ts）同语义。 */
@@ -98,7 +143,7 @@ export const QUOTA_LIMIT_FLOOR = 2
 /** 僵尸子会话的判定阈值：开了工又没等到收尾，超过这么久就按僵死处理。 */
 export const STALE_AFTER_MS = 6 * 60 * 60 * 1000
 /** 上下文告警阈值：最近一次 assistant 调用的输入侧 token 数超过它才提醒（与面板同口径）。 */
-export const CONTEXT_WARN_TOKENS = 300_000
+export const CONTEXT_WARN_TOKENS = DEFAULT_CONTEXT_WARN_TOKENS
 /** 视为「compact 过」的下降比例：当前长度较上次提醒时下降 ≥30% 就清掉声明。 */
 export const CONTEXT_DROP_RATIO = 0.3
 /** 判定日志默认落盘位置。 */
@@ -144,6 +189,10 @@ export type Child = {
   finished: boolean
   /** 僵尸：开了工没等到收尾，且已经僵死超过阈值。 */
   stale: boolean
+  /** 当前模型，用于旗舰判定。 */
+  model?: unknown
+  /** 会话元数据，含 `superagent.flagship` 持久标记。 */
+  metadata?: Record<string, unknown>
 }
 
 /** 拒绝信号：只有它会被转成 ToolError，其他异常一律 fail-open。 */
@@ -477,9 +526,26 @@ export function readCriticEnabled(entries: any[]): boolean {
   return isEnabledValue(entries.find((entry) => entry?.key === CRITIC_ENABLED_KEY)?.value)
 }
 
+/** 从指令条目读监管等级；只有 0..4 的整数算合法，其余视作未设置。 */
+export function readOversightLevel(entries: unknown): number | undefined {
+  const entry = asArray(entries).find((item) => item?.key === OVERSIGHT_LEVEL_KEY)
+  if (!entry) return undefined
+  const raw = entry.value
+  const parsed =
+    typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : Number.NaN
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 4) return undefined
+  return parsed
+}
+
+/** 子会话条目优先，其次 root 条目，最后默认 L2。 */
+export function resolveOversightLevel(childEntries: unknown, rootEntries: unknown): number {
+  return readOversightLevel(childEntries) ?? readOversightLevel(rootEntries) ?? DEFAULT_OVERSIGHT_LEVEL
+}
+
 /**
- * 复核触发判定：只复核「成功完成的、root 家族里的非 root、非 critic 子会话」，
- * 且 root 显式开启了 critic。另外避开同一子会话的并发复核。
+ * 复核触发判定：只复核「成功完成的、root 家族里的非 root、非 critic 子会话」。
+ * L4 强制独立复核；L0-L3 遵循 root 的 `superagent.critic-enabled`。
+ * 另外避开同一子会话的并发复核。
  */
 export function shouldCriticReview(input: {
   eventType: string
@@ -488,11 +554,14 @@ export function shouldCriticReview(input: {
   child: { title?: string; metadata?: Record<string, unknown> } | undefined
   entries: any[]
   inFlight?: ReadonlySet<string>
+  /** 解析后的监管等级；缺省按 L0-L3 的开关规则处理。 */
+  oversightLevel?: number
 }): boolean {
   if (input.eventType !== "session.execution.succeeded") return false
   if (!input.childSessionID || input.childSessionID === input.rootID) return false
   if (isCriticSession(input.child)) return false
   if (input.inFlight?.has(input.childSessionID)) return false
+  if (input.oversightLevel === 4) return true
   return readCriticEnabled(input.entries)
 }
 
@@ -503,6 +572,8 @@ export type ProbeCandidate = {
   idle?: number
   title?: string
   metadata?: Record<string, unknown>
+  /** 当前模型，用于按模型上下文窗口算提醒阈值。 */
+  model?: unknown
 }
 
 /** 会话列表项 → 探针候选（只取判定要用的字段）。 */
@@ -515,6 +586,7 @@ export function toProbeCandidate(item: any): ProbeCandidate {
     idle: typeof time.idle === "number" ? time.idle : undefined,
     title: typeof item?.title === "string" ? item.title : undefined,
     metadata: isObject(item?.metadata) ? item.metadata : undefined,
+    model: item?.model,
   }
 }
 
@@ -685,9 +757,12 @@ function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0
 }
 
-/** 是否已超过上下文告警阈值（严格大于 300k）。 */
-export function isContextOverLimit(tokens: number | undefined): tokens is number {
-  return typeof tokens === "number" && Number.isFinite(tokens) && tokens > CONTEXT_WARN_TOKENS
+/** 是否已超过上下文告警阈值（严格大于；默认 300k）。 */
+export function isContextOverLimit(
+  tokens: number | undefined,
+  limit = CONTEXT_WARN_TOKENS,
+): tokens is number {
+  return typeof tokens === "number" && Number.isFinite(tokens) && tokens > limit
 }
 
 /** 当前长度较上次提醒时是否下降 ≥30%（视为 compact 过）。 */
@@ -709,12 +784,17 @@ export function shouldCheckContext(candidate: ProbeCandidate): boolean {
   return true
 }
 
-/** 发给 root 的提醒文案：指向具体子代理，给出 compact / 删除重建两条路。 */
-export function ctxWarningText(title: string | undefined, sessionID: string, tokens: number): string {
+/** 发给 root 的提醒文案：优先 compact，只有不再需要上下文时才删除。 */
+export function ctxWarningText(
+  title: string | undefined,
+  sessionID: string,
+  tokens: number,
+  limit = CONTEXT_WARN_TOKENS,
+): string {
   const label = typeof title === "string" && title.trim().length > 0 ? title.trim() : "未命名"
   const k = Math.round(tokens / 1000)
-  const limitK = Math.round(CONTEXT_WARN_TOKENS / 1000)
-  return `[上下文提醒] 子代理「${label}」(${sessionID}) 当前上下文约 ${k}k tokens（>${limitK}k）。建议：对其执行 compact，或删除重建（可用交接摘要续接）。`
+  const limitK = Math.round(limit / 1000)
+  return `[上下文提醒] 子代理「${label}」(${sessionID}) 当前上下文约 ${k}k tokens（>${limitK}k）。建议：需要保留上下文时对其执行 compact；不再需要上下文时才删除。`
 }
 
 export type CtxWarningScannerDeps = {
@@ -726,6 +806,8 @@ export type CtxWarningScannerDeps = {
   rootIsConfigured: (rootID: string) => Promise<boolean>
   /** 读该会话最近一次 assistant 调用的输入 token 数。 */
   readTokens: (sessionID: string) => Promise<number | undefined>
+  /** 按会话模型算提醒阈值；缺省 300K。读失败按默认值处理。 */
+  readThreshold?: (candidate: ProbeCandidate) => Promise<number | undefined>
   /** 该 root 的协作总开关；缺省视为启用。 */
   rootIsEnabled?: (rootID: string) => Promise<boolean>
   /** 向 root 发 steer 提醒。 */
@@ -798,19 +880,44 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
         }
         if (tokens === undefined) continue
 
+        // 按当前模型上下文窗口收紧阈值；读不到就沿用 300K。
+        let threshold = CONTEXT_WARN_TOKENS
+        if (deps.readThreshold) {
+          try {
+            const found = await deps.readThreshold(candidate)
+            if (typeof found === "number" && Number.isFinite(found) && found > 0) threshold = Math.floor(found)
+          } catch (cause) {
+            deps.log({
+              event: "ctx-limit-failed",
+              decision: "error",
+              childSessionID: candidate.id,
+              root: rootID,
+              note: "模型上下文窗口读取失败，按默认 300K",
+              cause: errorText(cause),
+            })
+          }
+        }
+
         const claimed = readContextClaim(candidate.id)
         const dropped = contextDropped(claimed, tokens)
         // compact 过：清掉声明，允许当前这轮重新提醒。
         if (dropped) clearContextClaim(candidate.id)
-        if (!isContextOverLimit(tokens)) continue
+        if (!isContextOverLimit(tokens, threshold)) continue
         if (claimed !== undefined && !dropped) continue
 
         const claim = deps.claim ?? claimContextWarning
         if (!claim(candidate.id, tokens)) continue
         try {
-          await deps.sendWarn(rootID, ctxWarningText(candidate.title, candidate.id, tokens))
+          await deps.sendWarn(rootID, ctxWarningText(candidate.title, candidate.id, tokens, threshold))
           sent++
-          deps.log({ event: "ctx-warn", decision: "allow", childSessionID: candidate.id, tokens, root: rootID })
+          deps.log({
+            event: "ctx-warn",
+            decision: "allow",
+            childSessionID: candidate.id,
+            tokens,
+            threshold,
+            root: rootID,
+          })
         } catch (cause) {
           // 先登记再发：发送失败也不在 5 分钟后重复轰炸同一个会话。
           deps.log({
@@ -836,6 +943,41 @@ async function readSessionMessages(ctx: any, sessionID: string): Promise<any[]> 
 }
 
 /**
+ * 模型上下文窗口查询：`ctx.model.list` 拿 `limit.context`，按 provider/model
+ * 缓存成功结果；查询失败返回 undefined（沿用默认 300K）并留日志。
+ */
+export function createModelContextWindowLookup(ctx: any, write: (record: Record<string, unknown>) => void = log) {
+  const cache = new Map<string, number>()
+  return async (model: unknown): Promise<number | undefined> => {
+    const ref = parseModelRef(model)
+    if (!ref) return undefined
+    const key = `${ref.providerID}/${ref.id}`
+    const cached = cache.get(key)
+    if (cached !== undefined) return cached
+    try {
+      if (typeof ctx?.model?.list !== "function") return undefined
+      const output = await ctx.model.list()
+      const items = asArray(isObject(output) && Array.isArray(output.data) ? output.data : output)
+      const found = items.find(
+        (item) => item?.providerID === ref.providerID && (item?.id === ref.id || item?.modelID === ref.id),
+      )
+      const window = modelContextWindow(found)
+      if (window !== undefined) cache.set(key, window)
+      return window
+    } catch (cause) {
+      write({
+        event: "ctx-model-lookup-failed",
+        decision: "error",
+        model: key,
+        note: "模型上下文窗口读取失败，按默认 300K",
+        cause: errorText(cause),
+      })
+      return undefined
+    }
+  }
+}
+
+/**
  * 从插件 ctx 建出超长上下文扫描器（真实接线）。抽出来让集成测试能用假的 ctx 驱动。
  */
 export function createCtxContextWarningScanner(
@@ -848,6 +990,7 @@ export function createCtxContextWarningScanner(
   } = {},
 ) {
   const write = options.log ?? log
+  const windowOf = createModelContextWindowLookup(ctx, write)
   return createCtxWarningScanner({
     listSessions: async () => {
       const items = asArray(await ctx.session.list({ limit: options.limit ?? 200, order: "desc" }))
@@ -867,6 +1010,27 @@ export function createCtxContextWarningScanner(
       return entries.some((entry) => typeof entry?.key === "string" && entry.key.startsWith("superagent."))
     },
     readTokens: async (sessionID) => contextTokens(await readSessionMessages(ctx, sessionID)),
+    readThreshold: async (candidate) => {
+      let model = candidate.model
+      if (model === undefined) {
+        try {
+          const info = await ctx.session.get({ sessionID: candidate.id })
+          model = isObject(info) ? info.model : undefined
+        } catch (cause) {
+          write({
+            event: "ctx-model-read-failed",
+            decision: "error",
+            childSessionID: candidate.id,
+            note: "会话模型读取失败，按默认 300K",
+            cause: errorText(cause),
+          })
+          return CONTEXT_WARN_TOKENS
+        }
+      }
+      const window = await windowOf(model)
+      if (window === undefined) return CONTEXT_WARN_TOKENS
+      return contextWarnThreshold({ limit: { context: window } })
+    },
     sendWarn: async (rootID, text) => {
       await ctx.session.prompt({ sessionID: rootID, text, delivery: "steer" })
     },
@@ -920,6 +1084,169 @@ export function forceRetryAfterSwitch(event: any, switched: boolean): boolean {
   return true
 }
 
+/**
+ * 随插件注册原生 Skills：用 `ctx.skill.transform` 一次性加入静态流程资产。
+ * 已存在同名技能（id 相同）不覆盖；任何失败只记 `skills-register-failed`，不阻断 setup。
+ */
+export async function registerSuperagentSkills(ctx: any, write: (record: Record<string, unknown>) => void = log) {
+  if (typeof ctx?.skill?.transform !== "function") return undefined
+  try {
+    const registration = await ctx.skill.transform((editor: any) => {
+      for (const skill of SUPERAGENT_SKILLS) {
+        try {
+          if (typeof editor?.get === "function" && editor.get(skill.id)) continue
+          editor.add({
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+            path: skill.path,
+            content: skill.content,
+          })
+        } catch (cause) {
+          write({
+            event: "skills-register-failed",
+            decision: "error",
+            skill: skill.id,
+            cause: errorText(cause),
+          })
+        }
+      }
+    })
+    write({ event: "skills-registered", decision: "allow", count: SUPERAGENT_SKILLS.length })
+    return registration
+  } catch (cause) {
+    write({ event: "skills-register-failed", decision: "error", cause: errorText(cause) })
+    return undefined
+  }
+}
+
+/** 读 agent 配置（模型继承用）；拿不到按缺省处理，不阻断主流程。 */
+async function readAgentInfo(ctx: any, agentID: unknown): Promise<any | undefined> {
+  if (typeof agentID !== "string" || agentID.length === 0) return undefined
+  try {
+    if (typeof ctx?.agent?.get === "function") {
+      const output = await ctx.agent.get({ agentID })
+      const info = isObject(output) && isObject(output.data) ? output.data : output
+      if (isObject(info)) return info
+    }
+    if (typeof ctx?.agent?.list === "function") {
+      const output = await ctx.agent.list()
+      const items = asArray(isObject(output) && Array.isArray((output as any).data) ? (output as any).data : output)
+      return items.find((item) => item?.id === agentID || item?.name === agentID)
+    }
+  } catch (cause) {
+    log({
+      event: "agent-read-failed",
+      decision: "allow",
+      agent: agentID,
+      note: "agent 配置读取失败，按缺省模型继承",
+      cause: errorText(cause),
+    })
+  }
+  return undefined
+}
+
+async function readSessionModel(ctx: any, sessionID: string): Promise<unknown> {
+  try {
+    const info = await ctx.session.get({ sessionID })
+    return isObject(info) ? info.model : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function readSessionMetadata(ctx: any, sessionID: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const info = await ctx.session.get({ sessionID })
+    return isObject(info) && isObject(info.metadata) ? info.metadata : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function eventData(event: any): Record<string, any> {
+  return isObject(event?.data) ? event.data : {}
+}
+
+/** 把旗舰标记写到 child 自身；保留原有 metadata，不写 root。 */
+export async function markFlagshipSession(
+  ctx: any,
+  input: { sessionID: string; parentID?: string; model: unknown; metadata?: Record<string, unknown> },
+): Promise<boolean> {
+  const existing = input.metadata ?? (await readSessionMetadata(ctx, input.sessionID))
+  const next = withFlagshipMarker(existing, input.model, Date.now())
+  if (!next) return false
+  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  log({
+    event: "flagship-marked",
+    decision: "allow",
+    sessionID: input.sessionID,
+    parentID: input.parentID,
+    model: formatModelRef(input.model),
+  })
+  return true
+}
+
+async function clearFlagshipSession(ctx: any, input: { sessionID: string; parentID?: string; reason: string }) {
+  const existing = await readSessionMetadata(ctx, input.sessionID)
+  if (!hasFlagshipMarker(existing)) return false
+  const next = withoutFlagshipMarker(existing)
+  if (!next) return false
+  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  log({
+    event: "flagship-cleared",
+    decision: "allow",
+    sessionID: input.sessionID,
+    parentID: input.parentID,
+    reason: input.reason,
+  })
+  return true
+}
+
+/**
+ * `session.created`：child 与 parent 当前模型一致时在 child 自身写旗舰标记；
+ * 不一致时清掉可能继承来的旧标记。未知模型一律不判定（fail-open）。
+ */
+export async function handleSessionCreated(ctx: any, event: any): Promise<void> {
+  const data = eventData(event)
+  const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
+  const parentID = typeof data.parentID === "string" ? data.parentID : undefined
+  if (!sessionID || !parentID) return
+  const title = typeof data.title === "string" ? data.title : undefined
+  const metadata = isObject(data.metadata) ? data.metadata : undefined
+  if (isCriticSession({ title, metadata })) return
+  const childModel = data.model ?? (await readSessionModel(ctx, sessionID))
+  const parentModel = await readSessionModel(ctx, parentID)
+  if (!normalizeFlagshipModel(childModel) || !normalizeFlagshipModel(parentModel)) return
+  if (sameFlagshipModel(childModel, parentModel)) {
+    await markFlagshipSession(ctx, { sessionID, parentID, model: childModel, metadata })
+  } else {
+    await clearFlagshipSession(ctx, { sessionID, parentID, reason: "created-model-mismatch" })
+  }
+}
+
+/**
+ * `session.model.selected`：只处理有 parent 的 child。child 切到与当前 parent
+ * 相同的模型就标记，切走就清掉自己的标记。root 切模型不遍历、不清洗旧 child 标记。
+ */
+export async function handleSessionModelSelected(ctx: any, event: any): Promise<void> {
+  const data = eventData(event)
+  const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
+  if (!sessionID) return
+  const info = await ctx.session.get({ sessionID })
+  if (!isObject(info) || typeof info.parentID !== "string" || !info.parentID) return
+  if (isCriticSession(info)) return
+  const parent = await ctx.session.get({ sessionID: info.parentID })
+  const parentModel = isObject(parent) ? parent.model : undefined
+  const model = data.model ?? info.model
+  if (!normalizeFlagshipModel(model) || !normalizeFlagshipModel(parentModel)) return
+  if (sameFlagshipModel(model, parentModel)) {
+    await markFlagshipSession(ctx, { sessionID, parentID: info.parentID, model })
+  } else {
+    await clearFlagshipSession(ctx, { sessionID, parentID: info.parentID, reason: "model-switched" })
+  }
+}
+
 /** 沿 parentID 上溯到 family root（没有 parentID 即 root）。 */
 async function findRoot(ctx: any, sessionID: string): Promise<string> {
   let current = sessionID
@@ -941,7 +1268,7 @@ async function readLimit(
   ctx: any,
   callerID: string,
   rootID: string,
-): Promise<{ limit: number; source?: string }> {
+): Promise<{ limit: number; source?: string; entries?: any[] }> {
   let current = callerID
   const seen = new Set<string>([callerID])
   for (;;) {
@@ -952,6 +1279,7 @@ async function readLimit(
       return {
         limit: Number.isInteger(parsed) && parsed >= 1 ? parsed : DEFAULT_MAX_SUBAGENTS,
         source: current,
+        entries,
       }
     }
     if (current === rootID) break
@@ -1011,6 +1339,60 @@ async function readKeptSubagents(
     current = parentID
   }
   return kept
+}
+
+/**
+ * 读保护名单的容错版本：读失败按「没有保护」处理（fail-open），并留日志。
+ * 一次查询异常不该把模型硬约束整体关死。
+ */
+async function readKeptSubagentsSafe(
+  ctx: any,
+  callerID: string,
+  rootID: string,
+  context: Record<string, unknown> = {},
+): Promise<Set<string> | undefined> {
+  try {
+    return await readKeptSubagents(ctx, callerID, rootID)
+  } catch (cause) {
+    log({
+      event: "kept-read-failed",
+      decision: "allow",
+      root: rootID,
+      note: "保护名单读取失败，按无保护处理",
+      cause: errorText(cause),
+      ...context,
+    })
+    return undefined
+  }
+}
+
+/**
+ * 本次 steer 会不会改变目标会话的模型：
+ *  - 显式 `input.model` 生效；
+ *  - 切换 agent 时 `agent.model` 生效；
+ *  - 其余情况保持原模型（同模型续跑、未指定模型）。
+ * 现有模型读不出来时按「会变」处理：模型不可改是硬约束，宁可拒绝。
+ */
+export function detectSteerModelChange(input: {
+  explicitModel?: unknown
+  agentModel?: unknown
+  switched: boolean
+  existingModel?: unknown
+}): { from?: string; to?: string } | undefined {
+  const explicit = normalizeFlagshipModel(input.explicitModel)
+  const agentModel = normalizeFlagshipModel(input.agentModel)
+  const next = explicit ?? (input.switched ? agentModel : undefined)
+  if (!next) return undefined
+  const existing = normalizeFlagshipModel(input.existingModel)
+  if (existing && sameFlagshipModel(existing, next)) return undefined
+  return { from: existing ? formatModelRef(existing) : undefined, to: formatModelRef(next) }
+}
+
+/** 受保护子会话改模型的拒绝文案：先取消保护，再改模型。 */
+export function keptModelDenyMessage(input: { sessionID: string; from?: string; to?: string }): string {
+  const from = input.from ?? "未知"
+  const to = input.to ?? "未知"
+  return `受保护子会话 ${input.sessionID} 的模型不可修改：当前 ${from}，本次调用会切到 ${to}。请先取消该子会话的保护（superagent.kept-subagents）再改模型。`
 }
 
 export type RetryFailure = {
@@ -1156,6 +1538,8 @@ export function toChild(item: any, now: number): Child {
     running,
     finished,
     stale,
+    model: item?.model,
+    metadata: isObject(item?.metadata) ? item.metadata : undefined,
   }
 }
 
@@ -1202,10 +1586,15 @@ export default {
       ToolError = null
     }
 
-    /** callID → 本次调用的登记信息。 */
-    const pending = new Map<string, { rootID?: string; steerTarget?: string }>()
+    // 原生 Skills 是静态流程资产，注册与协作总开关无关；失败只记日志。
+    const skillRegistration = await registerSuperagentSkills(ctx)
+
+    /** callID → 本次调用的登记信息；flagshipRoot 记本次占的旗舰槽。 */
+    const pending = new Map<string, { rootID?: string; steerTarget?: string; flagshipRoot?: string }>()
     /** root → 飞行中（子会话尚未创建）的 subagent 调用数。 */
     const flying = new Map<string, number>()
+    /** root → 飞行中的旗舰 subagent 调用数（含本次调用自己的槽）。 */
+    const flyingFlagship = new Map<string, number>()
     /** 正在被 steer 的子会话：淘汰时避开。 */
     const steered = new Set<string>()
 
@@ -1244,21 +1633,62 @@ export default {
       try {
         const child = await ctx.session.get({ sessionID })
         const rootID = await findRoot(ctx, sessionID)
-        let entries: any[] = []
+        let rootEntries: any[] = []
+        let rootReadFailed = false
         try {
-          entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+          rootEntries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
         } catch (cause) {
+          rootReadFailed = true
           log({
             event: "collab-read-failed",
             decision: "allow",
             root: rootID,
-            note: "开关读取失败，按启用处理",
+            note: "开关读取失败，按启用处理；critic 读取失败保持关闭",
             cause: errorText(cause),
           })
         }
-        // 总开关按 root 生效：本 root 停用时不发复核。
-        if (!collabEnabledFromEntries(entries)) return
-        if (!shouldCriticReview({ eventType: "session.execution.succeeded", childSessionID: sessionID, rootID, child, entries })) {
+        // 总开关按 root 生效：本 root 停用时不发复核，L4 也不能越过总开关。
+        if (!collabEnabledFromEntries(rootEntries)) return
+        let childEntries: any[] = []
+        let childReadFailed = false
+        try {
+          childEntries = asArray(await ctx.session.instructions.entry.list({ sessionID }))
+        } catch (cause) {
+          childReadFailed = true
+          log({
+            event: "oversight-child-read-failed",
+            decision: "allow",
+            childSessionID: sessionID,
+            root: rootID,
+            note: "子会话监管等级读取失败，按 root 等级处理",
+            cause: errorText(cause),
+          })
+        }
+        const childLevel = readOversightLevel(childEntries)
+        const rootLevel = readOversightLevel(rootEntries)
+        const level = childLevel ?? rootLevel ?? DEFAULT_OVERSIGHT_LEVEL
+        log({
+          event: "critic-level",
+          decision: "allow",
+          childSessionID: sessionID,
+          root: rootID,
+          childLevel: childLevel ?? null,
+          rootLevel: rootLevel ?? null,
+          level,
+          childReadFailed,
+          rootReadFailed,
+        })
+        // root 条目读失败时无法确认监管等级：保持 fail-closed，不凭 L4 触发复核。
+        if (
+          !shouldCriticReview({
+            eventType: "session.execution.succeeded",
+            childSessionID: sessionID,
+            rootID,
+            child,
+            entries: rootEntries,
+            oversightLevel: rootReadFailed ? undefined : level,
+          })
+        ) {
           return
         }
         // 同一完成事件可能被多个插件实例收到（reload 后旧订阅未必及时释放），
@@ -1283,6 +1713,12 @@ export default {
       else flying.set(rootID, next)
     }
 
+    const bumpFlagship = (rootID: string, delta: number) => {
+      const next = (flyingFlagship.get(rootID) ?? 0) + delta
+      if (next <= 0) flyingFlagship.delete(rootID)
+      else flyingFlagship.set(rootID, next)
+    }
+
     const before = await ctx.tool.hook("execute.before", async (event: any) => {
       // 快路径：不是 subagent 立即返回，不做任何查询。
       if (event?.tool !== TOOL_NAME) return
@@ -1293,24 +1729,232 @@ export default {
       const steerTarget =
         typeof input?.sessionID === "string" && input.sessionID.length > 0 ? input.sessionID : undefined
       const base = { sessionID: event.sessionID, callID: event.id, agent: event.agent }
+      const explicitModel =
+        typeof input?.model === "string" && input.model.trim() !== "" ? input.model : undefined
       let reserved: string | undefined
+      let reservedFlagship: string | undefined
+
+      /** 归还本次调用占的槽（总槽与旗舰槽），before 拒绝或异常时用。 */
+      const releaseReservation = () => {
+        const entry = pending.get(event.id)
+        pending.delete(event.id)
+        const root = reserved ?? entry?.rootID
+        if (root) bump(root, -1)
+        const flagRoot = reservedFlagship ?? entry?.flagshipRoot
+        if (flagRoot) bumpFlagship(flagRoot, -1)
+        reserved = undefined
+        reservedFlagship = undefined
+      }
+      const reserveFlagship = (rootID: string) => {
+        bumpFlagship(rootID, 1)
+        reservedFlagship = rootID
+        const entry = pending.get(event.id)
+        if (entry) entry.flagshipRoot = rootID
+        else pending.set(event.id, { flagshipRoot: rootID })
+      }
 
       try {
         if (steerTarget) {
-          // 续跑已有子会话：不占新槽，直接放行。登记 steer 目标，淘汰时避开它。
+          // 续跑已有子会话：不占新的总槽。若把普通 child 切成旗舰，仍要占旗舰槽。
           pending.set(event.id, { steerTarget })
           steered.add(steerTarget)
+          let steerRoot: string | undefined
+          let targetFlagship = false
+          let alreadyFlagship = false
+          let flagLimit: number | undefined
+          let flagExist = 0
+          let flagInflight = 0
+          let flagEvicted = 0
+          const evictedIds: string[] = []
+          try {
+            steerRoot = await findRoot(ctx, steerTarget)
+            const target = await ctx.session.get({ sessionID: steerTarget })
+            const targetModel = isObject(target) ? target.model : undefined
+            const rootModel = await readSessionModel(ctx, steerRoot)
+            const agent = await readAgentInfo(ctx, input?.agent)
+            const switched = isObject(target) && agent ? target.agent !== agent.id : false
+            // 保护中的子会话：模型也不可改。显式 model、或切换 agent 带来的模型变化都要拦；
+            // 同模型续跑与不换 agent 的普通 steer 照常放行。
+            const keptForSteer = await readKeptSubagentsSafe(ctx, event.sessionID, steerRoot, base)
+            if (keptForSteer?.has(steerTarget)) {
+              const change = detectSteerModelChange({
+                explicitModel: explicitModel,
+                agentModel: agent?.model,
+                switched,
+                existingModel: targetModel,
+              })
+              if (change) {
+                const message = keptModelDenyMessage({
+                  sessionID: steerTarget,
+                  from: change.from,
+                  to: change.to,
+                })
+                releaseReservation()
+                steered.delete(steerTarget)
+                log({
+                  event: "kept-model-denied",
+                  decision: "deny",
+                  reason: "kept-model-locked",
+                  root: steerRoot,
+                  steerTarget,
+                  from: change.from ?? null,
+                  to: change.to ?? null,
+                  message,
+                  ...base,
+                })
+                throw new DenyError(message)
+              }
+            }
+            const predicted = resolveSteerSubagentModel({
+              inputModel: explicitModel,
+              agentModel: agent?.model,
+              existingModel: targetModel,
+              switched,
+            })
+            targetFlagship = isFlagshipModel(predicted, rootModel)
+            alreadyFlagship = isObject(target)
+              ? isFlagshipSession(
+                  { model: target.model, metadata: isObject(target.metadata) ? target.metadata : undefined },
+                  rootModel,
+                )
+              : false
+            if (targetFlagship && !alreadyFlagship) {
+              // 已旗舰的 steer 不重复计数；普通 child → 旗舰才占新旗舰槽。
+              reserveFlagship(steerRoot)
+              const found = await readLimit(ctx, event.sessionID, steerRoot)
+              flagLimit = effectiveFlagshipLimit(readMaxFlagshipSubagents(found.entries), found.limit)
+              let children = await listChildren(ctx, steerRoot, Date.now())
+              const existOf = () => children.filter((child) => isFlagshipSession(child, rootModel)).length
+              const inflightOf = () => flyingFlagship.get(steerRoot!) ?? 0
+              flagExist = existOf()
+              flagInflight = inflightOf()
+              if (isFlagshipOverLimit(flagExist, flagInflight, flagLimit)) {
+                let kept: Set<string> | undefined
+                try {
+                  kept = await readKeptSubagents(ctx, event.sessionID, steerRoot)
+                } catch (cause) {
+                  log({
+                    event: "kept-read-failed",
+                    decision: "allow",
+                    root: steerRoot,
+                    note: "保护名单读取失败，旗舰 switch 放行不淘汰",
+                    cause: errorText(cause),
+                    ...base,
+                  })
+                }
+                if (kept) {
+                  for (;;) {
+                    flagExist = existOf()
+                    flagInflight = inflightOf()
+                    if (!isFlagshipOverLimit(flagExist, flagInflight, flagLimit)) break
+                    const roundFormula = flagshipFormula(flagExist, flagInflight, flagLimit)
+                    const flagships = children.filter((child) => isFlagshipSession(child, rootModel))
+                    const victim = pickFlagshipVictim(flagships, steered, kept)
+                    if (!victim) break
+                    try {
+                      await ctx.session.remove({ sessionID: victim.id })
+                    } catch (cause) {
+                      log({
+                        event: "flagship-evict-failed",
+                        decision: "error",
+                        root: steerRoot,
+                        victim: victim.id,
+                        formula: roundFormula,
+                        cause: errorText(cause),
+                        ...base,
+                      })
+                      break
+                    }
+                    flagEvicted++
+                    evictedIds.push(victim.id)
+                    log({
+                      event: "flagship-evict",
+                      decision: "allow",
+                      root: steerRoot,
+                      victim: victim.id,
+                      reason: "steer-switch",
+                      count: flagExist + flagInflight,
+                      exist: flagExist,
+                      inflight: flagInflight,
+                      evicted: flagEvicted,
+                      limit: flagLimit,
+                      formula: roundFormula,
+                      ...base,
+                    })
+                    children = await listChildren(ctx, steerRoot, Date.now())
+                  }
+                }
+              }
+              flagExist = existOf()
+              flagInflight = inflightOf()
+              if (isFlagshipOverLimit(flagExist, flagInflight, flagLimit)) {
+                releaseReservation()
+                steered.delete(steerTarget)
+                const message = flagshipDenyMessage({
+                  count: flagExist + flagInflight,
+                  limit: flagLimit,
+                  rootID: steerRoot,
+                })
+                log({
+                  event: "subagent-denied",
+                  decision: "deny",
+                  reason: "flagship-limit",
+                  root: steerRoot,
+                  count: flagExist + flagInflight,
+                  exist: flagExist,
+                  inflight: flagInflight,
+                  evicted: flagEvicted,
+                  limit: null,
+                  limitSource: null,
+                  flagshipExist: flagExist,
+                  flagshipInflight: flagInflight,
+                  flagshipLimit: flagLimit,
+                  evictedIds,
+                  formula: `steer=no-slot ${flagshipFormula(flagExist, flagInflight, flagLimit)}`,
+                  message,
+                  ...base,
+                })
+                throw new DenyError(message)
+              }
+            }
+          } catch (cause) {
+            if (cause instanceof DenyError) throw cause
+            // 预测失败不阻断 steer（fail-open）；已占的旗舰槽要还回去。
+            if (reservedFlagship) {
+              steered.delete(steerTarget)
+              releaseReservation()
+            }
+            log({
+              event: "flagship-steer-skip",
+              decision: "allow",
+              root: steerRoot ?? null,
+              note: "旗舰判定失败，按普通 steer 放行",
+              steerTarget,
+              cause: errorText(cause),
+              ...base,
+            })
+          }
           log({
             event: "subagent-steer",
             decision: "allow",
-            root: null,
+            root: steerRoot ?? null,
             count: null,
             exist: null,
             inflight: null,
-            evicted: 0,
+            evicted: flagEvicted,
             limit: null,
             formula: "steer=no-slot",
             steerTarget,
+            flagship: targetFlagship,
+            alreadyFlagship,
+            flagshipExist: targetFlagship && !alreadyFlagship ? flagExist : null,
+            flagshipInflight: targetFlagship && !alreadyFlagship ? flagInflight : null,
+            flagshipLimit: targetFlagship && !alreadyFlagship ? (flagLimit ?? null) : null,
+            flagshipFormula:
+              targetFlagship && !alreadyFlagship && flagLimit !== undefined
+                ? flagshipFormula(flagExist, flagInflight, flagLimit)
+                : null,
+            evictedIds,
             ...base,
           })
           return
@@ -1320,7 +1964,11 @@ export default {
         let rootID = event.sessionID
         let limit = DEFAULT_MAX_SUBAGENTS
         let limitSource: string | undefined
+        let configEntries: any[] | undefined
         let children: Child[] = []
+        let rootModel: unknown
+        let predictedFlagship = false
+        let flagLimit: number | undefined
         try {
           rootID = await findRoot(ctx, event.sessionID)
           // 先占槽再看子会话：并发调用必须互相看见，否则会同时放行、超发。
@@ -1330,15 +1978,26 @@ export default {
           const found = await readLimit(ctx, event.sessionID, rootID)
           limit = found.limit
           limitSource = found.source
+          configEntries = found.entries
           children = await listChildren(ctx, rootID, now)
+          // 预判本次新建是否会落到旗舰模型：input.model ?? agent.model ?? parent.model。
+          rootModel = await readSessionModel(ctx, rootID)
+          const callerModel = await readSessionModel(ctx, event.sessionID)
+          const agent = await readAgentInfo(ctx, input?.agent)
+          const predicted = resolveNewSubagentModel({
+            inputModel: explicitModel,
+            agentModel: agent?.model,
+            parentModel: callerModel,
+          })
+          predictedFlagship = isFlagshipModel(predicted, rootModel)
+          if (predictedFlagship) {
+            reserveFlagship(rootID)
+            flagLimit = effectiveFlagshipLimit(readMaxFlagshipSubagents(configEntries), limit)
+          }
         } catch (cause) {
           // 查询异常：fail-open，放行并留 error 日志。已占的槽要还回去。
           const inflightAtFailure = reserved ? (flying.get(reserved) ?? 0) : 0
-          if (reserved) {
-            bump(reserved, -1)
-            pending.delete(event.id)
-            reserved = undefined
-          }
+          releaseReservation()
           log({
             event: "lookup-failed",
             decision: "error",
@@ -1363,10 +2022,15 @@ export default {
         let count = exist + inflight()
         let evicted = 0
         const evictedIds: string[] = []
+        const flagshipExist = () => children.filter((child) => isFlagshipSession(child, rootModel)).length
+        const needsFlagshipEviction = () =>
+          predictedFlagship &&
+          flagLimit !== undefined &&
+          isFlagshipOverLimit(flagshipExist(), flyingFlagship.get(rootID) ?? 0, flagLimit)
+        let kept: Set<string> | undefined
 
-        if (isOverLimit(exist, inflight(), limit)) {
+        if (isOverLimit(exist, inflight(), limit) || needsFlagshipEviction()) {
           // 淘汰前先读保护名单：root 链上的 `superagent.kept-subagents`。
-          let kept: Set<string>
           try {
             kept = await readKeptSubagents(ctx, event.sessionID, rootID)
           } catch (cause) {
@@ -1386,12 +2050,16 @@ export default {
             })
             return
           }
+        }
+
+        if (isOverLimit(exist, inflight(), limit)) {
+          const protectedIDs = kept ?? new Set<string>()
           for (;;) {
             // 每轮都重新算一次：并发调用可能已经结束，槽位已经还回来了。
             count = exist + inflight()
             if (!isOverLimit(exist, inflight(), limit)) break
             const roundFormula = `exist=${exist} inflight=${inflight()} total=${count} limit=${limit}`
-            const victim = pickVictim(children, steered, kept)
+            const victim = pickVictim(children, steered, protectedIDs)
             if (!victim) break
             const victimID = victim.child.id
             try {
@@ -1433,19 +2101,82 @@ export default {
           }
         }
 
+        // 旗舰上限独立于总上限：优先淘汰最旧已完成旗舰；运行中/steer/保护的都不动。
+        let flagshipEvicted = 0
+        if (predictedFlagship && flagLimit !== undefined) {
+          const protectedIDs = kept ?? new Set<string>()
+          for (;;) {
+            const flagExist = flagshipExist()
+            const flagInflight = flyingFlagship.get(rootID) ?? 0
+            if (!isFlagshipOverLimit(flagExist, flagInflight, flagLimit)) break
+            const roundFormula = flagshipFormula(flagExist, flagInflight, flagLimit)
+            const flagships = children.filter((child) => isFlagshipSession(child, rootModel))
+            const victim = pickFlagshipVictim(flagships, steered, protectedIDs)
+            if (!victim) break
+            try {
+              await ctx.session.remove({ sessionID: victim.id })
+            } catch (cause) {
+              log({
+                event: "flagship-evict-failed",
+                decision: "error",
+                root: rootID,
+                victim: victim.id,
+                formula: roundFormula,
+                cause: errorText(cause),
+                ...base,
+              })
+              break
+            }
+            flagshipEvicted++
+            evicted++
+            evictedIds.push(victim.id)
+            log({
+              event: "flagship-evict",
+              decision: "allow",
+              root: rootID,
+              victim: victim.id,
+              reason: "flagship-limit",
+              count: flagExist + flagInflight,
+              exist: flagExist,
+              inflight: flagInflight,
+              evicted: flagshipEvicted,
+              limit: flagLimit,
+              formula: roundFormula,
+              ...base,
+            })
+            children = await listChildren(ctx, rootID, now)
+            exist = children.length
+          }
+        }
+
         // 判定快照：拒绝时槽位要还回去，日志按判定时刻的算式记。
         const decision = { count: exist + inflight(), exist, inflight: inflight() }
         const formula = `exist=${decision.exist} inflight=${decision.inflight} total=${decision.count} limit=${limit}`
+        const flagExist = predictedFlagship ? flagshipExist() : undefined
+        const flagInflight = predictedFlagship ? (flyingFlagship.get(rootID) ?? 0) : undefined
+        const flagFormula =
+          predictedFlagship && flagLimit !== undefined
+            ? flagshipFormula(flagExist ?? 0, flagInflight ?? 0, flagLimit)
+            : undefined
+        const flagshipFields = predictedFlagship
+          ? {
+              flagship: true,
+              flagshipExist: flagExist,
+              flagshipInflight: flagInflight,
+              flagshipLimit: flagLimit,
+              flagshipEvicted,
+              flagshipFormula: flagFormula,
+            }
+          : { flagship: false }
 
         if (isOverLimit(decision.exist, decision.inflight, limit)) {
           // 拒绝：被拒绝的调用不会触发 execute.after，槽位要在这里还回去。
-          bump(rootID, -1)
-          reserved = undefined
-          pending.delete(event.id)
+          releaseReservation()
           const message = denyMessage(decision.count, limit, rootID)
           log({
             event: "subagent-denied",
             decision: "deny",
+            reason: "total-limit",
             root: rootID,
             ...decision,
             evicted,
@@ -1455,6 +2186,38 @@ export default {
             children: children.map((child) => child.id),
             formula,
             message,
+            ...flagshipFields,
+            ...base,
+          })
+          throw new DenyError(message)
+        }
+
+        if (
+          predictedFlagship &&
+          flagLimit !== undefined &&
+          isFlagshipOverLimit(flagExist ?? 0, flagInflight ?? 0, flagLimit)
+        ) {
+          // 旗舰槽不够且没有可淘汰的已完成旗舰：明确拒绝，不静默超发。
+          releaseReservation()
+          const message = flagshipDenyMessage({
+            count: (flagExist ?? 0) + (flagInflight ?? 0),
+            limit: flagLimit,
+            rootID,
+          })
+          log({
+            event: "subagent-denied",
+            decision: "deny",
+            reason: "flagship-limit",
+            root: rootID,
+            ...decision,
+            evicted,
+            limit,
+            limitSource,
+            evictedIds,
+            children: children.map((child) => child.id),
+            formula: `${formula} ${flagFormula ?? ""}`.trim(),
+            message,
+            ...flagshipFields,
             ...base,
           })
           throw new DenyError(message)
@@ -1470,19 +2233,19 @@ export default {
           limitSource,
           evictedIds,
           children: children.map((child) => child.id),
-          formula,
+          formula: `${formula} ${flagFormula ?? ""}`.trim(),
+          ...flagshipFields,
           ...base,
         })
       } catch (cause) {
         if (cause instanceof DenyError) {
+          releaseReservation()
           if (ToolError) throw new ToolError({ message: cause.message })
           throw cause
         }
         // 意外异常：fail-open，不能把用户的 subagent 调用打挂。
-        if (reserved) {
-          bump(reserved, -1)
-          pending.delete(event.id)
-        }
+        if (steerTarget) steered.delete(steerTarget)
+        releaseReservation()
         log({
           event: "hook-error",
           decision: "error",
@@ -1503,6 +2266,7 @@ export default {
         if (!entry) return
         pending.delete(event.id)
         if (entry.rootID) bump(entry.rootID, -1)
+        if (entry.flagshipRoot) bumpFlagship(entry.flagshipRoot, -1)
         if (entry.steerTarget) steered.delete(entry.steerTarget)
       } catch {
         // after 钩子抛错会波及工具体本身，这里绝不能抛。
@@ -1519,6 +2283,18 @@ export default {
         const rootID = await findRoot(ctx, sessionID)
         // 总开关按 root 生效：本 root 停用时不计失败、不切模型。
         if (!(await readRootCollabEnabled(ctx, rootID))) return
+        // 保护中的子会话不参与限额备用切换：不计失败、不切模型、不强制重试。
+        const keptForFallback = await readKeptSubagentsSafe(ctx, sessionID, rootID, { sessionID })
+        if (keptForFallback?.has(sessionID)) {
+          log({
+            event: "fallback-kept-model",
+            decision: "allow",
+            root: rootID,
+            sessionID,
+            note: "受保护子会话：限额失败不计失败、不切模型、不强制重试",
+          })
+          return
+        }
         const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
         const outcome = await quotaFallback.onFailure({
           sessionID,
@@ -1549,9 +2325,24 @@ export default {
     const resetSubscription = (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.step.ended", "session.execution.succeeded"],
+          types: ["session.step.ended", "session.execution.succeeded", "session.created", "session.model.selected"],
           signal: resetAbort.signal,
         })) {
+          if (event?.type === "session.created" || event?.type === "session.model.selected") {
+            try {
+              if (event.type === "session.created") await handleSessionCreated(ctx, event)
+              else await handleSessionModelSelected(ctx, event)
+            } catch (cause) {
+              log({
+                event: "flagship-marker-failed",
+                decision: "error",
+                type: event.type,
+                childSessionID: eventSessionID(event),
+                cause: errorText(cause),
+              })
+            }
+            continue
+          }
           const sessionID = eventSessionID(event)
           if (!sessionID) continue
           quotaFallback.reset(sessionID)
@@ -1585,7 +2376,7 @@ export default {
       toolError: ToolError ? "Tool.Error" : "plain Error",
     })
 
-    return () => {
+    return async () => {
       try {
         before?.dispose?.()
       } catch {}
@@ -1600,6 +2391,9 @@ export default {
       } catch {}
       try {
         probeTimer.stop()
+      } catch {}
+      try {
+        await skillRegistration?.dispose?.()
       } catch {}
       log({ event: "dispose", decision: "allow", root: null, count: null, limit: null })
     }

@@ -62,7 +62,10 @@ export function modelKey(model: ModelRef) {
 }
 
 export function sameModel(a: ModelRef, b: ModelRef) {
-  return a.providerID === b.providerID && a.id === b.id && (a.variant ?? "") === (b.variant ?? "")
+  // Providers may materialize an omitted variant as the literal "default".
+  // Treat both forms as the same selection so reloads never re-switch a session.
+  const variant = (model: ModelRef) => model.variant === "default" ? "" : (model.variant ?? "")
+  return a.providerID === b.providerID && a.id === b.id && variant(a) === variant(b)
 }
 
 export function uniqueModels(models: readonly ModelRef[]): ModelRef[] {

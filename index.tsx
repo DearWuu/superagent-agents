@@ -38,7 +38,17 @@ import {
 import { planEviction, type SubagentChild } from "./subagent-limit"
 import { sessionRunning, sessionStatusView } from "./run-duration"
 import { migrateLegacyPluginStorage, storageDirectory } from "./storage-migration"
-import { buildHandoffSummary, type HandoffClient } from "./handoff"
+
+import {
+  DEFAULT_MAX_FLAGSHIP_SUBAGENTS,
+  countFlagshipSubagents,
+  effectiveFlagshipLimit,
+  flagshipChangeAllowed,
+  isFlagshipModel,
+  isFlagshipSession,
+  normalizeFlagshipModel,
+} from "./flagship"
+import { DEFAULT_CONTEXT_WARN_TOKENS, contextWarnThreshold } from "./context-policy"
 
 type ModelInfo = {
   providerID: string
@@ -59,6 +69,7 @@ type SessionInfo = {
   model?: ModelRef
   location?: unknown
   outcome?: string
+  metadata?: Record<string, unknown>
   time?: { created: number; updated: number; archived?: number; busy?: number; idle?: number }
 }
 type Policy = "auto" | "inherit" | "fixed"
@@ -74,6 +85,7 @@ type SettingsAction =
   | { kind: "oversight" }
   | { kind: "policy" }
   | { kind: "maxSubagents" }
+  | { kind: "maxFlagshipSubagents" }
   | { kind: "assignmentPrompt" }
   | { kind: "taskPrompt" }
   | { kind: "restore" }
@@ -92,7 +104,7 @@ type OversightAction = { kind: "default" } | { kind: "pin"; level: OversightLeve
 type AgentAction =
   | { kind: "model" }
   | { kind: "open" }
-  | { kind: "recreate" }
+  | { kind: "delete" }
   | { kind: "compact" }
   | { kind: "keep" }
 
@@ -103,7 +115,9 @@ const INSTRUCTION_KEYS = {
   sessionPrompt: "superagent.session-prompt",
   taskPrompt: "superagent.task-prompt",
   maxSubagents: "superagent.max-subagents",
+  maxFlagshipSubagents: "superagent.max-flagship-subagents",
   oversight: "superagent.oversight",
+  oversightLevel: "superagent.oversight-level",
   assignmentPrompt: "superagent.assignment-prompt",
   defaultModel: "superagent.default-model",
   fallbackModel: "superagent.fallback-model",
@@ -114,19 +128,40 @@ const INSTRUCTION_KEYS = {
   keptSubagents: "superagent.kept-subagents",
 } as const
 
-/** 各级监管的实现程度：选择器里介绍"管到什么程度"，不写操作说明。 */
+/** 各级监管的实现程度：选择器里介绍"管到什么程度"与验收深度，不写操作说明。 */
 export const OVERSIGHT_LEVEL_DESCRIPTIONS: Record<OversightLevel, string> = {
-  0: "只交结果：改动/测试/风险，完成时一次汇报",
-  1: "加命令清单与阶段小结，完成时一次汇报",
-  2: "加阅读记录与失败详情，证据可核查（默认）",
-  3: "加完整输出与代码摘录，每阶段中途简报",
-  4: "逐步汇报动机与假设，全程可审计",
+  0: "只交结果：改动/测试/风险，完成时一次汇报 · 结果验收（低风险）",
+  1: "加命令清单与阶段小结，完成时一次汇报 · 摘要验收（常规）",
+  2: "加阅读记录与失败详情，证据可核查（默认） · 证据验收（默认）",
+  3: "加完整输出与代码摘录，每阶段中途简报 · 全量验收（严格）",
+  4: "逐步汇报动机与假设，全程可审计 · 审计验收（独立 critic）",
 }
+
+/** The texts written by earlier releases; rewritten once when still the entry value. */
+const LEGACY_SESSION_PROMPTS = [
+  [
+    "主代理（Superagent）负责：分析需求、拆解任务、方案设计（架构/接口/交互/版面等具体设计）、编写任务书与验收标准、派工和验收。设计产物由主代理产出后交给 Subagent 实现，不让 Subagent 自行决定设计方向。",
+    "主代理不做具体实现：改代码、写文件、调试、测试执行交给 Subagent；只读分析（读代码/查文档/调研）主代理可自己做。",
+    "派工新建与续跑：与既有子代理无关联的新任务一律新建 Subagent，避免无关上下文污染；仅同一模块/同一文件的后续修改、验收打回返工、类似任务迭代时才 steer 续跑已有子代理。续跑对象上下文较长（>300k）时先判断是否有必要保持：任务需要这些上下文则直接续跑；无必要则先 compact 再续跑。交接摘要仅用于删除重建场景，不是续跑的前置动作。",
+    "验收：按报告协议逐项核查（状态三行、章节完整性、证据真实性）；排版/UI 类必须亲眼看实际渲染结果（截图）验收，不只信报告；证据不足或与 session 记录不符打回。",
+  ].join("\n"),
+  [
+    "主代理（Superagent）负责：分析需求、拆解任务、方案设计（架构/接口/交互/版面等具体设计）、编写任务书与验收标准、派工和验收。设计产物由主代理产出后交给 Subagent 实现，不让 Subagent 自行决定设计方向。",
+    "主代理不做具体实现：改代码、写文件、调试、测试执行交给 Subagent；只读分析（读代码/查文档/调研）主代理可自己做。",
+    "派工前使用 superagent-orchestration 技能；先判断任务是否适合 Flash，再决定新建还是续跑：推理密度高、需求模糊或跨模块决策的工作由旗舰负责，边界清晰且可验证的工作交给 Flash。与既有子代理无关联的新任务一律新建；仅同一模块/同一文件的后续修改、验收打回返工、类似任务迭代时续跑已有子代理。",
+    "能力升级或主动需要同模型时，用户已授权用原生 subagent 创建与当前 Superagent 相同 provider/model/variant 的旗舰子代理；默认上限 2 且仍受子代理总上限约束，不得绕过。",
+    "失败先区分局部返工、任务书不清与能力升级；限额切换不等于能力升级。",
+    "验收前使用 superagent-acceptance 技能：按报告协议逐项核查（状态三行、章节完整性、证据真实性）；排版/UI 类必须亲眼看实际渲染结果（截图）验收，不只信报告；证据不足或与 session 记录不符打回。compact 或删除重建前使用 superagent-context 技能。详细任务书格式与技能流程见对应技能，不在本提示词重复。",
+  ].join("\n"),
+]
+
+const LEGACY_TASK_PROMPT = ""
 
 /** Provider-neutral defaults: unset means follow the session's own model. */
 export const SUPERAGENT_DEFAULTS = {
   reportStyle: "concise",
   maxSubagents: 5,
+  maxFlagshipSubagents: DEFAULT_MAX_FLAGSHIP_SUBAGENTS,
   defaultPolicy: "inherit" as Policy,
   defaultModel: undefined as ModelRef | undefined,
   autoModels: [] as ModelRef[],
@@ -138,12 +173,16 @@ export const SUPERAGENT_DEFAULTS = {
   sessionPrompt: [
     "主代理（Superagent）负责：分析需求、拆解任务、方案设计（架构/接口/交互/版面等具体设计）、编写任务书与验收标准、派工和验收。设计产物由主代理产出后交给 Subagent 实现，不让 Subagent 自行决定设计方向。",
     "主代理不做具体实现：改代码、写文件、调试、测试执行交给 Subagent；只读分析（读代码/查文档/调研）主代理可自己做。",
-    "派工新建与续跑：与既有子代理无关联的新任务一律新建 Subagent，避免无关上下文污染；仅同一模块/同一文件的后续修改、验收打回返工、类似任务迭代时才 steer 续跑已有子代理。续跑对象上下文较长（>300k）时先判断是否有必要保持：任务需要这些上下文则直接续跑；无必要则先 compact 再续跑。交接摘要仅用于删除重建场景，不是续跑的前置动作。",
-    "验收：按报告协议逐项核查（状态三行、章节完整性、证据真实性）；排版/UI 类必须亲眼看实际渲染结果（截图）验收，不只信报告；证据不足或与 session 记录不符打回。",
+    "派工前使用 superagent-orchestration 技能；先判断任务是否适合 Flash，再决定新建还是续跑：推理密度高、需求模糊或跨模块决策的工作由旗舰负责，边界清晰且可验证的工作交给 Flash。与既有子代理无关联的新任务一律新建；仅同一模块/同一文件的后续修改、验收打回返工、类似任务迭代时续跑已有子代理。",
+    "能力升级或主动需要同模型时，用户已授权用原生 subagent 创建与当前 Superagent 相同 provider/model/variant 的旗舰子代理；默认上限 2 且仍受子代理总上限约束，不得绕过。",
+    "失败先区分局部返工、任务书不清与能力升级；限额切换不等于能力升级。",
+    "上下文：需要继续同一任务时优先 steer 续跑或 compact，保留上下文；只有不再需要该上下文时才删除 Subagent，删除前先与用户确认。",
+    "验收前使用 superagent-acceptance 技能：按报告协议逐项核查（状态三行、章节完整性、证据真实性）；排版/UI 类必须亲眼看实际渲染结果（截图）验收，不只信报告；证据不足或与 session 记录不符打回。compact 或删除 Subagent 前使用 superagent-context 技能。详细任务书格式与技能流程见对应技能，不在本提示词重复。",
   ].join("\n"),
   assignmentPrompt:
     "按任务书执行，不扩大范围；修改后运行约定验证；报告修改文件、测试命令与结果、未解决风险；需求不清先提问，不自行决定。",
-  taskPrompt: "",
+  taskPrompt:
+    "按任务契约执行：范围以任务书为准，需求不清先提问；完成后报告验证结果与风险；遇到能力升级先报告，不自行切换模型。",
 } as const
 
 const REPORT_STYLE_LABELS: Record<string, string> = {
@@ -228,7 +267,7 @@ export function collabEnabledFromInstructions(values: Readonly<Record<string, un
 }
 
 /** 上下文偏长的提示阈值：子代理当前上下文超过它就把读数染成警示色。 */
-export const CONTEXT_WARN_TOKENS = 300_000
+export const CONTEXT_WARN_TOKENS = DEFAULT_CONTEXT_WARN_TOKENS
 
 export type SessionTokenUsage = {
   input: number
@@ -265,11 +304,19 @@ export function formatTokenCount(tokens: number) {
   return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
 }
 
-/** 信息行里的上下文读数：无数据返回 undefined，超过阈值带上警示标记。 */
-export function contextUsageView(messages: ReadonlyArray<ContextMessage> | undefined) {
+/**
+ * 信息行里的上下文读数：无数据返回 undefined，严格超过阈值带上警示标记。
+ * 传入模型时按它的上下文窗口收紧阈值；不传模型/阈值保持 300K 旧行为。
+ */
+export function contextUsageView(
+  messages: ReadonlyArray<ContextMessage> | undefined,
+  model?: unknown,
+  threshold?: number,
+) {
   const tokens = contextTokens(messages)
   if (tokens === undefined) return undefined
-  return { tokens, text: `ctx ${formatTokenCount(tokens)}`, warning: tokens > CONTEXT_WARN_TOKENS }
+  const limit = threshold ?? contextWarnThreshold(model)
+  return { tokens, text: `ctx ${formatTokenCount(tokens)}`, warning: tokens > limit }
 }
 
 
@@ -502,15 +549,6 @@ function subagentTitle(session: SessionInfo) {
   return agentMatch ? title.replace(agentMatch[0], "").trim() || title : title
 }
 
-function latestUserMessage(context: Plugin.Context, sessionID: string) {
-  const messages = context.data.session.message.list(sessionID) ?? []
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]!
-    if (message.type === "user" && message.text.trim()) return message.text
-  }
-  return undefined
-}
-
 /**
  * 一行的状态。活跃执行集合优先（与原生 Subagents 面板同源）：取消后重启仍在跑的
  * 会话即使残留 outcome，也必须显示运行中。运行中的子代理附带已运行时长。
@@ -562,7 +600,12 @@ function decorate(node: AgentNode, settings: RootSettings, parentModel: ModelRef
     const newerThanDefault =
       node.created !== undefined && settings.defaultSetAt !== undefined && node.created > settings.defaultSetAt
     const fixedDefault =
-      settings.defaultPolicy === "fixed" && settings.defaultModel && newerThanDefault ? settings.defaultModel : undefined
+      settings.defaultPolicy === "fixed" &&
+      settings.defaultModel &&
+      newerThanDefault &&
+      !settings.keptSubagents?.[node.sessionID]
+        ? settings.defaultModel
+        : undefined
     const actual =
       explicit === "fixed"
         ? node.model?.actual ?? parentModel
@@ -894,6 +937,13 @@ export function SidebarAgents(props: {
       maxSubagentsCustom:
         instructionPresent(INSTRUCTION_KEYS.maxSubagents) &&
         instructionText(INSTRUCTION_KEYS.maxSubagents) !== String(SUPERAGENT_DEFAULTS.maxSubagents),
+      maxFlagshipSubagents:
+        instructionText(INSTRUCTION_KEYS.maxFlagshipSubagents) ||
+        String(SUPERAGENT_DEFAULTS.maxFlagshipSubagents),
+      maxFlagshipSubagentsCustom:
+        instructionPresent(INSTRUCTION_KEYS.maxFlagshipSubagents) &&
+        instructionText(INSTRUCTION_KEYS.maxFlagshipSubagents) !==
+          String(SUPERAGENT_DEFAULTS.maxFlagshipSubagents),
       assignmentPrompt: root().assignmentPrompt || SUPERAGENT_DEFAULTS.assignmentPrompt,
       assignmentPromptCustom: root().assignmentPrompt !== "" && root().assignmentPrompt !== SUPERAGENT_DEFAULTS.assignmentPrompt,
     }
@@ -986,14 +1036,18 @@ export function SidebarAgents(props: {
   async function putInstruction(key: string, value: string | number) {
     const id = rootSessionID()
     if (!id) return
+    await putSessionInstruction(id, key, value)
+  }
+  async function putSessionInstruction(sessionID: string, key: string, value: string | number) {
     await props.context.client.experimental.session.instructions.entry.put({
-      sessionID: id,
+      sessionID,
       key,
       value,
     })
+    if (sessionID !== rootSessionID()) return
     setInstructions((current) => ({
-      rootID: id,
-      values: { ...(current.rootID === id ? current.values : {}), [key]: value },
+      rootID: sessionID,
+      values: { ...(current.rootID === sessionID ? current.values : {}), [key]: value },
     }))
   }
   async function removeInstruction(key: string) {
@@ -1027,6 +1081,7 @@ export function SidebarAgents(props: {
     }
     mergeKeptEntry()
     await ensureFallbackDefaults()
+    await migrateDefaultInstructions()
     if (!root().initialized[id]) {
       for (const [key, value] of defaultInstructionEntries()) {
         if (instructionValue(key) !== undefined) continue
@@ -1047,12 +1102,29 @@ export function SidebarAgents(props: {
       INSTRUCTION_KEYS.fallbackThreshold,
       INSTRUCTION_KEYS.fallbackEnabled,
       INSTRUCTION_KEYS.criticEnabled,
+      INSTRUCTION_KEYS.maxFlagshipSubagents,
+      INSTRUCTION_KEYS.oversightLevel,
     ])
     for (const [key, value] of defaultInstructionEntries()) {
       if (!keys.has(key) || instructionValue(key) !== undefined) continue
       await putInstruction(key, value)
     }
   }
+  /**
+   * Prompt defaults changed: entries that are absent or still exactly the
+   * previous default move to the new text. A user's custom text is untouched.
+   */
+  async function migrateDefaultInstructions() {
+    const session = instructionText(INSTRUCTION_KEYS.sessionPrompt)
+    if (!instructionPresent(INSTRUCTION_KEYS.sessionPrompt) || LEGACY_SESSION_PROMPTS.includes(session)) {
+      await putInstruction(INSTRUCTION_KEYS.sessionPrompt, SUPERAGENT_DEFAULTS.sessionPrompt)
+    }
+    const task = instructionText(INSTRUCTION_KEYS.taskPrompt)
+    if (!instructionPresent(INSTRUCTION_KEYS.taskPrompt) || task === LEGACY_TASK_PROMPT) {
+      await putInstruction(INSTRUCTION_KEYS.taskPrompt, SUPERAGENT_DEFAULTS.taskPrompt)
+    }
+  }
+
   async function restoreDefaults() {
     const entries = defaultInstructionEntries()
     for (const [key, value] of entries) await putInstruction(key, value)
@@ -1063,7 +1135,6 @@ export function SidebarAgents(props: {
     ]) {
       if (!entries.some(([entryKey]) => entryKey === key)) await removeInstruction(key)
     }
-    await removeInstruction(INSTRUCTION_KEYS.taskPrompt)
     await updateRoot((draft) => {
       draft.defaultPolicy = SUPERAGENT_DEFAULTS.defaultPolicy
       draft.defaultModel = SUPERAGENT_DEFAULTS.defaultModel
@@ -1087,7 +1158,9 @@ export function SidebarAgents(props: {
     const entries: Array<[string, string | number]> = [
       [INSTRUCTION_KEYS.reportStyle, SUPERAGENT_DEFAULTS.reportStyle],
       [INSTRUCTION_KEYS.maxSubagents, SUPERAGENT_DEFAULTS.maxSubagents],
+      [INSTRUCTION_KEYS.maxFlagshipSubagents, SUPERAGENT_DEFAULTS.maxFlagshipSubagents],
       [INSTRUCTION_KEYS.sessionPrompt, SUPERAGENT_DEFAULTS.sessionPrompt],
+      [INSTRUCTION_KEYS.taskPrompt, SUPERAGENT_DEFAULTS.taskPrompt],
       [INSTRUCTION_KEYS.fallbackThreshold, SUPERAGENT_DEFAULTS.fallbackThreshold],
       [INSTRUCTION_KEYS.fallbackEnabled, String(SUPERAGENT_DEFAULTS.fallbackEnabled)],
       [INSTRUCTION_KEYS.criticEnabled, String(SUPERAGENT_DEFAULTS.criticEnabled)],
@@ -1271,8 +1344,12 @@ export function SidebarAgents(props: {
     const id = rootSessionID()
     if (!id) return
     const text = renderReportProtocol(contract)
-    if (instructionText(INSTRUCTION_KEYS.oversight) === text) return
-    await putInstruction(INSTRUCTION_KEYS.oversight, text)
+    const level = String(contract.level)
+    const textChanged = instructionText(INSTRUCTION_KEYS.oversight) !== text
+    const levelChanged = instructionText(INSTRUCTION_KEYS.oversightLevel) !== level
+    if (!textChanged && !levelChanged) return
+    if (textChanged) await putInstruction(INSTRUCTION_KEYS.oversight, text)
+    if (levelChanged) await putInstruction(INSTRUCTION_KEYS.oversightLevel, contract.level)
     await updateRoot((draft) => {
       draft.oversight.lastResolved = {
         ...draft.oversight.lastResolved,
@@ -1286,6 +1363,7 @@ export function SidebarAgents(props: {
     }).catch(() => {})
   }
   createEffect(() => {
+    if (!ready()) return
     if (!collabOn()) return
     if (!session()) return
     void writeOversightInstruction(rootOversight()).catch(() => {})
@@ -1295,10 +1373,85 @@ export function SidebarAgents(props: {
   createEffect(() => {
     const id = rootSessionID()
     if (!id) return
+    if (!ready()) return
     if (!collabOn()) return
     if (!root().initialized[id]) return
     if (instructionText(INSTRUCTION_KEYS.assignmentPrompt) === assignmentPromptEntry()) return
     void putInstruction(INSTRUCTION_KEYS.assignmentPrompt, assignmentPromptEntry()).catch(() => {})
+  })
+
+  /**
+   * Child sessions get their own machine-readable level and assignment prompt
+   * so a running child sees acceptance changes on its next turn. Root changes
+   * update unpinned children; a pinned child is written only when created or
+   * when its own pin changes.
+   */
+  const oversightSynced = new Map<string, { level: number; pinned: boolean; assignment: string }>()
+  let syncingOversight = false
+  async function syncChildOversightEntries(
+    rootID: string,
+    desired: Array<{
+      sessionID: string
+      level: number
+      pinned: boolean
+      assignment: string
+    }>,
+  ) {
+    if (syncingOversight) return
+    syncingOversight = true
+    try {
+      for (const child of desired) {
+        const previous = oversightSynced.get(child.sessionID)
+        const changed =
+          !previous ||
+          previous.level !== child.level ||
+          previous.pinned !== child.pinned ||
+          (!child.pinned && previous.assignment !== child.assignment)
+        if (!changed) continue
+        try {
+          if (previous?.level !== child.level || !previous) {
+            await putSessionInstruction(child.sessionID, INSTRUCTION_KEYS.oversightLevel, child.level)
+          }
+          if (!child.pinned || !previous || previous.pinned !== child.pinned || previous.assignment !== child.assignment) {
+            await putSessionInstruction(child.sessionID, INSTRUCTION_KEYS.assignmentPrompt, child.assignment)
+          }
+          oversightSynced.set(child.sessionID, {
+            level: child.level,
+            pinned: child.pinned,
+            assignment: child.assignment,
+          })
+        } catch {
+          // A child that cannot be written keeps its previous entries; retry on the next change.
+        }
+      }
+    } finally {
+      syncingOversight = false
+    }
+  }
+  createEffect(() => {
+    if (!collabOn()) {
+      oversightSynced.clear()
+      return
+    }
+    if (!ready()) return
+    const rootID = rootSessionID()
+    if (!rootID) return
+    const family = new Set(props.context.data.session.family(rootID))
+    const assignmentBase = root().assignmentPrompt || SUPERAGENT_DEFAULTS.assignmentPrompt
+    const pins = root().oversight.pins
+    const desired = sessions()
+      .filter((item) => item.id !== rootID && family.has(item.id))
+      .map((item) => {
+        const contract = oversightFor(item.id)
+        return {
+          sessionID: item.id,
+          level: contract.level,
+          pinned: pins.sessions?.[item.id] !== undefined,
+          assignment: `${renderReportProtocol(contract)}\n\n${assignmentBase}`,
+        }
+      })
+    if (desired.length === 0) return
+    void syncChildOversightEntries(rootID, desired)
   })
 
   /** 主会话的标题：内部类型名对用户没有意义，用会话标题。 */
@@ -1328,31 +1481,157 @@ export function SidebarAgents(props: {
     return value
   })
 
-  const appliedDefaults = new Set<string>()
+  /** A valid marker counts only while the child still runs the marked model; unmarked sessions fall back to the root model. */
+  const rootModel = createMemo(() => tree()?.model?.actual)
+  const flagshipLimit = createMemo(() => effectiveFlagshipLimit(policy().maxFlagshipSubagents, subagentLimit()))
+  const flagshipCount = createMemo(() =>
+    countFlagshipSubagents(
+      (tree()?.children ?? []).flatMap((node) =>
+        node.sessionID
+          ? [
+              {
+                model: node.model?.actual,
+                metadata: props.context.data.session.get(node.sessionID)?.metadata,
+              },
+            ]
+          : [],
+      ),
+      rootModel(),
+    ),
+  )
+  /** 旗舰数量只用于准入与淘汰，面板不展示。 */
+
+  /**
+   * 默认模型批量同步：fixed 变更与 inherit 跟随都把当前 root 下未保护子代理
+   * 切到目标模型；auto 没有唯一模型，只影响后续分配。运行中的子代理走
+   * 中断→等待停止→切换→续跑，串行处理并逐项报告失败。
+   */
+  let lastTargetKey: string | undefined
+  let appliedTargetKey: string | undefined
+  let mountPassDone = false
+  let syncingDefaultModels = false
   createEffect(() => {
+    if (!ready()) return
     const current = session()
     if (!current) return
     const scoped = root()
-    if (scoped.defaultPolicy !== "fixed") return
-    const model = scoped.defaultModel
-    const since = scoped.defaultSetAt
-    if (!model || since === undefined) return
-    const family = new Set(props.context.data.session.family(current.id))
-    for (const item of sessions()) {
-      if (item.id === current.id || !family.has(item.id)) continue
-      if ((item.time?.created ?? 0) <= since) continue
-      if (scoped.policies[item.id] && scoped.policies[item.id] !== "fixed") continue
-      if (appliedDefaults.has(item.id)) continue
-      appliedDefaults.add(item.id)
-      if (item.model && sameModel(item.model, model)) continue
-      void props.context.client.session
-        .switchModel({
-          sessionID: item.id,
-          model: { providerID: model.providerID, id: model.id },
-        })
-        .catch(() => {})
+    const rootModelRef = rootModel()
+    // The tree must be known before a batch runs: the flagship pre-check needs
+    // the root model to tell whether the target model is a flagship model.
+    if (!rootModelRef) return
+    const target =
+      scoped.defaultPolicy === "fixed"
+        ? scoped.defaultModel
+        : scoped.defaultPolicy === "inherit"
+          ? rootModelRef
+          : undefined
+    if (!target) return
+    const key = `${current.id}|${scoped.defaultPolicy}|${modelKey(target)}`
+    if (key === lastTargetKey) return
+    lastTargetKey = key
+    if (!mountPassDone) {
+      // Opening the panel never re-models existing subagents; only subagents
+      // created after the default was set pick that default up.
+      mountPassDone = true
+      if (scoped.defaultPolicy === "fixed") void applyDefaultToNewChildren(current.id, target)
+      return
     }
+    if (key === appliedTargetKey) return
+    appliedTargetKey = key
+    void syncDefaultModels(current.id, target).catch(() => {})
   })
+
+  /** Subagents created after the fixed default was set pick that model up. */
+  async function applyDefaultToNewChildren(rootID: string, model: ModelRef) {
+    const since = root().defaultSetAt
+    if (since === undefined) return
+    const family = new Set(props.context.data.session.family(rootID))
+    const kept = root().keptSubagents ?? {}
+    const failures: string[] = []
+    for (const item of sessions()) {
+      if (item.id === rootID || !family.has(item.id)) continue
+      if ((item.time?.created ?? 0) <= since) continue
+      const policy = root().policies[item.id]
+      if (policy && policy !== "fixed") continue
+      // A protected Subagent keeps its own model; the default never reaches it.
+      if (kept[item.id]) continue
+      if (item.model && sameModel(item.model, model)) continue
+      try {
+        // A newly created child already has a running parent/tool call. Apply
+        // its default for subsequent attempts without interrupting that call.
+        await props.context.client.session.switchModel({ sessionID: item.id, model })
+      } catch (error) {
+        failures.push(`${subagentTitle(item)}：${errorText(error)}`)
+      }
+    }
+    if (failures.length > 0) {
+      props.context.ui.toast.show({
+        message: `默认模型应用到新子代理：${failures.length} 个失败（${failures.join("；")}）。`,
+      })
+    }
+  }
+
+  async function syncDefaultModels(rootID: string, target: ModelRef) {
+    if (syncingDefaultModels) return
+    syncingDefaultModels = true
+    try {
+      const family = new Set(props.context.data.session.family(rootID))
+      const kept = root().keptSubagents ?? {}
+      const policies = root().policies
+      const targets = sessions().filter(
+        (item) =>
+          item.id !== rootID &&
+          family.has(item.id) &&
+          !kept[item.id] &&
+          policies[item.id] !== "auto",
+      )
+      if (targets.length === 0) return
+      const label = names().get(modelKey(target)) ?? target.id
+      // Only a target on the root's provider/model adds flagships; the pre-check
+      // counts the flagships that stay (protected or auto) plus every target
+      // and refuses the whole batch when the result would exceed the cap. The
+      // variant is ignored here so a variant change cannot bypass the guard.
+      const rootRef = rootModel()
+      const targetIsFlagship = Boolean(
+        rootRef && target.providerID === rootRef.providerID && target.id === rootRef.id,
+      )
+      if (targetIsFlagship) {
+        const targetIDs = new Set(targets.map((item) => item.id))
+        const stayingFlagships = sessions().filter(
+          (item) =>
+            item.id !== rootID &&
+            family.has(item.id) &&
+            !targetIDs.has(item.id) &&
+            isFlagshipSession({ model: item.model, metadata: item.metadata }, rootModel()),
+        ).length
+        const after = targets.length + stayingFlagships
+        if (after > flagshipLimit()) {
+          props.context.ui.toast.show({
+            message: `切换默认模型后旗舰数将为 ${after}，超过上限 ${flagshipLimit()}（本次目标 ${targets.length} + 保持旗舰 ${stayingFlagships}）；整次未执行，请先调大旗舰上限或减少子代理。`,
+          })
+          return
+        }
+      }
+      let switched = 0
+      const failures: string[] = []
+      for (const item of targets) {
+        if (item.model && sameModel(item.model, target)) continue
+        const outcome = await switchModelCore(item.id, target)
+        if (outcome.error) failures.push(`${subagentTitle(item)}：${outcome.error}`)
+        else if (outcome.warn) failures.push(`${subagentTitle(item)}：${outcome.warn}`)
+        else switched++
+      }
+      if (failures.length > 0) {
+        props.context.ui.toast.show({
+          message: `默认模型批量切换：${switched} 个成功，${failures.length} 个失败（${failures.join("；")}）。`,
+        })
+      } else if (switched > 0) {
+        props.context.ui.toast.show({ message: `已将 ${switched} 个未保护子代理切到 ${label}。` })
+      }
+    } finally {
+      syncingDefaultModels = false
+    }
+  }
 
   const rows = createMemo(() => {
     const value = tree()
@@ -1434,7 +1713,10 @@ export function SidebarAgents(props: {
   /** 子代理的上下文读数：最近一次 assistant 调用的输入规模，无数据时整段不显示。 */
   const rowUsage = (row: FlatNode) =>
     row.node.kind === "subagent" && row.node.sessionID
-      ? contextUsageView(props.context.data.session.message.list(row.node.sessionID))
+      ? contextUsageView(
+          props.context.data.session.message.list(row.node.sessionID),
+          row.node.model?.actual,
+        )
       : undefined
 
   /**
@@ -1549,10 +1831,11 @@ export function SidebarAgents(props: {
   /** 头部第一行：默认模型。监管等级另起一行，不挂在模型后面。 */
   const defaultLabel = createMemo(() => headerLine("默认模型", defaultModelName()))
 
-  /** 头部第三行：监管等级与等级名。 */
+  /** 头部第三行：监管等级、等级名与对应的验收深度。 */
   const oversightText = createMemo(() => {
     const contract = rootOversight()
-    return headerLine("监管", `L${contract.level} ${contract.name}`)
+    const acceptance = contract.acceptance?.name
+    return headerLine("监管", `L${contract.level} ${contract.name}${acceptance ? `${SEPARATOR}${acceptance}` : ""}`)
   })
 
   /** 头部文字也按可用宽度收尾，窄栏下不会换行。 */
@@ -1615,7 +1898,7 @@ export function SidebarAgents(props: {
     await putInstruction(INSTRUCTION_KEYS.defaultModel, `${model.providerID}/${model.id}`)
     await rememberRecent(model)
     props.context.ui.toast.show({
-      message: `子代理默认模型已设为 ${model.name || model.id}。`,
+      message: `子代理默认模型已设为 ${model.name || model.id}，正在应用到未保护子代理。`,
     })
   }
 
@@ -1635,11 +1918,21 @@ export function SidebarAgents(props: {
           value: { kind: "auto" },
           title: "自动",
           description:
-            autoModels().length > 0 ? `每次分配由 Superagent 从 ${autoModels().length} 个全局自动模型中指定` : "未配置（禁用）",
+            autoModels().length > 0
+              ? `每次分配由 Superagent 从 ${autoModels().length} 个全局自动模型中指定；不改动已有子代理`
+              : "未配置（禁用）",
           disabled: autoModels().length === 0,
         },
-        { value: { kind: "inherit" }, title: "跟随会话", description: "使用当前会话的模型（Superagent 主模型）" },
-        { value: { kind: "choose" }, title: "选择模型…", description: "打开原生 /models 选择器" },
+        {
+          value: { kind: "inherit" },
+          title: "跟随会话",
+          description: "所有未保护子代理跟随当前会话的模型（Superagent 主模型）",
+        },
+        {
+          value: { kind: "choose" },
+          title: "选择模型…",
+          description: "打开原生 /models 选择器；应用到所有未保护子代理",
+        },
         { value: { kind: "configure" }, title: "配置全局自动模型…", description: "所有 Session 共用这份列表" },
       ],
       current,
@@ -1674,49 +1967,74 @@ export function SidebarAgents(props: {
   /** 正在换模型的会话：同一时间只允许一次切换，避免两次动作交错。 */
   const switchingModels = new Set<string>()
 
+  type SwitchOutcome = { running: boolean; error?: string; warn?: string }
+
   /**
-   * 换模型：空闲时直接换；运行中先中断，等执行真的停下再换，并让子代理继续。
-   * 中断失败就中止，不在半中断的状态下换模型。
+   * 切换模型的公共流程：空闲直接换；运行中先中断并等执行真的停下，再切换，
+   * 最后让子代理继续。所有失败以返回值上报，不在这里弹 toast。
    */
-  async function applyModelSwitch(sessionID: string, model: ModelRef, label: string) {
-    if (switchingModels.has(sessionID)) {
-      props.context.ui.toast.show({ message: "正在切换模型，请稍候。" })
-      return
-    }
-    switchingModels.add(sessionID)
+  async function switchModelCore(sessionID: string, model: ModelRef): Promise<SwitchOutcome> {
     const running = isSessionRunning(props.context, sessionID)
+    if (switchingModels.has(sessionID)) return { running, error: "正在切换模型" }
+    switchingModels.add(sessionID)
     try {
       if (running) {
         await props.context.client.session.interrupt({ sessionID })
         const stopped = await waitForSessionIdle(props.context, sessionID)
-        if (!stopped) {
-          props.context.ui.toast.show({ message: "中断没有生效，模型未切换。" })
-          return
-        }
+        if (!stopped) return { running, error: "中断没有生效" }
       }
       await props.context.client.session.switchModel({ sessionID, model })
-      props.context.ui.toast.show({
-        message: running ? `已中断当前步骤，切换模型 ${label} 并继续` : `已切换模型 ${label}`,
-      })
-      if (!running) return
+      if (!running) return { running }
       try {
         await props.context.client.session.prompt({
           sessionID,
-          text: `模型已切换为 ${label}，继续当前任务`,
+          text: `模型已切换为 ${names().get(modelKey(model)) ?? model.id}，继续当前任务`,
           delivery: "steer",
         })
       } catch {
-        props.context.ui.toast.show({ message: `模型已切换为 ${label}，请手动让该子代理继续。` })
+        return { running, warn: "已切换模型，但未能让子代理继续" }
       }
+      return { running }
     } catch (error) {
-      props.context.ui.toast.show({ message: `切换模型失败：${errorText(error)}` })
+      return { running, error: errorText(error) }
     } finally {
       switchingModels.delete(sessionID)
     }
   }
 
+  async function applyModelSwitch(sessionID: string, model: ModelRef, label: string) {
+    const running = isSessionRunning(props.context, sessionID)
+    const outcome = await switchModelCore(sessionID, model)
+    if (outcome.error === "正在切换模型") {
+      props.context.ui.toast.show({ message: "正在切换模型，请稍候。" })
+      return
+    }
+    if (outcome.error === "中断没有生效") {
+      props.context.ui.toast.show({ message: "中断没有生效，模型未切换。" })
+      return
+    }
+    if (outcome.error) {
+      props.context.ui.toast.show({ message: `切换模型失败：${outcome.error}` })
+      return
+    }
+    if (outcome.warn) {
+      props.context.ui.toast.show({ message: `模型已切换为 ${label}，请手动让该子代理继续。` })
+      return
+    }
+    props.context.ui.toast.show({
+      message: running ? `已中断当前步骤，切换模型 ${label} 并继续` : `已切换模型 ${label}`,
+    })
+  }
+
   async function openModel(node: AgentNode) {
     if (node.kind === "root") return
+    // Protected Subagents keep their own model; changing it needs the protection off first.
+    if (node.sessionID && root().keptSubagents?.[node.sessionID]) {
+      props.context.ui.toast.show({
+        message: `${node.title} 已受保护，模型不会被修改；请先取消保护。`,
+      })
+      return
+    }
     await loadPreferences()
     const choice = policyChoice(node)
     const current: DefaultAction | undefined =
@@ -1747,6 +2065,25 @@ export function SidebarAgents(props: {
       return
     }
     if (selected.kind === "inherit") {
+      const target = normalizeFlagshipModel(rootModel())
+      const already = Boolean(node.sessionID && isFlagshipSession({
+        model: node.model?.actual,
+        metadata: props.context.data.session.get(node.sessionID)?.metadata,
+      }, rootModel()))
+      if (
+        target &&
+        !flagshipChangeAllowed({
+          current: flagshipCount(),
+          limit: flagshipLimit(),
+          alreadyFlagship: already,
+          targetFlagship: true,
+        })
+      ) {
+        props.context.ui.toast.show({
+          message: `旗舰子代理已达上限 ${flagshipLimit()}，不能把 ${node.title} 切到旗舰模型。`,
+        })
+        return
+      }
       await updateRoot((draft) => {
         draft.policies = { ...draft.policies, [node.sessionID!]: "inherit" }
       })
@@ -1769,6 +2106,31 @@ export function SidebarAgents(props: {
       providerID: picked.providerID,
       id: picked.id,
       ...(picked.variant ? { variant: picked.variant } : {}),
+    }
+    const targetFlagship = isFlagshipModel(modelRef, rootModel())
+    const alreadyFlagship = Boolean(
+      node.sessionID &&
+        isFlagshipSession(
+          {
+            model: node.model?.actual,
+            metadata: props.context.data.session.get(node.sessionID)?.metadata,
+          },
+          rootModel(),
+        ),
+    )
+    if (
+      targetFlagship &&
+      !flagshipChangeAllowed({
+        current: flagshipCount(),
+        limit: flagshipLimit(),
+        alreadyFlagship,
+        targetFlagship,
+      })
+    ) {
+      props.context.ui.toast.show({
+        message: `旗舰子代理已达上限 ${flagshipLimit()}，不能把 ${node.title} 切到旗舰模型。`,
+      })
+      return
     }
     const oversight = oversightFor(node.sessionID!)
     await updateRoot((draft) => {
@@ -1849,6 +2211,30 @@ export function SidebarAgents(props: {
       draft.maxSubagents = parsed
     })
     props.context.ui.toast.show({ message: `最大子代理数量已设为 ${parsed}。` })
+  }
+
+  async function editMaxFlagshipSubagents() {
+    const value = await props.context.ui.dialog.prompt({
+      title: "旗舰子代理数量",
+      description:
+        `0–20 的整数：默认 ${DEFAULT_MAX_FLAGSHIP_SUBAGENTS}。旗舰子代理与 Superagent 同 provider/model/variant；仍计入子代理总上限。`,
+      placeholder: `例如：${DEFAULT_MAX_FLAGSHIP_SUBAGENTS}`,
+      value: policy().maxFlagshipSubagents,
+    })
+    if (value === undefined) return
+    const text = value.trim()
+    if (!text) {
+      await removeInstruction(INSTRUCTION_KEYS.maxFlagshipSubagents)
+      props.context.ui.toast.show({ message: "旗舰子代理数量已清除。" })
+      return
+    }
+    const parsed = Number(text)
+    if (!/^\d+$/.test(text) || !Number.isInteger(parsed) || parsed < 0 || parsed > 20) {
+      props.context.ui.toast.show({ message: "旗舰子代理数量必须是 0–20 的整数。" })
+      return
+    }
+    await putInstruction(INSTRUCTION_KEYS.maxFlagshipSubagents, parsed)
+    props.context.ui.toast.show({ message: `旗舰子代理数量已设为 ${parsed}。` })
   }
 
   async function editAssignmentPrompt() {
@@ -2096,6 +2482,11 @@ export function SidebarAgents(props: {
           description: `${current.maxSubagents}${current.maxSubagentsCustom ? "" : "（默认）"} · 超出后自动淘汰最旧的已完成子代理`,
         },
         {
+          value: { kind: "maxFlagshipSubagents" },
+          title: "旗舰子代理数量",
+          description: `${current.maxFlagshipSubagents}${current.maxFlagshipSubagentsCustom ? "" : "（默认）"} · 与 Superagent 同模型；仍计入子代理总上限`,
+        },
+        {
           value: { kind: "assignmentPrompt" },
           title: "任务分配微调提示词",
           description: `${summarize(current.assignmentPrompt)}${current.assignmentPromptCustom ? "" : "（默认）"}`,
@@ -2149,6 +2540,7 @@ export function SidebarAgents(props: {
     if (selected.kind === "oversight") return openOversight()
     if (selected.kind === "policy") return openPolicyEditor()
     if (selected.kind === "maxSubagents") return editMaxSubagents()
+    if (selected.kind === "maxFlagshipSubagents") return editMaxFlagshipSubagents()
     if (selected.kind === "assignmentPrompt") return editAssignmentPrompt()
     if (selected.kind === "taskPrompt") return editTaskPrompt()
     if (selected.kind === "restore") return restoreDefaults()
@@ -2160,32 +2552,17 @@ export function SidebarAgents(props: {
     return configureAutoModels()
   }
 
-  async function recreateSubagent(node: AgentNode) {
+  /** Deletes the Subagent session and its context; nothing is recreated. */
+  async function deleteSubagent(node: AgentNode) {
     if (!node.sessionID) return
-    const current = props.context.data.session.get(node.sessionID)
-    if (!current) return
     const confirmed = await props.context.ui.dialog.confirm({
-      title: "删除并重建",
-      message: `删除并重建 ${node.title}？上下文将被清空。`,
-      label: { confirm: "删除并重建", cancel: "取消" },
+      title: "删除 Subagent",
+      message: `删除 ${node.title}？该子会话及其上下文会被永久删除，无法恢复。`,
+      label: { confirm: "删除 Subagent", cancel: "取消" },
     })
     if (!confirmed) return
-    const prompt = latestUserMessage(props.context, node.sessionID) ?? current.title ?? node.title
-    // 交接摘要取不到（读会话失败）不阻塞删除重建，降级为无交接直接重建。
-    const handoff = await buildHandoffSummary({
-      client: props.context.client as unknown as HandoffClient,
-      childSessionID: node.sessionID,
-    }).catch(() => undefined)
     await props.context.client.session.remove({ sessionID: node.sessionID })
-    const created = await props.context.client.session.create({
-      parentID: current.parentID,
-      agent: current.agent,
-      model: current.model,
-      title: current.title,
-    })
-    const brief = handoff ? `# 交接摘要\n${handoff}\n\n${prompt}` : prompt
-    await props.context.client.session.prompt({ sessionID: created.id, text: brief })
-    props.context.ui.toast.show({ message: `${node.title} 已清空上下文并重建。` })
+    props.context.ui.toast.show({ message: `${node.title} 已删除。` })
   }
 
   async function compactSubagent(node: AgentNode) {
@@ -2194,7 +2571,7 @@ export function SidebarAgents(props: {
     props.context.ui.toast.show({ message: `已请求压缩 ${node.title} 的上下文。` })
   }
 
-  /** Protects a Subagent from automatic eviction. Manual deletion stays allowed. */
+  /** Protects a Subagent from automatic eviction and from model changes. */
   async function toggleKeep(node: AgentNode) {
     const sessionID = node.sessionID
     if (!sessionID) return
@@ -2207,7 +2584,9 @@ export function SidebarAgents(props: {
     })
     await writeKeptEntry(next).catch(() => {})
     props.context.ui.toast.show({
-      message: kept ? `${node.title} 已取消保护，可被自动淘汰。` : `${node.title} 已保护，不会被自动淘汰。`,
+      message: kept
+        ? `${node.title} 已取消保护，可被自动淘汰，模型也可以被修改。`
+        : `${node.title} 已保护，不会被自动淘汰，模型也不会被修改；取消保护后才可改。`,
     })
   }
 
@@ -2221,6 +2600,41 @@ export function SidebarAgents(props: {
    * Subagent goes first; running, protected, pending and currently viewed
    * sessions stay.
    */
+  function evictionChild(item: SessionInfo): SubagentChild {
+    return {
+      id: item.id,
+      title: subagentTitle(item),
+      status: String(props.context.data.session.status(item.id)),
+      outcome: item.outcome as SubagentChild["outcome"],
+      created: item.time?.created,
+      updated: item.time?.updated,
+    }
+  }
+  async function removeEvictionVictims(
+    victims: SubagentChild[],
+    reason: { limit: number; label: string },
+  ) {
+    for (const victim of victims) {
+      evicting.add(victim.id)
+      try {
+        await props.context.client.session.remove({ sessionID: victim.id })
+        props.context.ui.toast.show({
+          message: `已自动淘汰子代理「${victim.title}」(${victim.id})：${reason.label} ${reason.limit}，已删除最旧的已完成子代理。`,
+        })
+        void appendOversightEvent("subagent.evicted", {
+          rootSessionID: rootSessionID(),
+          sessionID: victim.id,
+          title: victim.title,
+          limit: reason.limit,
+          reason: reason.label,
+        }).catch(() => {})
+      } catch {
+        // The session stays; a later prune tries again.
+      } finally {
+        evicting.delete(victim.id)
+      }
+    }
+  }
   async function evictExcessSubagents() {
     if (pruning) {
       pruneAgain = true
@@ -2232,45 +2646,37 @@ export function SidebarAgents(props: {
         pruneAgain = false
         const limit = subagentLimit()
         const children = directSubagents()
-        if (children.length <= limit) break
-        const scoped = root()
         const plan = planEviction({
-          children: children.map(
-            (item): SubagentChild => ({
-              id: item.id,
-              title: subagentTitle(item),
-              status: String(props.context.data.session.status(item.id)),
-              outcome: item.outcome,
-              created: item.time?.created,
-              updated: item.time?.updated,
-            }),
-          ),
+          children: children.map(evictionChild),
           limit,
           currentSessionID: props.sessionID,
-          keptSubagents: scoped.keptSubagents,
+          keptSubagents: root().keptSubagents,
         })
         const victims = plan.victims.filter((victim) => !evicting.has(victim.id))
         if (victims.length === 0) break
-        for (const victim of victims) {
-          evicting.add(victim.id)
-          try {
-            await props.context.client.session.remove({ sessionID: victim.id })
-            props.context.ui.toast.show({
-              message: `已自动淘汰子代理「${victim.title}」(${victim.id})：超出上限 ${limit}，已删除最旧的已完成子代理。`,
-            })
-            void appendOversightEvent("subagent.evicted", {
-              rootSessionID: rootSessionID(),
-              sessionID: victim.id,
-              title: victim.title,
-              limit,
-            }).catch(() => {})
-          } catch {
-            // The session stays; a later prune tries again.
-          } finally {
-            evicting.delete(victim.id)
-          }
-        }
+        await removeEvictionVictims(victims, { limit, label: "超出上限" })
       } while (pruneAgain)
+
+      // The flagship cap is a second, narrower limit. Only the oldest finished
+      // flagships are candidates; total-cap eviction has already run first.
+      const limit = flagshipLimit()
+      const effectiveModels = new Map(
+        (tree()?.children ?? []).flatMap((node) => (node.sessionID ? [[node.sessionID, node.model?.actual] as const] : [])),
+      )
+      const flagships = directSubagents().filter((item) =>
+        isFlagshipSession(
+          { model: effectiveModels.get(item.id) ?? item.model, metadata: item.metadata },
+          rootModel(),
+        ),
+      )
+      const plan = planEviction({
+        children: flagships.map(evictionChild),
+        limit,
+        currentSessionID: props.sessionID,
+        keptSubagents: root().keptSubagents,
+      })
+      const victims = plan.victims.filter((victim) => !evicting.has(victim.id))
+      if (victims.length > 0) await removeEvictionVictims(victims, { limit, label: "超出旗舰上限" })
     } finally {
       pruning = false
     }
@@ -2280,6 +2686,8 @@ export function SidebarAgents(props: {
     if (!collabOn()) return
     directSubagents().length
     subagentLimit()
+    flagshipCount()
+    flagshipLimit()
     void evictExcessSubagents()
   })
 
@@ -2308,16 +2716,18 @@ export function SidebarAgents(props: {
         {
           value: { kind: "keep" },
           title: kept ? "取消保护" : "保护此子代理",
-          description: kept ? "允许自动淘汰这个子代理" : "禁止自动淘汰这个子代理",
+          description: kept
+            ? "允许自动淘汰这个子代理，模型也可以被修改"
+            : "不会被自动淘汰，模型也不会被修改；取消保护后才可改",
         },
-        { value: { kind: "recreate" }, title: "删除并重建", description: "清空上下文后按原配置重新创建" },
+        { value: { kind: "delete" }, title: "删除 Subagent", description: "删除该子会话及其上下文，不可恢复" },
       ],
     })
     if (!selected) return
     if (selected.kind === "model") return openModel(node)
     if (selected.kind === "compact") return compactSubagent(node)
     if (selected.kind === "keep") return toggleKeep(node)
-    if (selected.kind === "recreate") return recreateSubagent(node)
+    if (selected.kind === "delete") return deleteSubagent(node)
     if (node.sessionID) props.context.ui.router.navigate({ type: "session", sessionID: node.sessionID })
   }
 

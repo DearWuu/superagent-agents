@@ -17,6 +17,22 @@ export const TASK_BRIEF_INLINE_LIMIT = 1500
 /** Inline budget of a single command output inside a report, in characters. */
 export const COMMAND_OUTPUT_INLINE_LIMIT = 600
 
+/** How the Superagent verifies the result at a given level. */
+export type OversightCriticMode = "switch" | "required"
+
+/**
+ * The acceptance contract the Superagent applies to a Subagent's report.
+ * Depth follows the Subagent's resolved oversight level; no separate setting.
+ */
+export type OversightAcceptance = {
+  /** 结果验收 / 摘要验收 / 证据验收 / 全量验收 / 审计验收 */
+  name: string
+  /** What the Superagent must do before accepting the result. */
+  actions: readonly string[]
+  /** `switch` follows the root critic switch; `required` always reviews. */
+  critic: OversightCriticMode
+}
+
 /**
  * The report contract a Subagent receives. It never restricts what the
  * Subagent may do; it only fixes how much of the work has to be reported
@@ -31,6 +47,8 @@ export type OversightContract = {
   sections: readonly string[]
   /** When the Subagent reports back. */
   cadence: string
+  /** How the Superagent verifies this level's report. */
+  acceptance: OversightAcceptance
 }
 
 export type OversightModel = {
@@ -122,6 +140,65 @@ const SECTIONS: Record<OversightLevel, readonly string[]> = {
   2: L2_SECTIONS,
   3: L3_SECTIONS,
   4: L4_SECTIONS,
+}
+
+/**
+ * What the Superagent does to verify a Subagent's result at each level.
+ * The levels only change acceptance depth; they never add a new user setting.
+ */
+export const OVERSIGHT_ACCEPTANCE: Record<OversightLevel, OversightAcceptance> = {
+  0: {
+    name: "结果验收",
+    actions: [
+      "以子代理结论为依据，低风险改动不要求过程记录",
+      "确认改动范围与派工任务书一致，没有未声明的高风险改动",
+      "核对测试结论；低风险改动不要求复跑",
+    ],
+    critic: "switch",
+  },
+  1: {
+    name: "摘要验收",
+    actions: [
+      "核对命令清单与 exit code",
+      "阅读阶段小结，逐段确认结果与目标一致",
+      "对关键改动做抽查，不逐行复读",
+    ],
+    critic: "switch",
+  },
+  2: {
+    name: "证据验收",
+    actions: [
+      "核对真实输出指针（path:行号 或日志文件），不接受口头复述",
+      "查看关键 diff，确认改动与目标一致",
+      "失败命令必须附失败输出与原因，不接受只写结论",
+      "界面改动必须提供真实截图，不接受文字描述代替",
+    ],
+    critic: "switch",
+  },
+  3: {
+    name: "全量验收",
+    actions: [
+      "复跑关键命令并核对实际输出",
+      "阅读关键代码，确认实现与修改理由一致",
+      "按任务书验收点执行边界与回归检查",
+      "critic 复核遵循 root 的开关，不强制",
+    ],
+    critic: "switch",
+  },
+  4: {
+    name: "审计验收",
+    actions: [
+      "独立 critic 强制复核，不依赖 critic 开关",
+      "由 Superagent 结合 critic 结论与证据做最终裁决",
+      "关键检查与不稳定检查重复运行，确认结果可复现",
+      "完整审计命令、代码、假设与备选方案，结论冲突时按证据重新裁定",
+    ],
+    critic: "required",
+  },
+}
+
+export function acceptanceForLevel(level: OversightLevel): OversightAcceptance {
+  return OVERSIGHT_ACCEPTANCE[level] ?? OVERSIGHT_ACCEPTANCE[DEFAULT_OVERSIGHT_LEVEL]
 }
 
 /** The report header every level has to carry, in a fixed order. */
@@ -247,6 +324,7 @@ export function resolveOversight(input: ResolveOversightInput = {}): OversightCo
     name: OVERSIGHT_LEVEL_NAMES[level],
     sections: SECTIONS[level],
     cadence: CADENCES[level],
+    acceptance: acceptanceForLevel(level),
   }
 }
 
@@ -260,6 +338,7 @@ export function oversightLabel(contract: Pick<OversightContract, "level">) {
  * states that the evidence has to be real.
  */
 export function renderReportProtocol(contract: OversightContract) {
+  const acceptance = contract.acceptance ?? acceptanceForLevel(contract.level)
   return [
     `[报告协议 ${oversightLabel(contract)} · ${contract.name}]`,
     contract.cadence,
@@ -270,5 +349,11 @@ export function renderReportProtocol(contract: OversightContract) {
     "说明：行为不受限制；证据必须真实（真实执行输出、真实文件引用）；Superagent 可随时翻查 session 完整记录核查。",
     BUDGET_LINE,
     CONTEXT_DISCIPLINE_LINE,
+    "",
+    `[Superagent 验收动作 ${oversightLabel(contract)} · ${acceptance.name}]`,
+    ...acceptance.actions.map((action) => `- ${action}`),
+    `复核方式：${
+      acceptance.critic === "required" ? "独立 critic 强制复核" : "critic 复核遵循 root 的 critic 开关"
+    }`,
   ].join("\n")
 }
