@@ -14,7 +14,7 @@ import plugin, {
   COLLAB_ENABLED_KEY,
   PROBE_AFTER_MS,
   collabEnabledFromEntries,
-  createCtxWarningScanner,
+  createCtxCompactionScanner,
   createProbeScanner,
   readCollabState,
 } from "./server"
@@ -381,10 +381,10 @@ describe("扫描器逐 root 判断", () => {
     expect(sent).toEqual(["ses_b_child"])
   })
 
-  test("上下文提醒：A 停用不发，B 照常向自己的 root 发", async () => {
-    const sent: Array<{ root: string; text: string }> = []
+  test("上下文自动压缩：A 停用不压，B 照常压缩自己的子代理", async () => {
+    const compacted: string[] = []
     const now = Date.now()
-    const scanner = createCtxWarningScanner({
+    const scanner = createCtxCompactionScanner({
       listSessions: async () => [
         { id: "ses_a_child", title: "A", busy: now - 1 },
         { id: "ses_b_child", title: "B", busy: now - 1 },
@@ -393,8 +393,8 @@ describe("扫描器逐 root 判断", () => {
       rootIsEnabled: async (rootID) => rootID !== "ses_a_root",
       rootIsConfigured: async () => true,
       readTokens: async () => 350_000,
-      sendWarn: async (rootID, text) => {
-        sent.push({ root: rootID, text })
+      compactSession: async (childSessionID) => {
+        compacted.push(childSessionID)
       },
       claim: () => true,
       log: () => {},
@@ -402,7 +402,7 @@ describe("扫描器逐 root 判断", () => {
     })
 
     expect(await scanner.scan()).toBe(1)
-    expect(sent.map((item) => item.root)).toEqual(["ses_b_root"])
+    expect(compacted).toEqual(["ses_b_child"])
   })
 
   test("开关读取异常按启用处理并留日志", async () => {

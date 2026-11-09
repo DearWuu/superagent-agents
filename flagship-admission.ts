@@ -1,15 +1,18 @@
 /**
- * Server-side admission for same-model flagship Subagents.
+ * Server-side admission for explicit same-model flagship Subagents.
  *
  * `superagent.max-flagship-subagents` is a separate cap on top of the total
- * Subagent cap. A persisted marker counts only while the child's current model
- * still matches the marked model; without a marker the child's model is compared
- * with the Superagent/root model. These helpers stay pure and reuse the shared
- * `isFlagshipSession` so the hook wiring, panel and tests share one definition.
+ * Subagent cap. Only a call whose `input.model` explicitly names the root's
+ * provider/model/variant is flagship admission; inherited, agent-default,
+ * UI and fallback-model paths never enter this cap. Identity persists only
+ * through the marker written after a successful call, reused via the shared
+ * marker-only `isFlagshipSession` so the hook wiring, panel and tests share
+ * one definition.
  */
 
 import {
   DEFAULT_MAX_FLAGSHIP_SUBAGENTS,
+  FLAGSHIP_MARKER_SOURCE,
   FLAGSHIP_METADATA_KEY,
   MAX_MAX_FLAGSHIP_SUBAGENTS,
   MIN_MAX_FLAGSHIP_SUBAGENTS,
@@ -24,6 +27,7 @@ import {
 
 export {
   DEFAULT_MAX_FLAGSHIP_SUBAGENTS,
+  FLAGSHIP_MARKER_SOURCE,
   FLAGSHIP_METADATA_KEY,
   MAX_MAX_FLAGSHIP_SUBAGENTS,
   MIN_MAX_FLAGSHIP_SUBAGENTS,
@@ -61,41 +65,6 @@ export function readMaxFlagshipSubagents(entries: unknown): number {
   return DEFAULT_MAX_FLAGSHIP_SUBAGENTS
 }
 
-/**
- * Native subagent model resolution for a new child:
- * `input.model ?? agent.model ?? parent.model`. Empty strings are treated as
- * absent because the native tool deletes them before use.
- */
-function present(value: unknown): unknown {
-  return value === undefined || value === null || value === "" ? undefined : value
-}
-
-export function resolveNewSubagentModel(input: {
-  inputModel?: unknown
-  agentModel?: unknown
-  parentModel?: unknown
-}): ModelRef | undefined {
-  const chosen = present(input.inputModel) ?? present(input.agentModel) ?? present(input.parentModel)
-  return normalizeFlagshipModel(chosen)
-}
-
-/**
- * Native model resolution for an existing child:
- * `override ?? (switched ? agent.model : undefined) ?? existing.model`.
- */
-export function resolveSteerSubagentModel(input: {
-  inputModel?: unknown
-  agentModel?: unknown
-  existingModel?: unknown
-  switched: boolean
-}): ModelRef | undefined {
-  const chosen =
-    present(input.inputModel) ??
-    present(input.switched ? input.agentModel : undefined) ??
-    present(input.existingModel)
-  return normalizeFlagshipModel(chosen)
-}
-
 /** Same off-by-one rule as the total cap: in-flight includes the current call. */
 export function isFlagshipOverLimit(exist: number, inflight: number, limit: number): boolean {
   return exist + inflight > limit
@@ -105,14 +74,14 @@ export function flagshipFormula(exist: number, inflight: number, limit: number):
   return `flagshipExist=${exist} flagshipInflight=${inflight} flagshipTotal=${exist + inflight} flagshipLimit=${limit}`
 }
 
-/** `{ model, at }`, the marker written on a flagship child's own metadata. */
-export type FlagshipMarker = { model: ModelRef; at: number }
+/** `{ model, at, source }`, the marker written on an explicitly delegated flagship child. */
+export type FlagshipMarker = { model: ModelRef; at: number; source: typeof FLAGSHIP_MARKER_SOURCE }
 
 export function withFlagshipMarker(metadata: unknown, model: unknown, at: number): Record<string, unknown> | undefined {
   const ref = normalizeFlagshipModel(model)
   if (!ref) return undefined
   const base = isRecord(metadata) ? metadata : {}
-  const marker: FlagshipMarker = { model: ref, at }
+  const marker: FlagshipMarker = { model: ref, at, source: FLAGSHIP_MARKER_SOURCE }
   return { ...base, [FLAGSHIP_METADATA_KEY]: marker }
 }
 

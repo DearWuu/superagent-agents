@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import {
   DEFAULT_MAX_FLAGSHIP_SUBAGENTS,
+  FLAGSHIP_MARKER_SOURCE,
   FLAGSHIP_METADATA_KEY,
   MAX_FLAGSHIP_SUBAGENTS_KEY,
   effectiveFlagshipLimit,
@@ -12,8 +13,6 @@ import {
   isFlagshipSession,
   pickFlagshipVictim,
   readMaxFlagshipSubagents,
-  resolveNewSubagentModel,
-  resolveSteerSubagentModel,
   withFlagshipMarker,
   withoutFlagshipMarker,
 } from "./flagship-admission"
@@ -51,39 +50,7 @@ describe("readMaxFlagshipSubagents", () => {
   })
 })
 
-describe("模型解析遵循 native", () => {
-  test("新建：input.model ?? agent.model ?? parent.model", () => {
-    expect(
-      resolveNewSubagentModel({ inputModel: FLASH, agentModel: ROOT, parentModel: FLASH }),
-    ).toEqual({ providerID: "acme", id: "flash" })
-    expect(resolveNewSubagentModel({ agentModel: ROOT, parentModel: FLASH })).toEqual({
-      providerID: "acme",
-      id: "flagship",
-      variant: "high",
-    })
-    expect(resolveNewSubagentModel({ parentModel: FLASH })).toEqual({ providerID: "acme", id: "flash" })
-  })
-
-  test("新建：空串视作未设置，未知模型返回 undefined", () => {
-    expect(resolveNewSubagentModel({ inputModel: "", parentModel: FLASH })).toEqual({
-      providerID: "acme",
-      id: "flash",
-    })
-    expect(resolveNewSubagentModel({ inputModel: "not-a-model", parentModel: FLASH })).toBeUndefined()
-  })
-
-  test("steer：override ?? (switched ? agent.model : undefined) ?? existing.model", () => {
-    expect(
-      resolveSteerSubagentModel({ inputModel: FLASH, agentModel: ROOT, existingModel: ROOT, switched: true }),
-    ).toEqual({ providerID: "acme", id: "flash" })
-    expect(
-      resolveSteerSubagentModel({ agentModel: ROOT, existingModel: FLASH, switched: true }),
-    ).toEqual({ providerID: "acme", id: "flagship", variant: "high" })
-    expect(
-      resolveSteerSubagentModel({ agentModel: ROOT, existingModel: FLASH, switched: false }),
-    ).toEqual({ providerID: "acme", id: "flash" })
-  })
-
+describe("显式旗舰模型判定", () => {
   test("旗舰定义含 variant，未知模型不当作确定旗舰", () => {
     expect(isFlagshipModel(ROOT, ROOT)).toBe(true)
     expect(isFlagshipModel("acme/flagship#high", ROOT)).toBe(true)
@@ -122,7 +89,7 @@ describe("旗舰标记", () => {
     expect(isFlagshipSession).toBe(sharedIsFlagshipSession)
   })
 
-  test("写入时保留旧 metadata，清除时只去掉旗舰键", () => {
+  test("写入时保留旧 metadata 并带显式来源，清除时只去掉旗舰键", () => {
     const marked = withFlagshipMarker({ keep: 1, "superagent.critic": true }, ROOT, 123)
     expect(marked).toEqual({
       keep: 1,
@@ -130,6 +97,7 @@ describe("旗舰标记", () => {
       [FLAGSHIP_METADATA_KEY]: {
         model: { providerID: "acme", id: "flagship", variant: "high" },
         at: 123,
+        source: FLAGSHIP_MARKER_SOURCE,
       },
     })
     expect(hasFlagshipMarker(marked)).toBe(true)
@@ -138,15 +106,17 @@ describe("旗舰标记", () => {
   })
 
   test("持久标记在 child 当前模型一致时保留身份；不一致视为过期", () => {
-    const markedRoot = { model: ROOT, metadata: { [FLAGSHIP_METADATA_KEY]: { model: ROOT, at: 1 } } }
-    const staleFlash = { model: FLASH, metadata: { [FLAGSHIP_METADATA_KEY]: { model: ROOT, at: 1 } } }
+    const markedRoot = { model: ROOT, metadata: { [FLAGSHIP_METADATA_KEY]: { model: ROOT, at: 1, source: FLAGSHIP_MARKER_SOURCE } } }
+    const staleFlash = { model: FLASH, metadata: { [FLAGSHIP_METADATA_KEY]: { model: ROOT, at: 1, source: FLAGSHIP_MARKER_SOURCE } } }
     const plainFlash = { model: FLASH, metadata: {} }
+    const plainRoot = { model: ROOT, metadata: {} }
     // root 后来换模型不清洗标记：child 仍与 marker 同模型时仍是旗舰。
     expect(isFlagshipSession(markedRoot, FLASH)).toBe(true)
     // child 已经换到别的模型：旧标记过期，不再算旗舰。
     expect(isFlagshipSession(staleFlash, ROOT)).toBe(false)
+    // 无标记一律是普通子代理：与 root 同模型也不算旗舰。
     expect(isFlagshipSession(plainFlash, ROOT)).toBe(false)
-    expect(isFlagshipSession(plainFlash, FLASH)).toBe(true)
+    expect(isFlagshipSession(plainRoot, ROOT)).toBe(false)
   })
 })
 

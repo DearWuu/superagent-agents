@@ -400,11 +400,19 @@ test("受保护子代理跳过默认同步", async () => {
   }
 })
 
-test("旗舰预检不重复计数已旗舰的子代理", async () => {
+test("默认同步到 root 同模型不受旗舰上限影响", async () => {
   const h = await render({
     sessions: [
       { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
-      { id: "flag", parentID: "root", title: "旗舰", agent: "executor", model: rootModel, time: { created: 2, updated: 400 } },
+      {
+        id: "flag",
+        parentID: "root",
+        title: "旗舰",
+        agent: "executor",
+        model: rootModel,
+        metadata: { "superagent.flagship": { model: rootModel, at: 1, source: "explicit-subagent-delegation" } },
+        time: { created: 2, updated: 400 },
+      },
       { id: "a", parentID: "root", title: "甲", agent: "executor", model: flash, time: { created: 3, updated: 300 } },
       { id: "b", parentID: "root", title: "乙", agent: "executor", model: flash, time: { created: 4, updated: 200 } },
     ],
@@ -425,7 +433,7 @@ test("旗舰预检不重复计数已旗舰的子代理", async () => {
   }
 })
 
-test("旗舰超限时整次不变更", async () => {
+test("默认批量同步不因目标与 root 同模型被拒绝", async () => {
   const h = await render({
     sessions: threeChildren,
     instructions: { "superagent.max-flagship-subagents": 1 },
@@ -438,9 +446,10 @@ test("旗舰超限时整次不变更", async () => {
   try {
     await h.app.flush()
     h.setDefaultModel(rootModel)
-    await h.app.waitFor(() => h.toasts.some((message) => message.includes("超过上限")))
-    expect(h.switched.length).toBe(0)
-    expect(h.toasts.at(-1)).toContain("整次未执行")
+    await h.app.waitFor(() => h.switched.length >= 2)
+    // 默认批量同步不是显式旗舰委派：即使目标与 root 同模型也照常执行。
+    expect(h.toasts.some((message) => message.includes("超过上限"))).toBe(false)
+    expect(h.switched.map((item) => item.sessionID).sort()).toEqual(["a", "b"])
   } finally {
     h.app.renderer.destroy()
   }

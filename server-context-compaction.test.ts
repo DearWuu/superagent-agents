@@ -1,6 +1,6 @@
 /**
- * 超长上下文提醒：阈值、跳过条件、每子代理一次、compact 后再提醒、发送失败容错，
- * 以及真实 `setup()` 接线后向 root 发 steer 提醒的隔离实测。
+ * 超长上下文自动压缩：阈值、跳过条件、每子代理一次、compact 后再压缩、压缩失败容错，
+ * 以及真实 `setup()` 接线后直接调用原生 `session.compact`（不发 prompt）的隔离实测。
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
@@ -9,12 +9,11 @@ import path from "node:path"
 
 import plugin, {
   CONTEXT_WARN_TOKENS,
-  claimContextWarning,
+  claimContextCompaction,
   clearContextClaim,
   contextDropped,
   contextTokens,
-  createCtxWarningScanner,
-  ctxWarningText,
+  createCtxCompactionScanner,
   isContextOverLimit,
   readContextClaim,
   shouldCheckContext,
@@ -44,27 +43,27 @@ type ScannerOptions = {
   configured?: boolean
   claim?: (sessionID: string, tokens: number) => boolean
   rootIsEnabled?: (rootID: string) => Promise<boolean>
-  sendError?: boolean
+  compactError?: boolean
 }
 
 function scannerHarness(options: ScannerOptions) {
-  const prompts: Array<{ sessionID: string; text: string }> = []
+  const compacts: string[] = []
   const logs: any[] = []
-  const scanner = createCtxWarningScanner({
+  const scanner = createCtxCompactionScanner({
     listSessions: async () => options.candidates,
     resolveRoot: async (sessionID) => options.roots?.[sessionID] ?? "ses_root",
     rootIsConfigured: async () => options.configured ?? true,
     readTokens: async (sessionID) => options.tokens?.[sessionID],
-    sendWarn: async (sessionID, text) => {
-      if (options.sendError) throw new Error("steer down")
-      prompts.push({ sessionID, text })
+    compactSession: async (childSessionID) => {
+      if (options.compactError) throw new Error("compact down")
+      compacts.push(childSessionID)
     },
     claim: options.claim ?? (() => true),
     rootIsEnabled: options.rootIsEnabled,
     log: (record) => logs.push(record),
     now: () => NOW,
   })
-  return { scanner, prompts, logs }
+  return { scanner, compacts, logs }
 }
 
 const cleanups: string[] = []
@@ -125,18 +124,11 @@ describe("阈值与下降判定", () => {
     expect(isContextOverLimit(undefined)).toBe(false)
   })
 
-  test("下降 ≥30% 视为 compact 过", () => {
+  test("下降 ≥30% 视为 compact 已生效", () => {
     expect(contextDropped(350_000, 245_000)).toBe(true)
     expect(contextDropped(350_000, 244_999)).toBe(true)
     expect(contextDropped(350_000, 246_000)).toBe(false)
     expect(contextDropped(undefined, 100_000)).toBe(false)
-  })
-
-  test("提醒文案指向子代理并区分 compact 与删除边界", () => {
-    expect(ctxWarningText("修复登录", "ses_child", 301_400)).toBe(
-      "[上下文提醒] 子代理「修复登录」(ses_child) 当前上下文约 301k tokens（>300k）。建议：需要保留上下文时对其执行 compact；不再需要上下文时才删除。",
-    )
-    expect(ctxWarningText("  ", "ses_child", 350_000)).toContain("「未命名」")
   })
 })
 
@@ -156,11 +148,11 @@ describe("shouldCheckContext 跳过条件", () => {
   })
 })
 
-describe("createCtxWarningScanner", () => {
+describe("createCtxCompactionScanner", () => {
   test("root 停用时跳过该 root，但整轮仍列会话（不按全局布尔整轮跳过）", async () => {
     let listed = 0
-    const prompts: any[] = []
-    const scanner = createCtxWarningScanner({
+    const compacts: string[] = []
+    const scanner = createCtxCompactionScanner({
       listSessions: async () => {
         listed += 1
         return [child({ time: { busy: NOW - 500 } })]
@@ -169,16 +161,18 @@ describe("createCtxWarningScanner", () => {
       rootIsEnabled: async () => false,
       rootIsConfigured: async () => true,
       readTokens: async () => 400_000,
-      sendWarn: async (root, text) => prompts.push({ root, text }),
+      compactSession: async (childSessionID) => {
+        compacts.push(childSessionID)
+      },
       log: () => {},
     })
     expect(await scanner.scan()).toBe(0)
     expect(listed).toBe(1)
-    expect(prompts).toHaveLength(0)
+    expect(compacts).toHaveLength(0)
   })
 
   test("root 自身、critic 会话、已结束会话都不检查", async () => {
-    const { scanner, prompts } = scannerHarness({
+    const { scanner, compacts } = scannerHarness({
       candidates: [
         child({ id: "ses_root" }),
         child({ id: "ses_critic", title: "Critic: 复核 x", metadata: { "superagent.critic": true } }),
@@ -188,71 +182,84 @@ describe("createCtxWarningScanner", () => {
       tokens: { ses_root: 400_000, ses_critic: 400_000, ses_done: 400_000 },
     })
     expect(await scanner.scan()).toBe(0)
-    expect(prompts).toHaveLength(0)
+    expect(compacts).toHaveLength(0)
   })
 
   test("root 没有 superagent 配置时不检查", async () => {
-    const { scanner, prompts } = scannerHarness({
+    const { scanner, compacts } = scannerHarness({
       candidates: [child()],
       tokens: { ses_child: 400_000 },
       configured: false,
     })
     expect(await scanner.scan()).toBe(0)
-    expect(prompts).toHaveLength(0)
+    expect(compacts).toHaveLength(0)
   })
 
-  test("超过阈值向 root 发 steer，内容正确", async () => {
-    const { scanner, prompts, logs } = scannerHarness({
+  test("未超阈值不压缩", async () => {
+    const { scanner, compacts } = scannerHarness({
+      candidates: [child({ time: { busy: NOW - 500 } })],
+      tokens: { ses_child: 299_000 },
+    })
+    expect(await scanner.scan()).toBe(0)
+    expect(compacts).toHaveLength(0)
+  })
+
+  test("超过阈值直接对该子会话执行原生 compact，日志含 tokens/threshold/root", async () => {
+    const { scanner, compacts, logs } = scannerHarness({
       candidates: [child({ time: { busy: NOW - 500 } })],
       tokens: { ses_child: 350_000 },
     })
     expect(await scanner.scan()).toBe(1)
-    expect(prompts).toEqual([
-      { sessionID: "ses_root", text: ctxWarningText("修复登录", "ses_child", 350_000) },
-    ])
+    expect(compacts).toEqual(["ses_child"])
     expect(logs).toContainEqual(
-      expect.objectContaining({ event: "ctx-warn", childSessionID: "ses_child", tokens: 350_000, root: "ses_root" }),
+      expect.objectContaining({
+        event: "ctx-compact",
+        decision: "allow",
+        childSessionID: "ses_child",
+        tokens: 350_000,
+        threshold: 300_000,
+        root: "ses_root",
+      }),
     )
   })
 
-  test("每个子会话只提醒一次（落盘声明跨实例生效）", async () => {
+  test("每个子会话只压缩一次（落盘声明跨实例生效）", async () => {
     const options = {
       candidates: [child({ time: { busy: NOW - 500 } })],
       tokens: { ses_child: 350_000 },
-      claim: claimContextWarning,
+      claim: claimContextCompaction,
     }
     const first = scannerHarness(options)
     expect(await first.scanner.scan()).toBe(1)
     expect(readContextClaim("ses_child")).toBe(350_000)
 
-    // 换一个扫描器实例（模拟 reload 后的新插件）：声明还在，不再提醒。
+    // 换一个扫描器实例（模拟 reload 后的新插件）：声明还在，不再压缩。
     const second = scannerHarness(options)
     expect(await second.scanner.scan()).toBe(0)
-    expect(second.prompts).toHaveLength(0)
+    expect(second.compacts).toHaveLength(0)
   })
 
-  test("compact 后（下降 ≥30%）清声明，再次超阈时允许再提醒", async () => {
+  test("compact 生效后（下降 ≥30%）清声明，再次超阈时允许再压缩", async () => {
     const tokens: Record<string, number | undefined> = { ses_child: 350_000 }
-    const { scanner, prompts } = scannerHarness({
+    const { scanner, compacts } = scannerHarness({
       candidates: [child({ time: { busy: NOW - 500 } })],
       tokens,
-      claim: claimContextWarning,
+      claim: claimContextCompaction,
     })
     expect(await scanner.scan()).toBe(1)
 
-    // compact 后长度降到 200k：本轮不提醒，但声明被清掉。
+    // compact 后长度降到 200k：本轮不压缩，但声明被清掉。
     tokens.ses_child = 200_000
     expect(await scanner.scan()).toBe(0)
     expect(readContextClaim("ses_child")).toBeUndefined()
 
-    // 又涨回 320k：重新提醒一次。
+    // 又涨回 320k：重新压缩一次。
     tokens.ses_child = 320_000
     expect(await scanner.scan()).toBe(1)
-    expect(prompts.map((prompt) => prompt.sessionID)).toEqual(["ses_root", "ses_root"])
-    expect(prompts[1]!.text).toContain("约 320k tokens")
+    expect(compacts).toEqual(["ses_child", "ses_child"])
   })
 
-  test("声明文件被手动清掉后可再次提醒", async () => {
+  test("声明文件被手动清掉后可再次压缩", async () => {
     const options = { candidates: [child({ time: { busy: NOW - 500 } })], tokens: { ses_child: 350_000 } }
     const first = scannerHarness(options)
     expect(await first.scanner.scan()).toBe(1)
@@ -260,20 +267,26 @@ describe("createCtxWarningScanner", () => {
     expect(await first.scanner.scan()).toBe(1)
   })
 
-  test("发送失败只记日志、不抛出；声明保留，下一轮不重复轰炸", async () => {
-    const { scanner, prompts, logs } = scannerHarness({
+  test("压缩失败只记日志、不抛出；声明保留，下一轮不重复轰炸", async () => {
+    const { scanner, compacts, logs } = scannerHarness({
       candidates: [child({ time: { busy: NOW - 500 } })],
       tokens: { ses_child: 350_000 },
-      claim: claimContextWarning,
-      sendError: true,
+      claim: claimContextCompaction,
+      compactError: true,
     })
     expect(await scanner.scan()).toBe(0)
-    expect(prompts).toHaveLength(0)
+    expect(compacts).toHaveLength(0)
     expect(logs).toContainEqual(
-      expect.objectContaining({ event: "ctx-warn-failed", childSessionID: "ses_child", tokens: 350_000, root: "ses_root" }),
+      expect.objectContaining({
+        event: "ctx-compact-failed",
+        decision: "error",
+        childSessionID: "ses_child",
+        tokens: 350_000,
+        root: "ses_root",
+      }),
     )
     expect(await scanner.scan()).toBe(0)
-    expect(logs.filter((record) => record.event === "ctx-warn-failed")).toHaveLength(1)
+    expect(logs.filter((record) => record.event === "ctx-compact-failed")).toHaveLength(1)
   })
 })
 
@@ -289,6 +302,7 @@ describe("真实 setup 接线（假 ctx + 捕获定时器）", () => {
 
   function harness(sessions: FakeSession[], messages: Record<string, any[]>) {
     const prompts: Array<{ sessionID: string; text: string; delivery?: string }> = []
+    const compacts: Array<{ sessionID: string }> = []
     const events: any[] = []
     const ctx = {
       tool: { hook: async () => ({ dispose() {} }) },
@@ -316,6 +330,10 @@ describe("真实 setup 接线（假 ctx + 捕获定时器）", () => {
           prompts.push(input)
           return { id: `msg_${prompts.length}` }
         },
+        async compact(input: { sessionID: string }) {
+          compacts.push(input)
+          return { data: {} }
+        },
         async create() {
           return {}
         },
@@ -331,7 +349,7 @@ describe("真实 setup 接线（假 ctx + 捕获定时器）", () => {
         },
       },
     }
-    return { ctx, prompts }
+    return { ctx, prompts, compacts }
   }
 
   function readJsonl(file: string): any[] {
@@ -355,7 +373,27 @@ describe("真实 setup 接线（假 ctx + 捕获定时器）", () => {
     return check()
   }
 
-  test("扫描周期向 root 发提醒、内容正确且只发一次，并落 ctx-warn 日志", async () => {
+  function captureTimer() {
+    const realSet = globalThis.setInterval
+    const realClear = globalThis.clearInterval
+    let handler: (() => void) | undefined
+    globalThis.setInterval = ((fn: any) => {
+      handler = fn
+      return "probe-handle" as any
+    }) as any
+    globalThis.clearInterval = (() => {}) as any
+    return {
+      get handler() {
+        return handler
+      },
+      restore() {
+        globalThis.setInterval = realSet
+        globalThis.clearInterval = realClear
+      },
+    }
+  }
+
+  test("扫描周期直接调用原生 session.compact、不发 prompt，只压一次并落 ctx-compact 日志", async () => {
     const h = harness(
       [
         { id: "ses_root", title: "root" },
@@ -364,69 +402,50 @@ describe("真实 setup 接线（假 ctx + 捕获定时器）", () => {
       { ses_child: [assistant(350_000)] },
     )
 
-    const realSet = globalThis.setInterval
-    const realClear = globalThis.clearInterval
-    let handler: (() => void) | undefined
-    globalThis.setInterval = ((fn: any) => {
-      handler = fn
-      return "probe-handle" as any
-    }) as any
-    globalThis.clearInterval = (() => {}) as any
+    const timer = captureTimer()
     let dispose: any
     try {
       dispose = await (plugin as any).setup(h.ctx)
-      expect(handler).toBeDefined()
-      handler!()
-      expect(await waitFor(() => h.prompts.length > 0)).toBe(true)
-      expect(await waitFor(() => h.prompts.length === 1)).toBe(true)
+      expect(timer.handler).toBeDefined()
+      timer.handler!()
+      expect(await waitFor(() => h.compacts.length > 0)).toBe(true)
+      expect(await waitFor(() => h.compacts.length === 1)).toBe(true)
 
-      expect(h.prompts).toEqual([
-        {
-          sessionID: "ses_root",
-          text: ctxWarningText("修复登录", "ses_child", 350_000),
-          delivery: "steer",
-        },
-      ])
+      // 走原生 compact，参数只有 sessionID；全程不发任何 prompt。
+      expect(h.compacts).toEqual([{ sessionID: "ses_child" }])
+      expect(h.prompts).toHaveLength(0)
 
-      // 同一个 handler 再扫一轮：声明已落盘，不重复提醒。
-      handler!()
+      // 同一个 handler 再扫一轮：声明已落盘，不重复压缩。
+      timer.handler!()
       await new Promise((resolve) => setTimeout(resolve, 50))
-      expect(h.prompts).toHaveLength(1)
+      expect(h.compacts).toHaveLength(1)
 
       const hookLog = readJsonl(process.env.SUPERAGENT_HOOK_LOG!)
       expect(hookLog).toContainEqual(
-        expect.objectContaining({ event: "ctx-warn", childSessionID: "ses_child", tokens: 350_000, root: "ses_root" }),
+        expect.objectContaining({ event: "ctx-compact", childSessionID: "ses_child", tokens: 350_000, root: "ses_root" }),
       )
     } finally {
       await dispose?.()
-      globalThis.setInterval = realSet
-      globalThis.clearInterval = realClear
+      timer.restore()
     }
   })
 
-  test("子会话上下文未超阈值时不提醒", async () => {
+  test("子会话上下文未超阈值时既不 compact 也不 prompt", async () => {
     const h = harness(
       [{ id: "ses_root" }, { id: "ses_child", parentID: "ses_root", time: { busy: NOW - 500 } }],
       { ses_child: [assistant(299_000)] },
     )
-    const realSet = globalThis.setInterval
-    const realClear = globalThis.clearInterval
-    let handler: (() => void) | undefined
-    globalThis.setInterval = ((fn: any) => {
-      handler = fn
-      return "probe-handle" as any
-    }) as any
-    globalThis.clearInterval = (() => {}) as any
+    const timer = captureTimer()
     let dispose: any
     try {
       dispose = await (plugin as any).setup(h.ctx)
-      handler!()
+      timer.handler!()
       await new Promise((resolve) => setTimeout(resolve, 80))
+      expect(h.compacts).toHaveLength(0)
       expect(h.prompts).toHaveLength(0)
     } finally {
       await dispose?.()
-      globalThis.setInterval = realSet
-      globalThis.clearInterval = realClear
+      timer.restore()
     }
   })
 })

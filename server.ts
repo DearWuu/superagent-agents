@@ -35,15 +35,20 @@
  *  - 切换触发时把 root 的 `superagent.max-subagents` 降一档（5→4→3→2，下限 2），
  *    由常量 `QUOTA_TIER_DOWN` 控制；不自动恢复。
  *
- * 旗舰子代理：
+ * 旗舰子代理（只认显式委派）：
  *  - 新 root key `superagent.max-flagship-subagents`（默认 2，合法 0..20，非法回退 2，
- *    实际再受 `superagent.max-subagents` 总上限约束）；旗舰 = 与 root 同
- *    provider/model/variant，未知模型不按旗舰计。
- *  - 新建与 steer 前预测有效模型（`input.model ?? agent.model ?? parent.model`），
- *    存在数 + 在途数（含本次）分别计数；旗舰超限先淘汰最旧已完成旗舰，
+ *    实际再受 `superagent.max-subagents` 总上限约束）；旗舰 = Superagent 通过原生
+ *    subagent 工具在 `input.model` 里显式指定与 root 相同 provider/model/variant 的委派。
+ *  - 只有显式 `input.model` 与 root 同模型才按旗舰准入（新建与 steer 同一规则）；
+ *    缺省 input、agent.model、parent 继承、inherit/固定默认模型、UI/F2/手动
+ *    switchModel 都不创建旗舰身份、不占旗舰槽。旗舰超限先淘汰最旧已完成旗舰，
  *    运行中/steer/保护名单不删，无可淘汰则明确拒绝。
- *  - `session.created` / `session.model.selected` 在 child 自身写或清
- *    `metadata["superagent.flagship"] = { model, at }`；root 切模型不清洗旧 child 标记。
+ *  - 旗舰身份只认 child 自身 `metadata["superagent.flagship"] =
+ *    { model, at, source: "explicit-subagent-delegation" }`：
+ *    `tool:execute.after` 成功（status=completed）时按 `event.result.metadata.sessionID`
+ *    （或 steer 目标）写入标记，失败不写；`session.model.selected` 只在已有标记因
+ *    child 切走模型而失效时清理，不因切到 parent 同模型而新增；root 切模型不清洗旧
+ *    child 标记。无该 source 的旧标记一律按普通子代理处理。
  *
  * 保护子会话的模型硬约束：
  *  - 命中保护名单（`superagent.kept-subagents`）的子会话，steer 到它时模型也不可改：
@@ -69,16 +74,17 @@
  *  - 每个子会话只探一次（`probe-claims/` 落盘声明，跨插件实例同样只发一次）；
  *    critic 会话与 root 自身跳过。
  *
- * 超长上下文提醒（与面板 ctx 读数同口径）：
+ * 超长上下文自动压缩（与面板 ctx 读数同口径）：
  *  - 复用同一个 5 分钟扫描周期：对带 `superagent.*` 指令条目的 root 家族里的子会话，
  *    取其最近一次 assistant 调用的输入 token 数（input + cache 读写，跳过 compact 之前的旧记录）。
  *  - 阈值复用 `context-policy.ts`：有模型窗口时 `min(300K, floor(window * 0.8))`，
  *    否则 300K；窗口经 `session.model` + `ctx.model.list` 的 `limit.context` 读取并缓存，
- *    查询失败回退 300K。严格超过阈值才向 **root**（主会话）发 steer 提醒，
- *    建议 compact；不再需要上下文时才删除，不是发给子代理。
- *  - 每个子会话只提醒一次（`ctx-claims/` 落盘声明，记着上次提醒时的 token 数）；
- *    若当前长度较上次提醒下降 ≥30%（compact 过），清掉声明，允许再次提醒。
- *  - 该 root 的协作总开关关闭、critic 会话、root 自身、已结束的子会话都跳过；发送失败只记日志。
+ *    查询失败回退 300K。严格超过阈值就直接对该 **子会话** 调用原生 `ctx.session.compact`
+ *    （与手动点「压缩上下文」同一操作：保持当前模型、不发提示词；
+ *    compact 请求本身产生的压缩消息是预期行为）。
+ *  - 每个子会话只自动压缩一次（`ctx-claims/` 落盘声明，记着上次压缩时的 token 数）；
+ *    若当前长度较上次压缩下降 ≥30%（compact 已生效），清掉声明，允许再次压缩。
+ *  - 该 root 的协作总开关关闭、critic 会话、root 自身、已结束的子会话都跳过；压缩失败只记日志。
  */
 
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
@@ -99,8 +105,6 @@ import {
   normalizeFlagshipModel,
   pickFlagshipVictim,
   readMaxFlagshipSubagents,
-  resolveNewSubagentModel,
-  resolveSteerSubagentModel,
   sameFlagshipModel,
   withFlagshipMarker,
   withoutFlagshipMarker,
@@ -142,9 +146,9 @@ export const QUOTA_TIER_DOWN = true
 export const QUOTA_LIMIT_FLOOR = 2
 /** 僵尸子会话的判定阈值：开了工又没等到收尾，超过这么久就按僵死处理。 */
 export const STALE_AFTER_MS = 6 * 60 * 60 * 1000
-/** 上下文告警阈值：最近一次 assistant 调用的输入侧 token 数超过它才提醒（与面板同口径）。 */
+/** 上下文压缩阈值：最近一次 assistant 调用的输入侧 token 数超过它才自动压缩（与面板同口径）。 */
 export const CONTEXT_WARN_TOKENS = DEFAULT_CONTEXT_WARN_TOKENS
-/** 视为「compact 过」的下降比例：当前长度较上次提醒时下降 ≥30% 就清掉声明。 */
+/** 视为「compact 已生效」的下降比例：当前长度较上次自动压缩时下降 ≥30% 就清掉声明。 */
 export const CONTEXT_DROP_RATIO = 0.3
 /** 判定日志默认落盘位置。 */
 export const DEFAULT_LOG_FILE = path.join(homedir(), ".local", "state", "opencode", "superagent", "hook.log")
@@ -171,7 +175,7 @@ function criticClaimDir(): string {
 function probeClaimDir(): string {
   return path.join(stateRoot(), "probe-claims")
 }
-/** 上下文提醒声明目录：同一子会话只提醒一次，并记着上次提醒时的长度。 */
+/** 上下文压缩声明目录：同一子会话只自动压缩一次，并记着上次压缩时的长度。 */
 function ctxClaimDir(): string {
   return path.join(stateRoot(), "ctx-claims")
 }
@@ -308,13 +312,13 @@ export function claimProbe(sessionID: string | undefined, dir: string = probeCla
   return claimOnce(dir, sessionID)
 }
 
-/** 上下文提醒声明文件的路径；sessionID 里不允许出现路径分隔符。 */
+/** 上下文压缩声明文件的路径；sessionID 里不允许出现路径分隔符。 */
 export function contextClaimFile(sessionID: string, dir: string = ctxClaimDir()): string | undefined {
   const safe = (sessionID ?? "").replace(/[^A-Za-z0-9._-]/g, "")
   return safe ? path.join(dir, safe) : undefined
 }
 
-/** 读上次提醒时的上下文长度；没有声明或文件读不懂都返回 undefined。 */
+/** 读上次自动压缩时的上下文长度；没有声明或文件读不懂都返回 undefined。 */
 export function readContextClaim(sessionID: string, dir: string = ctxClaimDir()): number | undefined {
   const file = contextClaimFile(sessionID, dir)
   if (!file) return undefined
@@ -327,7 +331,7 @@ export function readContextClaim(sessionID: string, dir: string = ctxClaimDir())
   }
 }
 
-/** 清掉上下文提醒声明（compact 之后允许再次提醒）。 */
+/** 清掉上下文压缩声明（compact 生效、长度大幅下降后允许再次自动压缩）。 */
 export function clearContextClaim(sessionID: string, dir: string = ctxClaimDir()) {
   const file = contextClaimFile(sessionID, dir)
   if (!file) return
@@ -337,10 +341,10 @@ export function clearContextClaim(sessionID: string, dir: string = ctxClaimDir()
 }
 
 /**
- * 上下文提醒声明：`wx` 独占创建，先写成者独占；已有声明时只有
- * 「当前长度较上次提醒下降 ≥30%」才清掉重来，避免多实例重复提醒。
+ * 上下文压缩声明：`wx` 独占创建，先写成者独占；已有声明时只有
+ * 「当前长度较上次压缩下降 ≥30%」才清掉重来，避免多实例重复压缩。
  */
-export function claimContextWarning(
+export function claimContextCompaction(
   sessionID: string,
   tokens: number,
   dir: string = ctxClaimDir(),
@@ -572,7 +576,7 @@ export type ProbeCandidate = {
   idle?: number
   title?: string
   metadata?: Record<string, unknown>
-  /** 当前模型，用于按模型上下文窗口算提醒阈值。 */
+  /** 当前模型，用于按模型上下文窗口算压缩阈值。 */
   model?: unknown
 }
 
@@ -765,7 +769,7 @@ export function isContextOverLimit(
   return typeof tokens === "number" && Number.isFinite(tokens) && tokens > limit
 }
 
-/** 当前长度较上次提醒时是否下降 ≥30%（视为 compact 过）。 */
+/** 当前长度较上次自动压缩时是否下降 ≥30%（compact 已生效）。 */
 export function contextDropped(previous: number | undefined, current: number): boolean {
   return previous !== undefined && previous > 0 && previous - current >= previous * CONTEXT_DROP_RATIO
 }
@@ -784,20 +788,7 @@ export function shouldCheckContext(candidate: ProbeCandidate): boolean {
   return true
 }
 
-/** 发给 root 的提醒文案：优先 compact，只有不再需要上下文时才删除。 */
-export function ctxWarningText(
-  title: string | undefined,
-  sessionID: string,
-  tokens: number,
-  limit = CONTEXT_WARN_TOKENS,
-): string {
-  const label = typeof title === "string" && title.trim().length > 0 ? title.trim() : "未命名"
-  const k = Math.round(tokens / 1000)
-  const limitK = Math.round(limit / 1000)
-  return `[上下文提醒] 子代理「${label}」(${sessionID}) 当前上下文约 ${k}k tokens（>${limitK}k）。建议：需要保留上下文时对其执行 compact；不再需要上下文时才删除。`
-}
-
-export type CtxWarningScannerDeps = {
+export type CtxCompactionScannerDeps = {
   /** 列出全部会话（root 与各层子会话都在内）。 */
   listSessions: () => Promise<ProbeCandidate[]>
   /** 沿 parentID 上溯到 family root。 */
@@ -806,23 +797,23 @@ export type CtxWarningScannerDeps = {
   rootIsConfigured: (rootID: string) => Promise<boolean>
   /** 读该会话最近一次 assistant 调用的输入 token 数。 */
   readTokens: (sessionID: string) => Promise<number | undefined>
-  /** 按会话模型算提醒阈值；缺省 300K。读失败按默认值处理。 */
+  /** 按会话模型算压缩阈值；缺省 300K。读失败按默认值处理。 */
   readThreshold?: (candidate: ProbeCandidate) => Promise<number | undefined>
   /** 该 root 的协作总开关；缺省视为启用。 */
   rootIsEnabled?: (rootID: string) => Promise<boolean>
-  /** 向 root 发 steer 提醒。 */
-  sendWarn: (rootID: string, text: string) => Promise<void>
-  /** 跨实例去重：返回 false 表示已经提醒过（且未 compact）。 */
+  /** 对该子会话执行原生 compact（与手动点「压缩上下文」同一操作）。 */
+  compactSession: (childSessionID: string) => Promise<void>
+  /** 跨实例去重：返回 false 表示已经压缩过（且长度未下降 ≥30%）。 */
   claim?: (sessionID: string, tokens: number) => boolean
   log: (record: Record<string, unknown>) => void
   now?: () => number
 }
 
 /**
- * 超长上下文扫描器。每个子会话只提醒一次；长度下降 ≥30% 后清声明、允许再次提醒。
- * 失败一律只记日志：读不到长度或发不出提醒都不影响会话本身。
+ * 超长上下文自动压缩扫描器。每个子会话只压缩一次；长度下降 ≥30% 后清声明、允许再次压缩。
+ * 失败一律只记日志：读不到长度或压缩失败都不影响会话本身。
  */
-export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
+export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
   /** root → 是否带 superagent 配置；一个 root 只查一次。 */
   const configured = new Map<string, boolean>()
   return {
@@ -836,7 +827,7 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
       }
       /** root → 本轮是否启用；逐 root 判断，停用一个 root 不影响其他 root。 */
       const enabled = new Map<string, boolean>()
-      let sent = 0
+      let compacted = 0
       for (const candidate of candidates) {
         if (!shouldCheckContext(candidate)) continue
         let rootID: string | undefined
@@ -900,18 +891,18 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
 
         const claimed = readContextClaim(candidate.id)
         const dropped = contextDropped(claimed, tokens)
-        // compact 过：清掉声明，允许当前这轮重新提醒。
+        // compact 已生效：清掉声明，允许当前这轮重新压缩。
         if (dropped) clearContextClaim(candidate.id)
         if (!isContextOverLimit(tokens, threshold)) continue
         if (claimed !== undefined && !dropped) continue
 
-        const claim = deps.claim ?? claimContextWarning
+        const claim = deps.claim ?? claimContextCompaction
         if (!claim(candidate.id, tokens)) continue
         try {
-          await deps.sendWarn(rootID, ctxWarningText(candidate.title, candidate.id, tokens, threshold))
-          sent++
+          await deps.compactSession(candidate.id)
+          compacted++
           deps.log({
-            event: "ctx-warn",
+            event: "ctx-compact",
             decision: "allow",
             childSessionID: candidate.id,
             tokens,
@@ -919,18 +910,19 @@ export function createCtxWarningScanner(deps: CtxWarningScannerDeps) {
             root: rootID,
           })
         } catch (cause) {
-          // 先登记再发：发送失败也不在 5 分钟后重复轰炸同一个会话。
+          // 先声明再压缩：压缩失败也不在下一轮重复轰炸同一个会话。
           deps.log({
-            event: "ctx-warn-failed",
+            event: "ctx-compact-failed",
             decision: "error",
             childSessionID: candidate.id,
             tokens,
+            threshold,
             root: rootID,
             cause: errorText(cause),
           })
         }
       }
-      return sent
+      return compacted
     },
   }
 }
@@ -978,9 +970,9 @@ export function createModelContextWindowLookup(ctx: any, write: (record: Record<
 }
 
 /**
- * 从插件 ctx 建出超长上下文扫描器（真实接线）。抽出来让集成测试能用假的 ctx 驱动。
+ * 从插件 ctx 建出超长上下文自动压缩扫描器（真实接线）。抽出来让集成测试能用假的 ctx 驱动。
  */
-export function createCtxContextWarningScanner(
+export function createCtxContextCompactionScanner(
   ctx: any,
   options: {
     now?: () => number
@@ -991,7 +983,7 @@ export function createCtxContextWarningScanner(
 ) {
   const write = options.log ?? log
   const windowOf = createModelContextWindowLookup(ctx, write)
-  return createCtxWarningScanner({
+  return createCtxCompactionScanner({
     listSessions: async () => {
       const items = asArray(await ctx.session.list({ limit: options.limit ?? 200, order: "desc" }))
       return items
@@ -1031,10 +1023,10 @@ export function createCtxContextWarningScanner(
       if (window === undefined) return CONTEXT_WARN_TOKENS
       return contextWarnThreshold({ limit: { context: window } })
     },
-    sendWarn: async (rootID, text) => {
-      await ctx.session.prompt({ sessionID: rootID, text, delivery: "steer" })
+    compactSession: async (childSessionID) => {
+      await ctx.session.compact({ sessionID: childSessionID })
     },
-    claim: options.claim ?? claimContextWarning,
+    claim: options.claim ?? claimContextCompaction,
     rootIsEnabled: (rootID) => readRootCollabEnabled(ctx, rootID),
     log: write,
     now: options.now,
@@ -1204,30 +1196,9 @@ async function clearFlagshipSession(ctx: any, input: { sessionID: string; parent
 }
 
 /**
- * `session.created`：child 与 parent 当前模型一致时在 child 自身写旗舰标记；
- * 不一致时清掉可能继承来的旧标记。未知模型一律不判定（fail-open）。
- */
-export async function handleSessionCreated(ctx: any, event: any): Promise<void> {
-  const data = eventData(event)
-  const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
-  const parentID = typeof data.parentID === "string" ? data.parentID : undefined
-  if (!sessionID || !parentID) return
-  const title = typeof data.title === "string" ? data.title : undefined
-  const metadata = isObject(data.metadata) ? data.metadata : undefined
-  if (isCriticSession({ title, metadata })) return
-  const childModel = data.model ?? (await readSessionModel(ctx, sessionID))
-  const parentModel = await readSessionModel(ctx, parentID)
-  if (!normalizeFlagshipModel(childModel) || !normalizeFlagshipModel(parentModel)) return
-  if (sameFlagshipModel(childModel, parentModel)) {
-    await markFlagshipSession(ctx, { sessionID, parentID, model: childModel, metadata })
-  } else {
-    await clearFlagshipSession(ctx, { sessionID, parentID, reason: "created-model-mismatch" })
-  }
-}
-
-/**
- * `session.model.selected`：只处理有 parent 的 child。child 切到与当前 parent
- * 相同的模型就标记，切走就清掉自己的标记。root 切模型不遍历、不清洗旧 child 标记。
+ * `session.model.selected`：只处理有 parent 的 child。child 切走模型导致已有
+ * 旗舰标记失效时清掉标记；无标记一律不动——切到与 parent 相同的模型也不新增
+ * 旗舰身份（身份只来自显式委派成功后的标记）。root 切模型不遍历、不清洗旧 child 标记。
  */
 export async function handleSessionModelSelected(ctx: any, event: any): Promise<void> {
   const data = eventData(event)
@@ -1236,15 +1207,12 @@ export async function handleSessionModelSelected(ctx: any, event: any): Promise<
   const info = await ctx.session.get({ sessionID })
   if (!isObject(info) || typeof info.parentID !== "string" || !info.parentID) return
   if (isCriticSession(info)) return
-  const parent = await ctx.session.get({ sessionID: info.parentID })
-  const parentModel = isObject(parent) ? parent.model : undefined
+  const metadata = isObject(info.metadata) ? info.metadata : undefined
+  if (!hasFlagshipMarker(metadata)) return
   const model = data.model ?? info.model
-  if (!normalizeFlagshipModel(model) || !normalizeFlagshipModel(parentModel)) return
-  if (sameFlagshipModel(model, parentModel)) {
-    await markFlagshipSession(ctx, { sessionID, parentID: info.parentID, model })
-  } else {
-    await clearFlagshipSession(ctx, { sessionID, parentID: info.parentID, reason: "model-switched" })
-  }
+  // 标记只随 child 自身切走模型而失效；root 模型不参与判定。
+  if (isFlagshipSession({ model, metadata })) return
+  await clearFlagshipSession(ctx, { sessionID, parentID: info.parentID, reason: "model-switched" })
 }
 
 /** 沿 parentID 上溯到 family root（没有 parentID 即 root）。 */
@@ -1589,8 +1557,11 @@ export default {
     // 原生 Skills 是静态流程资产，注册与协作总开关无关；失败只记日志。
     const skillRegistration = await registerSuperagentSkills(ctx)
 
-    /** callID → 本次调用的登记信息；flagshipRoot 记本次占的旗舰槽。 */
-    const pending = new Map<string, { rootID?: string; steerTarget?: string; flagshipRoot?: string }>()
+    /** callID → 本次调用的登记信息；flagshipRoot/flagshipModel 记本次占的显式旗舰槽。 */
+    const pending = new Map<
+      string,
+      { rootID?: string; steerTarget?: string; flagshipRoot?: string; flagshipModel?: unknown }
+    >()
     /** root → 飞行中（子会话尚未创建）的 subagent 调用数。 */
     const flying = new Map<string, number>()
     /** root → 飞行中的旗舰 subagent 调用数（含本次调用自己的槽）。 */
@@ -1745,17 +1716,19 @@ export default {
         reserved = undefined
         reservedFlagship = undefined
       }
-      const reserveFlagship = (rootID: string) => {
+      const reserveFlagship = (rootID: string, model: unknown) => {
         bumpFlagship(rootID, 1)
         reservedFlagship = rootID
         const entry = pending.get(event.id)
-        if (entry) entry.flagshipRoot = rootID
-        else pending.set(event.id, { flagshipRoot: rootID })
+        if (entry) {
+          entry.flagshipRoot = rootID
+          entry.flagshipModel = model
+        } else pending.set(event.id, { flagshipRoot: rootID, flagshipModel: model })
       }
 
       try {
         if (steerTarget) {
-          // 续跑已有子会话：不占新的总槽。若把普通 child 切成旗舰，仍要占旗舰槽。
+          // 续跑已有子会话：不占新的总槽。显式 `input.model` 升级成旗舰才占旗舰槽。
           pending.set(event.id, { steerTarget })
           steered.add(steerTarget)
           let steerRoot: string | undefined
@@ -1805,13 +1778,10 @@ export default {
                 throw new DenyError(message)
               }
             }
-            const predicted = resolveSteerSubagentModel({
-              inputModel: explicitModel,
-              agentModel: agent?.model,
-              existingModel: targetModel,
-              switched,
-            })
-            targetFlagship = isFlagshipModel(predicted, rootModel)
+            // 旗舰准入只认显式 `input.model` 与 root 同模型：agent 切换或原模型
+            // 恰与 root 相同的普通续跑不占旗舰槽、不写旗舰身份。
+            const explicitRef = normalizeFlagshipModel(explicitModel)
+            targetFlagship = explicitRef ? isFlagshipModel(explicitRef, rootModel) : false
             alreadyFlagship = isObject(target)
               ? isFlagshipSession(
                   { model: target.model, metadata: isObject(target.metadata) ? target.metadata : undefined },
@@ -1819,8 +1789,8 @@ export default {
                 )
               : false
             if (targetFlagship && !alreadyFlagship) {
-              // 已旗舰的 steer 不重复计数；普通 child → 旗舰才占新旗舰槽。
-              reserveFlagship(steerRoot)
+              // 已旗舰的 steer 不重复计数；显式升级成旗舰才占新旗舰槽。
+              reserveFlagship(steerRoot, explicitRef)
               const found = await readLimit(ctx, event.sessionID, steerRoot)
               flagLimit = effectiveFlagshipLimit(readMaxFlagshipSubagents(found.entries), found.limit)
               let children = await listChildren(ctx, steerRoot, Date.now())
@@ -1980,18 +1950,13 @@ export default {
           limitSource = found.source
           configEntries = found.entries
           children = await listChildren(ctx, rootID, now)
-          // 预判本次新建是否会落到旗舰模型：input.model ?? agent.model ?? parent.model。
+          // 旗舰准入只认显式 `input.model` 与 root 同模型：缺省 input、agent 默认
+          // 模型、parent 继承都是普通子代理，不占旗舰槽、不写旗舰身份。
           rootModel = await readSessionModel(ctx, rootID)
-          const callerModel = await readSessionModel(ctx, event.sessionID)
-          const agent = await readAgentInfo(ctx, input?.agent)
-          const predicted = resolveNewSubagentModel({
-            inputModel: explicitModel,
-            agentModel: agent?.model,
-            parentModel: callerModel,
-          })
-          predictedFlagship = isFlagshipModel(predicted, rootModel)
+          const explicitRef = normalizeFlagshipModel(explicitModel)
+          predictedFlagship = explicitRef ? isFlagshipModel(explicitRef, rootModel) : false
           if (predictedFlagship) {
-            reserveFlagship(rootID)
+            reserveFlagship(rootID, explicitRef)
             flagLimit = effectiveFlagshipLimit(readMaxFlagshipSubagents(configEntries), limit)
           }
         } catch (cause) {
@@ -2258,11 +2223,20 @@ export default {
       }
     })
 
+    /** 原生 subagent 成功输出的子会话 ID：优先 `result.metadata.sessionID`。 */
+    const resultSessionID = (event: any): string | undefined => {
+      if (event?.status !== "completed" || !isObject(event.result)) return undefined
+      const metadata = isObject(event.result.metadata) ? event.result.metadata : {}
+      if (typeof metadata.sessionID === "string" && metadata.sessionID) return metadata.sessionID
+      if (typeof event.result.sessionID === "string" && event.result.sessionID) return event.result.sessionID
+      return undefined
+    }
+
     const after = await ctx.tool.hook("execute.after", async (event: any) => {
-      // 停用时 before 从未登记，这里只需清理可能残留的登记（纯内部簿记，无外部副作用）。
       if (event?.tool !== TOOL_NAME) return
+      let entry: { rootID?: string; steerTarget?: string; flagshipRoot?: string; flagshipModel?: unknown } | undefined
       try {
-        const entry = pending.get(event.id)
+        entry = pending.get(event.id)
         if (!entry) return
         pending.delete(event.id)
         if (entry.rootID) bump(entry.rootID, -1)
@@ -2270,6 +2244,46 @@ export default {
         if (entry.steerTarget) steered.delete(entry.steerTarget)
       } catch {
         // after 钩子抛错会波及工具体本身，这里绝不能抛。
+        return
+      }
+      // 显式旗舰委派成功后才写标记：只有 status=completed 才算成功（steer 失败也
+      // 不写）。新建从 result.metadata.sessionID 取 child，steer 落到目标会话。
+      if (!entry.flagshipModel) return
+      if (event?.status !== "completed") {
+        log({
+          event: "flagship-mark-skip",
+          decision: "allow",
+          root: entry.flagshipRoot ?? null,
+          callID: event.id,
+          note: "status!=completed，不写旗舰标记",
+        })
+        return
+      }
+      const childSessionID = resultSessionID(event) ?? entry.steerTarget
+      if (!childSessionID) {
+        log({
+          event: "flagship-mark-skip",
+          decision: "allow",
+          root: entry.flagshipRoot ?? null,
+          callID: event.id,
+          note: "无 result.metadata.sessionID，不写旗舰标记",
+        })
+        return
+      }
+      try {
+        await markFlagshipSession(ctx, {
+          sessionID: childSessionID,
+          parentID: entry.flagshipRoot,
+          model: entry.flagshipModel,
+        })
+      } catch (cause) {
+        log({
+          event: "flagship-mark-failed",
+          decision: "error",
+          root: entry.flagshipRoot ?? null,
+          childSessionID,
+          cause: errorText(cause),
+        })
       }
     })
 
@@ -2325,13 +2339,12 @@ export default {
     const resetSubscription = (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.step.ended", "session.execution.succeeded", "session.created", "session.model.selected"],
+          types: ["session.step.ended", "session.execution.succeeded", "session.model.selected"],
           signal: resetAbort.signal,
         })) {
-          if (event?.type === "session.created" || event?.type === "session.model.selected") {
+          if (event?.type === "session.model.selected") {
             try {
-              if (event.type === "session.created") await handleSessionCreated(ctx, event)
-              else await handleSessionModelSelected(ctx, event)
+              await handleSessionModelSelected(ctx, event)
             } catch (cause) {
               log({
                 event: "flagship-marker-failed",
@@ -2359,8 +2372,8 @@ export default {
 
     // 超时状态探针：只探带 superagent 配置且当前 root 启用协作的家族里的子会话。
     const probeScanner = createCtxProbeScanner(ctx)
-    // 超长上下文提醒：同一个 5 分钟周期内逐 root 判断开关。
-    const ctxScanner = createCtxContextWarningScanner(ctx)
+    // 超长上下文自动压缩：同一个 5 分钟周期内逐 root 判断开关。
+    const ctxScanner = createCtxContextCompactionScanner(ctx)
     const probeTimer = startProbeTimer(async () => {
       await Promise.allSettled([probeScanner.scan(), ctxScanner.scan()])
     })

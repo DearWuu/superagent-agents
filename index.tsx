@@ -43,10 +43,7 @@ import {
   DEFAULT_MAX_FLAGSHIP_SUBAGENTS,
   countFlagshipSubagents,
   effectiveFlagshipLimit,
-  flagshipChangeAllowed,
-  isFlagshipModel,
   isFlagshipSession,
-  normalizeFlagshipModel,
 } from "./flagship"
 import { DEFAULT_CONTEXT_WARN_TOKENS, contextWarnThreshold } from "./context-policy"
 
@@ -1481,7 +1478,7 @@ export function SidebarAgents(props: {
     return value
   })
 
-  /** A valid marker counts only while the child still runs the marked model; unmarked sessions fall back to the root model. */
+  /** Flagship identity is the explicit-delegation marker only; model equality with the root never counts. */
   const rootModel = createMemo(() => tree()?.model?.actual)
   const flagshipLimit = createMemo(() => effectiveFlagshipLimit(policy().maxFlagshipSubagents, subagentLimit()))
   const flagshipCount = createMemo(() =>
@@ -1496,10 +1493,9 @@ export function SidebarAgents(props: {
             ]
           : [],
       ),
-      rootModel(),
     ),
   )
-  /** 旗舰数量只用于准入与淘汰，面板不展示。 */
+  /** 旗舰数量只用于淘汰，面板不展示。 */
 
   /**
    * 默认模型批量同步：fixed 变更与 inherit 跟随都把当前 root 下未保护子代理
@@ -1516,8 +1512,8 @@ export function SidebarAgents(props: {
     if (!current) return
     const scoped = root()
     const rootModelRef = rootModel()
-    // The tree must be known before a batch runs: the flagship pre-check needs
-    // the root model to tell whether the target model is a flagship model.
+    // The tree must be known before a batch runs: the inherit target resolves
+    // from the root's current model.
     if (!rootModelRef) return
     const target =
       scoped.defaultPolicy === "fixed"
@@ -1587,31 +1583,8 @@ export function SidebarAgents(props: {
       )
       if (targets.length === 0) return
       const label = names().get(modelKey(target)) ?? target.id
-      // Only a target on the root's provider/model adds flagships; the pre-check
-      // counts the flagships that stay (protected or auto) plus every target
-      // and refuses the whole batch when the result would exceed the cap. The
-      // variant is ignored here so a variant change cannot bypass the guard.
-      const rootRef = rootModel()
-      const targetIsFlagship = Boolean(
-        rootRef && target.providerID === rootRef.providerID && target.id === rootRef.id,
-      )
-      if (targetIsFlagship) {
-        const targetIDs = new Set(targets.map((item) => item.id))
-        const stayingFlagships = sessions().filter(
-          (item) =>
-            item.id !== rootID &&
-            family.has(item.id) &&
-            !targetIDs.has(item.id) &&
-            isFlagshipSession({ model: item.model, metadata: item.metadata }, rootModel()),
-        ).length
-        const after = targets.length + stayingFlagships
-        if (after > flagshipLimit()) {
-          props.context.ui.toast.show({
-            message: `切换默认模型后旗舰数将为 ${after}，超过上限 ${flagshipLimit()}（本次目标 ${targets.length} + 保持旗舰 ${stayingFlagships}）；整次未执行，请先调大旗舰上限或减少子代理。`,
-          })
-          return
-        }
-      }
+      // 默认模型批量同步不是显式旗舰委派：目标与 root 同模型也不做旗舰预检、
+      // 不占旗舰名额（旗舰身份只认显式委派的 marker）。
       let switched = 0
       const failures: string[] = []
       for (const item of targets) {
@@ -2065,25 +2038,8 @@ export function SidebarAgents(props: {
       return
     }
     if (selected.kind === "inherit") {
-      const target = normalizeFlagshipModel(rootModel())
-      const already = Boolean(node.sessionID && isFlagshipSession({
-        model: node.model?.actual,
-        metadata: props.context.data.session.get(node.sessionID)?.metadata,
-      }, rootModel()))
-      if (
-        target &&
-        !flagshipChangeAllowed({
-          current: flagshipCount(),
-          limit: flagshipLimit(),
-          alreadyFlagship: already,
-          targetFlagship: true,
-        })
-      ) {
-        props.context.ui.toast.show({
-          message: `旗舰子代理已达上限 ${flagshipLimit()}，不能把 ${node.title} 切到旗舰模型。`,
-        })
-        return
-      }
+      // inherit/fixed/手动选模型都不是显式旗舰委派：不做旗舰上限预检，
+      // 同模型普通子代理不进入旗舰 cap。
       await updateRoot((draft) => {
         draft.policies = { ...draft.policies, [node.sessionID!]: "inherit" }
       })
@@ -2106,31 +2062,6 @@ export function SidebarAgents(props: {
       providerID: picked.providerID,
       id: picked.id,
       ...(picked.variant ? { variant: picked.variant } : {}),
-    }
-    const targetFlagship = isFlagshipModel(modelRef, rootModel())
-    const alreadyFlagship = Boolean(
-      node.sessionID &&
-        isFlagshipSession(
-          {
-            model: node.model?.actual,
-            metadata: props.context.data.session.get(node.sessionID)?.metadata,
-          },
-          rootModel(),
-        ),
-    )
-    if (
-      targetFlagship &&
-      !flagshipChangeAllowed({
-        current: flagshipCount(),
-        limit: flagshipLimit(),
-        alreadyFlagship,
-        targetFlagship,
-      })
-    ) {
-      props.context.ui.toast.show({
-        message: `旗舰子代理已达上限 ${flagshipLimit()}，不能把 ${node.title} 切到旗舰模型。`,
-      })
-      return
     }
     const oversight = oversightFor(node.sessionID!)
     await updateRoot((draft) => {
@@ -2568,7 +2499,7 @@ export function SidebarAgents(props: {
   async function compactSubagent(node: AgentNode) {
     if (!node.sessionID) return
     await props.context.client.session.compact({ sessionID: node.sessionID })
-    props.context.ui.toast.show({ message: `已请求压缩 ${node.title} 的上下文。` })
+    props.context.ui.toast.show({ message: `已发起 ${node.title} 的原生上下文压缩。` })
   }
 
   /** Protects a Subagent from automatic eviction and from model changes. */
@@ -2657,17 +2588,15 @@ export function SidebarAgents(props: {
         await removeEvictionVictims(victims, { limit, label: "超出上限" })
       } while (pruneAgain)
 
-      // The flagship cap is a second, narrower limit. Only the oldest finished
-      // flagships are candidates; total-cap eviction has already run first.
+      // The flagship cap is a second, narrower limit over explicit-delegation
+      // markers only. The oldest finished flagships are candidates; total-cap
+      // eviction has already run first.
       const limit = flagshipLimit()
       const effectiveModels = new Map(
         (tree()?.children ?? []).flatMap((node) => (node.sessionID ? [[node.sessionID, node.model?.actual] as const] : [])),
       )
       const flagships = directSubagents().filter((item) =>
-        isFlagshipSession(
-          { model: effectiveModels.get(item.id) ?? item.model, metadata: item.metadata },
-          rootModel(),
-        ),
+        isFlagshipSession({ model: effectiveModels.get(item.id) ?? item.model, metadata: item.metadata }),
       )
       const plan = planEviction({
         children: flagships.map(evictionChild),
@@ -2712,7 +2641,7 @@ export function SidebarAgents(props: {
       options: [
         { value: { kind: "model" }, title: "修改模型", description: "修改这个子代理的模型策略" },
         { value: { kind: "open" }, title: "打开子会话", description: "切换到该子代理会话" },
-        { value: { kind: "compact" }, title: "压缩上下文", description: "请求压缩该子代理的上下文" },
+        { value: { kind: "compact" }, title: "压缩上下文", description: "对该子代理发起原生上下文压缩" },
         {
           value: { kind: "keep" },
           title: kept ? "取消保护" : "保护此子代理",

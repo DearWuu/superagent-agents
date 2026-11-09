@@ -345,6 +345,7 @@ test("the flagship cap evicts only the oldest finished flagship", async () => {
         title: "旧旗舰",
         agent: "executor",
         model: rootModel,
+        metadata: { "superagent.flagship": { model: rootModel, at: 1, source: "explicit-subagent-delegation" } },
         outcome: "succeeded",
         time: { created: 2, updated: 200 },
       },
@@ -354,6 +355,7 @@ test("the flagship cap evicts only the oldest finished flagship", async () => {
         title: "新旗舰",
         agent: "executor",
         model: rootModel,
+        metadata: { "superagent.flagship": { model: rootModel, at: 1, source: "explicit-subagent-delegation" } },
         outcome: "succeeded",
         time: { created: 3, updated: 300 },
       },
@@ -363,6 +365,7 @@ test("the flagship cap evicts only the oldest finished flagship", async () => {
         title: "运行中旗舰",
         agent: "executor",
         model: rootModel,
+        metadata: { "superagent.flagship": { model: rootModel, at: 1, source: "explicit-subagent-delegation" } },
         time: { created: 4, updated: 400, busy: 400 },
       },
       {
@@ -386,6 +389,52 @@ test("the flagship cap evicts only the oldest finished flagship", async () => {
     expect(h.context.data.session.get("f2")).toBeDefined()
     expect(h.context.data.session.get("f3")).toBeDefined()
     expect(h.context.data.session.get("plain")).toBeDefined()
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("unmarked same-model subagents are never evicted by the flagship cap", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      {
+        id: "u1",
+        parentID: "root",
+        title: "同款一",
+        agent: "executor",
+        model: rootModel,
+        outcome: "succeeded",
+        time: { created: 2, updated: 200 },
+      },
+      {
+        id: "u2",
+        parentID: "root",
+        title: "同款二",
+        agent: "executor",
+        model: rootModel,
+        outcome: "succeeded",
+        time: { created: 3, updated: 300 },
+      },
+      {
+        id: "u3",
+        parentID: "root",
+        title: "同款三",
+        agent: "executor",
+        model: rootModel,
+        outcome: "succeeded",
+        time: { created: 4, updated: 400 },
+      },
+    ],
+    instructions: { "superagent.max-flagship-subagents": 1 },
+    maxSubagents: 10,
+  })
+  try {
+    await h.app.flush()
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(h.context.data.session.get("u1")).toBeDefined()
+    expect(h.context.data.session.get("u2")).toBeDefined()
+    expect(h.context.data.session.get("u3")).toBeDefined()
   } finally {
     h.app.renderer.destroy()
   }

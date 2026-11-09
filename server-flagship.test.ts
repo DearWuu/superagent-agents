@@ -1,7 +1,7 @@
 /**
- * 旗舰硬上限的真实接线：用假 ctx 驱动真实 `setup()` 的 `execute.before`
- * 与事件订阅，覆盖默认/0/非法上限、模型继承、variant、总上限共同约束、
- * 在途并发、steer 切换、持久标记与淘汰保护。
+ * 旗舰硬上限的真实接线：用假 ctx 驱动真实 `setup()` 的 `execute.before`/`execute.after`
+ * 与事件订阅，覆盖默认/0/非法上限、显式模型判定、总上限共同约束、在途并发、
+ * steer 切换、显式标记写入/清理与淘汰保护。
  */
 import { afterEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
@@ -9,7 +9,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 
 import plugin from "./server"
-import { FLAGSHIP_METADATA_KEY, MAX_FLAGSHIP_SUBAGENTS_KEY } from "./flagship-admission"
+import { FLAGSHIP_MARKER_SOURCE, FLAGSHIP_METADATA_KEY, MAX_FLAGSHIP_SUBAGENTS_KEY } from "./flagship-admission"
 
 const NOW = 1_800_000_000_000
 const ROOT_MODEL = { providerID: "acme", id: "flagship", variant: "high" }
@@ -223,12 +223,19 @@ function baseSessions(children: FakeSession[] = []): FakeSession[] {
   return [{ id: "ses_root", title: "root", agent: "superagent", model: ROOT_MODEL }, ...children]
 }
 
+/** 显式旗舰委派成功后写在 child 自身 metadata 的标记（带显式来源）。 */
+const flagshipMarker = { [FLAGSHIP_METADATA_KEY]: { model: ROOT_MODEL, at: 1, source: FLAGSHIP_MARKER_SOURCE } }
+
+/** 旧版本按模型相等自动写入的 `{ model, at }` 标记：无来源，不证明显式委派。 */
+const legacyAutoMarker = { [FLAGSHIP_METADATA_KEY]: { model: ROOT_MODEL, at: 1 } }
+
 function finishedFlagship(id: string, created: number): FakeSession {
   return {
     id,
     parentID: "ses_root",
     agent: "worker",
     model: ROOT_MODEL,
+    metadata: structuredClone(flagshipMarker),
     outcome: "succeeded",
     time: { created },
   }
@@ -240,8 +247,21 @@ function runningFlagship(id: string, created = NOW - 1000): FakeSession {
     parentID: "ses_root",
     agent: "worker",
     model: ROOT_MODEL,
+    metadata: structuredClone(flagshipMarker),
     outcome: null,
     time: { created, busy: created },
+  }
+}
+
+/** 与 root 同模型但无标记的普通子代理：不占旗舰名额。 */
+function plainSameModel(id: string, created: number, running = false): FakeSession {
+  return {
+    id,
+    parentID: "ses_root",
+    agent: "worker",
+    model: ROOT_MODEL,
+    outcome: running ? null : "succeeded",
+    time: running ? { created, busy: created } : { created },
   }
 }
 
@@ -303,19 +323,60 @@ describe("旗舰上限默认与配置", () => {
     h.events.close()
   })
 
-  test("0 禁止新旗舰，但普通子代理仍可创建", async () => {
+  test("0 禁止显式旗舰；继承/agent 默认/root 同模型的普通子代理不受限", async () => {
     tempState()
     const h = await setup({
       sessions: baseSessions(),
       entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 0 }]) },
     })
+    // 显式 input.model = root 同款：拒绝。
     const error = await denied(h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" })))
     expect(String(error.message)).toContain("旗舰子代理上限已满")
-    // 继承 root 模型同样算旗舰
-    const inherited = await denied(h.hooks["tool:execute.before"](call("c2")))
-    expect(String(inherited.message)).toContain("旗舰子代理上限已满")
-    await h.hooks["tool:execute.before"](call("c3", { model: "acme/flash" }))
-    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c3" })
+    // 无 input 继承 root 模型：普通子代理，放行。
+    await h.hooks["tool:execute.before"](call("c2"))
+    // agent.model = root 同款但无显式 input：普通子代理，放行。
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c2" })
+    const agentH = await setup({
+      sessions: baseSessions(),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 0 }]) },
+      agents: { worker: { id: "worker", name: "worker", model: ROOT_MODEL } },
+    })
+    await agentH.hooks["tool:execute.before"](call("c3"))
+    await agentH.hooks["tool:execute.after"]({ tool: "subagent", id: "c3" })
+    // 普通显式 Flash：放行。
+    await h.hooks["tool:execute.before"](call("c4", { model: "acme/flash" }))
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c4" })
+    await h.dispose()
+    await agentH.dispose()
+    h.events.close()
+    agentH.events.close()
+  })
+
+  test("root 从 Flash 切到旗舰后，无标记的同模型普通子代理不计数、不淘汰", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        plainSameModel("ses_p1", 10),
+        plainSameModel("ses_p2", 20),
+        plainSameModel("ses_p3", 30),
+      ]),
+      entries: { ses_root: rootEntries() },
+    })
+    // 显式旗舰新建：无标记普通子代理不占旗舰名额（exist=0 < limit=2），无需淘汰。
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
+    expect(h.removed).toEqual([])
+    const row = hookLog().find((record) => record.event === "subagent-allowed")
+    expect(row.flagship).toBe(true)
+    expect(row.flagshipExist).toBe(0)
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_new", status: "completed" } },
+    })
+    // 成功的显式旗舰才写标记；普通子代理仍无标记。
+    const marked = hookLog().filter((record) => record.event === "flagship-marked")
+    expect(marked.map((record) => record.sessionID)).toEqual(["ses_new"])
     await h.dispose()
     h.events.close()
   })
@@ -335,15 +396,15 @@ describe("旗舰上限默认与配置", () => {
   })
 })
 
-describe("旗舰模型判定", () => {
+describe("旗舰模型判定（只认显式 input.model）", () => {
   const cases: Array<{ name: string; input: Record<string, unknown>; agents?: HarnessOptions["agents"]; flagship: boolean }> = [
     { name: "显式同款模型", input: { model: "acme/flagship#high" }, flagship: true },
-    { name: "未指定时继承 parent 模型", input: {}, flagship: true },
+    { name: "未指定时继承 parent 模型不算旗舰", input: {}, flagship: false },
     {
-      name: "agent 配置的同款模型",
+      name: "agent 配置的同款模型但无显式 input 不算旗舰",
       input: {},
       agents: { worker: { id: "worker", name: "worker", model: ROOT_MODEL } },
-      flagship: true,
+      flagship: false,
     },
     { name: "variant 不同不算旗舰", input: { model: "acme/flagship#low" }, flagship: false },
     { name: "缺 variant 不算旗舰", input: { model: "acme/flagship" }, flagship: false },
@@ -462,6 +523,7 @@ describe("steer 切换旗舰", () => {
           parentID: "ses_root",
           agent: "worker",
           model: ROOT_MODEL,
+          metadata: structuredClone(flagshipMarker),
           outcome: "succeeded",
           time: { created: 1 },
         },
@@ -473,6 +535,41 @@ describe("steer 切换旗舰", () => {
     const row = hookLog().find((record) => record.event === "subagent-steer")
     expect(row.alreadyFlagship).toBe(true)
     expect(row.flagshipInflight).toBeNull()
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer1" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("无显式 model 的普通续跑不占旗舰槽（limit 0 也放行）", async () => {
+    tempState()
+    const h = await steerHarness(0)
+    await h.hooks["tool:execute.before"](call("steer1", { sessionID: "ses_child" }))
+    const row = hookLog().find((record) => record.event === "subagent-steer")
+    expect(row.flagship).toBe(false)
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer1" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("agent 切换带来同模型也不占旗舰槽", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          agent: "worker",
+          model: ROOT_MODEL,
+          outcome: "succeeded",
+          time: { created: 1 },
+        },
+      ]),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 0 }]) },
+      agents: { researcher: { id: "researcher", name: "researcher", model: ROOT_MODEL } },
+    })
+    await h.hooks["tool:execute.before"](call("steer1", { sessionID: "ses_child", agent: "researcher" }))
+    const row = hookLog().find((record) => record.event === "subagent-steer")
+    expect(row.flagship).toBe(false)
     await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer1" })
     await h.dispose()
     h.events.close()
@@ -490,7 +587,7 @@ describe("steer 切换旗舰", () => {
 })
 
 describe("持久旗舰标记", () => {
-  test("session.created 比较 child 与 parent 并合并旧 metadata", async () => {
+  test("session.created 不再写旗舰标记（同模型普通创建不是旗舰）", async () => {
     tempState()
     const h = await setup({ sessions: baseSessions([{ id: "ses_child", parentID: "ses_root" }]) })
     h.events.push({
@@ -500,18 +597,16 @@ describe("持久旗舰标记", () => {
         sessionID: "ses_child",
         parentID: "ses_root",
         model: ROOT_MODEL,
-        metadata: { keep: 1, "superagent.critic": false },
+        metadata: { keep: 1 },
       },
     })
-    expect(await waitFor(() => h.updates.length > 0)).toBe(true)
-    expect(h.updates[0].sessionID).toBe("ses_child")
-    expect(h.updates[0].metadata).toMatchObject({ keep: 1, "superagent.critic": false })
-    expect(h.updates[0].metadata?.[FLAGSHIP_METADATA_KEY]).toMatchObject({ model: ROOT_MODEL })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(h.updates).toHaveLength(0)
     await h.dispose()
     h.events.close()
   })
 
-  test("child 切到 Flash 清标记；root 切模型不清洗旧 child 标记", async () => {
+  test("child 切走模型清标记；root 切模型不清洗旧 child 标记", async () => {
     tempState()
     const h = await setup({
       sessions: baseSessions([
@@ -519,7 +614,7 @@ describe("持久旗舰标记", () => {
           id: "ses_child",
           parentID: "ses_root",
           model: ROOT_MODEL,
-          metadata: { keep: 1, [FLAGSHIP_METADATA_KEY]: { model: ROOT_MODEL, at: 1 } },
+          metadata: { keep: 1, ...structuredClone(flagshipMarker) },
         },
       ]),
     })
@@ -543,7 +638,7 @@ describe("持久旗舰标记", () => {
     h.events.close()
   })
 
-  test("child 切回与 parent 相同模型时重新标记", async () => {
+  test("无标记的 child 切到与 parent 相同模型不新增标记", async () => {
     tempState()
     const h = await setup({
       sessions: baseSessions([{ id: "ses_child", parentID: "ses_root", model: FLASH_MODEL, metadata: { keep: 1 } }]),
@@ -553,13 +648,36 @@ describe("持久旗舰标记", () => {
       type: "session.model.selected",
       data: { sessionID: "ses_child", model: ROOT_MODEL, previous: FLASH_MODEL },
     })
-    expect(await waitFor(() => h.updates.length > 0)).toBe(true)
-    expect(h.updates[0].metadata?.[FLAGSHIP_METADATA_KEY]).toMatchObject({ model: ROOT_MODEL })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(h.updates).toHaveLength(0)
     await h.dispose()
     h.events.close()
   })
 
-  test("critic 会话不写旗舰标记", async () => {
+  test("有标记的 child 保持在标记模型上不清理", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          model: ROOT_MODEL,
+          metadata: structuredClone(flagshipMarker),
+        },
+      ]),
+    })
+    h.events.push({
+      id: "evt_5",
+      type: "session.model.selected",
+      data: { sessionID: "ses_child", model: ROOT_MODEL },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(h.updates).toHaveLength(0)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("critic 会话不清理标记", async () => {
     tempState()
     const h = await setup({
       sessions: baseSessions([
@@ -567,16 +685,180 @@ describe("持久旗舰标记", () => {
           id: "ses_critic",
           parentID: "ses_root",
           title: "Critic: 复核 x",
-          metadata: { "superagent.critic": true },
+          model: ROOT_MODEL,
+          metadata: { "superagent.critic": true, ...structuredClone(flagshipMarker) },
         },
       ]),
     })
     h.events.push({
-      id: "evt_5",
-      type: "session.created",
-      data: { sessionID: "ses_critic", parentID: "ses_root", model: ROOT_MODEL, metadata: { "superagent.critic": true } },
+      id: "evt_6",
+      type: "session.model.selected",
+      data: { sessionID: "ses_critic", model: FLASH_MODEL },
     })
     await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(h.updates).toHaveLength(0)
+    await h.dispose()
+    h.events.close()
+  })
+})
+
+describe("显式旗舰标记（tool:execute.after）", () => {
+  test("显式旗舰创建成功后按 result.metadata.sessionID 写标记", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_new", status: "completed" } },
+    })
+    const update = h.updates.find((item) => item.sessionID === "ses_new")
+    expect(update?.metadata?.[FLAGSHIP_METADATA_KEY]).toMatchObject({
+      model: ROOT_MODEL,
+      source: FLAGSHIP_MARKER_SOURCE,
+    })
+    expect(hookLog().some((record) => record.event === "flagship-marked" && record.sessionID === "ses_new")).toBe(true)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("after 无 result（旧形态）不写标记、不抛错，槽位照常归还", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c1" })
+    expect(h.updates).toHaveLength(0)
+    expect(hookLog().some((record) => record.event === "flagship-mark-skip")).toBe(true)
+    // 槽位已还：下一个显式旗舰仍可放行。
+    await h.hooks["tool:execute.before"](call("c2", { model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c2" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("工具失败（status=error）不写标记", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "error",
+      error: { message: "boom" },
+    })
+    expect(h.updates).toHaveLength(0)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("后台运行（status=running）的显式旗舰同样写标记", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_bg", status: "running" } },
+    })
+    expect(h.updates.some((item) => item.sessionID === "ses_bg")).toBe(true)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("显式旗舰 steer 成功后给目标会话写标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          agent: "worker",
+          model: FLASH_MODEL,
+          outcome: "succeeded",
+          time: { created: 1 },
+        },
+      ]),
+      entries: { ses_root: rootEntries() },
+    })
+    await h.hooks["tool:execute.before"](call("steer1", { sessionID: "ses_child", model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "steer1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_child", status: "completed" } },
+    })
+    const update = h.updates.find((item) => item.sessionID === "ses_child")
+    expect(update?.metadata?.[FLAGSHIP_METADATA_KEY]).toMatchObject({
+      model: ROOT_MODEL,
+      source: FLAGSHIP_MARKER_SOURCE,
+    })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("显式旗舰 steer 失败（status=error）不写标记，槽位照常归还", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          agent: "worker",
+          model: FLASH_MODEL,
+          outcome: "succeeded",
+          time: { created: 1 },
+        },
+      ]),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 1 }]) },
+    })
+    await h.hooks["tool:execute.before"](call("steer1", { sessionID: "ses_child", model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "steer1",
+      status: "error",
+      error: { message: "subagent failed" },
+    })
+    expect(h.updates).toHaveLength(0)
+    expect(hookLog().some((record) => record.event === "flagship-marked")).toBe(false)
+    expect(hookLog().some((record) => record.event === "flagship-mark-skip")).toBe(true)
+    // 槽位已归还：下一个显式旗舰 steer 不会被拒绝。
+    await h.hooks["tool:execute.before"](call("steer2", { sessionID: "ses_child", model: "acme/flagship#high" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "steer2",
+      status: "error",
+      error: { message: "subagent failed" },
+    })
+    expect(hookLog().some((record) => record.event === "subagent-denied")).toBe(false)
+    expect(h.updates).toHaveLength(0)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("普通 steer（无显式 model）成功后不写标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          agent: "worker",
+          model: ROOT_MODEL,
+          outcome: "succeeded",
+          time: { created: 1 },
+        },
+      ]),
+      entries: { ses_root: rootEntries() },
+    })
+    await h.hooks["tool:execute.before"](call("steer1", { sessionID: "ses_child" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "steer1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_child", status: "completed" } },
+    })
     expect(h.updates).toHaveLength(0)
     await h.dispose()
     h.events.close()
@@ -649,7 +931,7 @@ describe("槽位归还与淘汰保护", () => {
     running.events.close()
   })
 
-  test("listChildren 保留 model 与 metadata，仅当前模型一致的标记计入旗舰", async () => {
+  test("listChildren 保留 model 与 metadata，仅带来源且当前模型一致的标记计入旗舰", async () => {
     tempState()
     const stale = await setup({
       sessions: baseSessions([
@@ -657,7 +939,7 @@ describe("槽位归还与淘汰保护", () => {
           id: "ses_marked",
           parentID: "ses_root",
           model: FLASH_MODEL,
-          metadata: { [FLAGSHIP_METADATA_KEY]: { model: ROOT_MODEL, at: 1 } },
+          metadata: structuredClone(flagshipMarker),
           outcome: "succeeded",
           time: { created: 1 },
         },
@@ -683,7 +965,7 @@ describe("槽位归还与淘汰保护", () => {
           id: "ses_marked",
           parentID: "ses_root",
           model: ROOT_MODEL,
-          metadata: { [FLAGSHIP_METADATA_KEY]: { model: ROOT_MODEL, at: 1 } },
+          metadata: structuredClone(flagshipMarker),
           outcome: "succeeded",
           time: { created: 1 },
         },
@@ -696,5 +978,55 @@ describe("槽位归还与淘汰保护", () => {
     await marked.hooks["tool:execute.after"]({ tool: "subagent", id: "c2" })
     await marked.dispose()
     marked.events.close()
+  })
+
+  test("无来源的旧自动标记不计数：limit=0 拒绝时也不删、F2 场景不触发旗舰淘汰", async () => {
+    tempState()
+    const legacyChildren = () => [
+      {
+        id: "ses_l1",
+        parentID: "ses_root",
+        agent: "worker",
+        model: ROOT_MODEL,
+        metadata: structuredClone(legacyAutoMarker),
+        outcome: "succeeded",
+        time: { created: 10 },
+      },
+      {
+        id: "ses_l2",
+        parentID: "ses_root",
+        agent: "worker",
+        model: ROOT_MODEL,
+        metadata: structuredClone(legacyAutoMarker),
+        outcome: "succeeded",
+        time: { created: 20 },
+      },
+    ]
+    // limit=0：显式旗舰被拒（quota 本身为 0），旧自动标记的 child 不被删。
+    const zero = await setup({
+      sessions: baseSessions(legacyChildren()),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 0 }]) },
+    })
+    expect(String((await denied(zero.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" })))).message)).toContain(
+      "旗舰子代理上限已满",
+    )
+    expect(zero.removed).toEqual([])
+    const deniedRow = hookLog().find((record) => record.event === "subagent-denied")
+    expect(deniedRow.flagshipExist).toBe(0)
+    await zero.dispose()
+    zero.events.close()
+
+    // F2 场景（root 已切到旗舰、旧 child 模型恰同款）：显式旗舰不因旧标记占满，照常放行且不删。
+    const f2 = await setup({
+      sessions: baseSessions(legacyChildren()),
+      entries: { ses_root: rootEntries() },
+    })
+    await f2.hooks["tool:execute.before"](call("c2", { model: "acme/flagship#high" }))
+    expect(f2.removed).toEqual([])
+    const allowedRow = hookLog().find((record) => record.event === "subagent-allowed")
+    expect(allowedRow.flagshipExist).toBe(0)
+    await f2.hooks["tool:execute.after"]({ tool: "subagent", id: "c2" })
+    await f2.dispose()
+    f2.events.close()
   })
 })

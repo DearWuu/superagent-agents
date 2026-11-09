@@ -74,11 +74,12 @@ describe("superagent skills", () => {
     expect(content).toContain("报告详细度与验收深度相关但不是一回事")
   })
 
-  test("context covers ctx, the 300K reminder and the delete rule", () => {
+  test("context covers ctx, the 300K threshold and the delete rule", () => {
     const content = SUPERAGENT_CONTEXT_SKILL.content
     expect(content).toContain("input + cache read + cache write")
     expect(content).toContain("300K")
-    expect(content).toContain("严格超过才提醒")
+    expect(content).toContain("严格超过才触发自动压缩")
+    expect(content).toContain("原生 compact")
     expect(content).toContain("不是自动拆分任务")
     expect(content).toContain("按模型阈值策略")
     expect(content).toContain("compact 还是续跑")

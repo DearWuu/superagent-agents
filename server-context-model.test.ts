@@ -1,11 +1,11 @@
 /**
- * 上下文提醒按模型窗口收紧阈值：复用 context-policy 的
+ * 上下文自动压缩按模型窗口收紧阈值：复用 context-policy 的
  * `min(300K, floor(window * 0.8))`，通过 `ctx.model.list` 的 limit.context
- * 查询并缓存；查询失败回退 300K。
+ * 查询并缓存；查询失败回退 300K。触发时走原生 `session.compact`，不发 prompt。
  */
 import { describe, expect, test } from "bun:test"
 
-import { CONTEXT_WARN_TOKENS, createCtxContextWarningScanner, ctxWarningText } from "./server"
+import { CONTEXT_WARN_TOKENS, createCtxContextCompactionScanner } from "./server"
 
 const NOW = 1_800_000_000_000
 
@@ -22,6 +22,7 @@ function harness(options: {
   listWithoutModel?: boolean
 }) {
   const prompts: Array<{ sessionID: string; text: string }> = []
+  const compacts: Array<{ sessionID: string }> = []
   const logs: any[] = []
   let listCalls = 0
   const sessions = new Map<string, any>([
@@ -48,6 +49,10 @@ function harness(options: {
         prompts.push(input)
         return { id: "msg_1" }
       },
+      async compact(input: { sessionID: string }) {
+        compacts.push(input)
+        return { data: {} }
+      },
       instructions: {
         entry: {
           async list() {
@@ -65,29 +70,36 @@ function harness(options: {
       },
     },
   }
-  const scanner = createCtxContextWarningScanner(ctx as any, {
+  const scanner = createCtxContextCompactionScanner(ctx as any, {
     now: () => NOW,
     claim: () => true,
     log: (record) => logs.push(record),
   })
-  return { scanner, prompts, logs, listCalls: () => listCalls }
+  return { scanner, prompts, compacts, logs, listCalls: () => listCalls }
 }
 
-describe("按模型窗口提醒", () => {
+describe("按模型窗口自动压缩", () => {
   const model = { providerID: "acme", id: "small" }
 
   test("窗口 100K → 阈值 80K；85K 触发、79K 不触发", async () => {
     const models = [modelInfo("acme", "small", 100_000)]
     const high = harness({ tokens: 85_000, model, models })
     expect(await high.scanner.scan()).toBe(1)
-    expect(high.prompts[0].text).toBe(ctxWarningText("任务", "ses_child", 85_000, 80_000))
-    expect(high.prompts[0].text).toContain(">80k")
+    expect(high.compacts).toEqual([{ sessionID: "ses_child" }])
 
     const low = harness({ tokens: 79_000, model, models })
     expect(await low.scanner.scan()).toBe(0)
   })
 
-  test("严格超过阈值才提醒（80K 本身不触发）", async () => {
+  test("触发走原生 session.compact，且不发任何 prompt", async () => {
+    const models = [modelInfo("acme", "small", 100_000)]
+    const h = harness({ tokens: 85_000, model, models })
+    expect(await h.scanner.scan()).toBe(1)
+    expect(h.compacts.map((item) => item.sessionID)).toEqual(["ses_child"])
+    expect(h.prompts).toHaveLength(0)
+  })
+
+  test("严格超过阈值才压缩（80K 本身不触发）", async () => {
     const h = harness({ tokens: 80_000, model, models: [modelInfo("acme", "small", 100_000)] })
     expect(await h.scanner.scan()).toBe(0)
   })
@@ -96,7 +108,9 @@ describe("按模型窗口提醒", () => {
     const large = { providerID: "acme", id: "large" }
     const h = harness({ tokens: 301_000, model: large, models: [modelInfo("acme", "large", 1_000_000)] })
     expect(await h.scanner.scan()).toBe(1)
-    expect(h.prompts[0].text).toContain(">300k")
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({ event: "ctx-compact", threshold: 300_000, root: "ses_root" }),
+    )
   })
 
   test("模型未知或列表缺失回退 300K", async () => {
@@ -106,13 +120,12 @@ describe("按模型窗口提醒", () => {
 
     const hit = harness({ tokens: 301_000, model: { providerID: "acme", id: "nope" }, models: [] })
     expect(await hit.scanner.scan()).toBe(1)
-    expect(hit.prompts[0].text).toContain(">300k")
+    expect(hit.compacts.map((item) => item.sessionID)).toEqual(["ses_child"])
   })
 
   test("查询失败回退 300K 并留日志", async () => {
     const h = harness({ tokens: 301_000, model, modelListFails: true })
     expect(await h.scanner.scan()).toBe(1)
-    expect(h.prompts[0].text).toContain(">300k")
     expect(h.logs.some((record) => record.event === "ctx-model-lookup-failed")).toBe(true)
   })
 
@@ -131,7 +144,6 @@ describe("按模型窗口提醒", () => {
       listWithoutModel: true,
     })
     expect(await h.scanner.scan()).toBe(1)
-    expect(h.prompts[0].text).toContain(">80k")
     expect(h.listCalls()).toBe(1)
   })
 })

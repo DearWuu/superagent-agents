@@ -1,7 +1,10 @@
 /**
- * Flagship subagents use the same provider/model/variant as the Superagent.
- * These helpers keep the identity rules and the separate flagship cap in one
- * place so the TUI, the server and tests read the same definition.
+ * Flagship subagents are the Superagent's explicit same-provider/model/variant
+ * delegations. Identity lives only in the metadata marker written when such a
+ * call succeeds; a session whose model merely equals the root model stays an
+ * ordinary Subagent. These helpers keep the identity rules and the separate
+ * flagship cap in one place so the TUI, the server and tests read the same
+ * definition.
  */
 
 export const DEFAULT_MAX_FLAGSHIP_SUBAGENTS = 2
@@ -9,6 +12,13 @@ export const MIN_MAX_FLAGSHIP_SUBAGENTS = 0
 export const MAX_MAX_FLAGSHIP_SUBAGENTS = 20
 /** Session metadata marker written by the server and preserved across model changes. */
 export const FLAGSHIP_METADATA_KEY = "superagent.flagship"
+/**
+ * Provenance of a flagship marker: only markers written for an explicit
+ * same-model subagent delegation carry this source. Markers without it
+ * (including markers from earlier automatic model-equality writes) never
+ * mean flagship.
+ */
+export const FLAGSHIP_MARKER_SOURCE = "explicit-subagent-delegation"
 
 export type ModelRef = {
   providerID: string
@@ -81,19 +91,16 @@ function metadataMarker(metadata: Record<string, unknown> | undefined): unknown 
 }
 
 /**
- * A model-bearing marker is stale once the child's current model differs.
- * Legacy `true` markers carry no model and remain valid; malformed markers and
- * explicit `false` never mean flagship.
+ * Only an explicit-delegation marker counts: a record carrying
+ * `source: "explicit-subagent-delegation"` with a valid model. Every other
+ * shape — explicit `false`, legacy `true`, bare model references, or a
+ * `{ model, at }` record without the source — means an ordinary Subagent.
+ * A valid marker goes stale once the child's current model differs.
  */
 function markerMeansFlagship(value: unknown, current: unknown): boolean {
-  if (value === false || value === undefined || value === null) return false
-  if (value === true) return true
-  if (typeof value === "string") {
-    const text = value.trim().toLowerCase()
-    if (["true", "1", "yes", "on"].includes(text)) return true
-    if (["false", "0", "no", "off"].includes(text)) return false
-  }
-  const marked = isRecord(value) && value.model !== undefined ? value.model : value
+  if (!isRecord(value)) return false
+  if (value.source !== FLAGSHIP_MARKER_SOURCE) return false
+  const marked = value.model
   if (!normalizeFlagshipModel(marked)) return false
   // An unknown current model cannot disprove a valid persisted marker.
   if (!normalizeFlagshipModel(current)) return true
@@ -101,31 +108,17 @@ function markerMeansFlagship(value: unknown, current: unknown): boolean {
 }
 
 /**
- * The marker preserves creation identity when only the root changes model.
- * The root model is consulted only for sessions created before markers existed.
+ * Flagship identity comes only from an explicit-delegation marker on the
+ * child's own metadata (`source: "explicit-subagent-delegation"` with a
+ * matching model). Unmarked sessions — and sessions whose model merely equals
+ * the root model — are ordinary Subagents; the `root` argument is kept for
+ * signature compatibility and ignored.
  */
-export function isFlagshipSession(candidate: FlagshipSessionRef | undefined, root: unknown): boolean {
+export function isFlagshipSession(candidate: FlagshipSessionRef | undefined, _root?: unknown): boolean {
   if (!candidate) return false
-  const marker = metadataMarker(candidate.metadata)
-  if (marker !== undefined) return markerMeansFlagship(marker, candidate.model)
-  return isFlagshipModel(candidate.model, root)
+  return markerMeansFlagship(metadataMarker(candidate.metadata), candidate.model)
 }
 
-export function countFlagshipSubagents(candidates: readonly FlagshipSessionRef[], root: unknown): number {
-  return candidates.filter((candidate) => isFlagshipSession(candidate, root)).length
-}
-
-/**
- * Admission for a model change. Staying on the same model, or moving away
- * from it, never increases the flagship count; only entering the flagship
- * set needs a free slot.
- */
-export function flagshipChangeAllowed(input: {
-  current: number
-  limit: number
-  alreadyFlagship: boolean
-  targetFlagship: boolean
-}): boolean {
-  if (!input.targetFlagship || input.alreadyFlagship) return true
-  return input.current + 1 <= input.limit
+export function countFlagshipSubagents(candidates: readonly FlagshipSessionRef[], _root?: unknown): number {
+  return candidates.filter((candidate) => isFlagshipSession(candidate)).length
 }
