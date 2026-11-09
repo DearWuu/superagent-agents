@@ -1541,6 +1541,32 @@ export function pickVictim(
   return undefined
 }
 
+/**
+ * 淘汰 remove 失败后的并发判定：重新列 children——victim 已不在刷新结果里，
+ * 说明它已被并发请求移除（或删除实际已生效），调用方采纳新列表继续即可；
+ * victim 仍在列表里就是真实失败；刷新自身失败也按真实失败处理。
+ * 继续的前提是 victim 从列表里消失、列表只会变短，不会无限循环。
+ */
+export async function classifyEvictFailure(
+  ctx: any,
+  rootID: string,
+  victimID: string,
+  now: number,
+): Promise<
+  | { status: "concurrent"; children: Child[] }
+  | { status: "real" }
+  | { status: "refresh-failed"; cause: unknown }
+> {
+  let refreshed: Child[]
+  try {
+    refreshed = await listChildren(ctx, rootID, now)
+  } catch (cause) {
+    return { status: "refresh-failed", cause }
+  }
+  if (refreshed.some((child) => child.id === victimID)) return { status: "real" }
+  return { status: "concurrent", children: refreshed }
+}
+
 export default {
   id: PLUGIN_ID,
   async setup(ctx: any) {
@@ -1824,6 +1850,21 @@ export default {
                     try {
                       await ctx.session.remove({ sessionID: victim.id })
                     } catch (cause) {
+                      const verdict = await classifyEvictFailure(ctx, steerRoot!, victim.id, Date.now())
+                      if (verdict.status === "concurrent") {
+                        children = verdict.children
+                        log({
+                          event: "evict-concurrent",
+                          decision: "allow",
+                          root: steerRoot,
+                          victim: victim.id,
+                          reason: "steer-switch",
+                          formula: roundFormula,
+                          cause: errorText(cause),
+                          ...base,
+                        })
+                        continue
+                      }
                       log({
                         event: "flagship-evict-failed",
                         decision: "error",
@@ -1831,6 +1872,7 @@ export default {
                         victim: victim.id,
                         formula: roundFormula,
                         cause: errorText(cause),
+                        refreshCause: verdict.status === "refresh-failed" ? errorText(verdict.cause) : undefined,
                         ...base,
                       })
                       break
@@ -2030,6 +2072,28 @@ export default {
             try {
               await ctx.session.remove({ sessionID: victimID })
             } catch (cause) {
+              // 两个并发调用可能选中同一个 victim：先删成功的不会报错，后到的
+              // 收到 NotFound。此时刷新列表确认 victim 已消失，按并发移除处理并
+              // 重新计算，而不是把本次调用拒掉。
+              const verdict = await classifyEvictFailure(ctx, rootID, victimID, now)
+              if (verdict.status === "concurrent") {
+                children = verdict.children
+                exist = children.length
+                log({
+                  event: "evict-concurrent",
+                  decision: "allow",
+                  root: rootID,
+                  victim: victimID,
+                  reason: victim.reason,
+                  exist,
+                  inflight: inflight(),
+                  limit,
+                  formula: roundFormula,
+                  cause: errorText(cause),
+                  ...base,
+                })
+                continue
+              }
               log({
                 event: "evict-failed",
                 decision: "error",
@@ -2041,6 +2105,7 @@ export default {
                 victim: victimID,
                 formula: roundFormula,
                 cause: errorText(cause),
+                refreshCause: verdict.status === "refresh-failed" ? errorText(verdict.cause) : undefined,
                 ...base,
               })
               break
@@ -2081,6 +2146,25 @@ export default {
             try {
               await ctx.session.remove({ sessionID: victim.id })
             } catch (cause) {
+              const verdict = await classifyEvictFailure(ctx, rootID, victim.id, now)
+              if (verdict.status === "concurrent") {
+                children = verdict.children
+                exist = children.length
+                log({
+                  event: "evict-concurrent",
+                  decision: "allow",
+                  root: rootID,
+                  victim: victim.id,
+                  reason: "flagship-limit",
+                  exist,
+                  inflight: inflight(),
+                  limit,
+                  formula: roundFormula,
+                  cause: errorText(cause),
+                  ...base,
+                })
+                continue
+              }
               log({
                 event: "flagship-evict-failed",
                 decision: "error",
@@ -2088,6 +2172,7 @@ export default {
                 victim: victim.id,
                 formula: roundFormula,
                 cause: errorText(cause),
+                refreshCause: verdict.status === "refresh-failed" ? errorText(verdict.cause) : undefined,
                 ...base,
               })
               break

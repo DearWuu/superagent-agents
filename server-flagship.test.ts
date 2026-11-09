@@ -36,6 +36,8 @@ type HarnessOptions = {
   barrier?: boolean
   /** 第 2 次读取指令条目时抛错：驱动 lookup-failed 的还槽路径。 */
   failSecondEntryList?: boolean
+  /** remove 一律失败且不删会话：驱动淘汰真实失败路径。 */
+  failRemove?: boolean
 }
 
 function eventQueue() {
@@ -145,6 +147,9 @@ function harness(options: HarnessOptions) {
         if (found && input.metadata !== undefined) found.metadata = structuredClone(input.metadata)
       },
       async remove({ sessionID }: { sessionID: string }) {
+        if (options.failRemove) throw new Error("remove failed")
+        // 与宿主一致：删一个已不存在（被并发调用删掉）的会话返回 NotFound。
+        if (!sessions.has(sessionID)) throw new Error(`session not found: ${sessionID}`)
         removed.push(sessionID)
         sessions.delete(sessionID)
       },
@@ -1028,5 +1033,207 @@ describe("槽位归还与淘汰保护", () => {
     await f2.hooks["tool:execute.after"]({ tool: "subagent", id: "c2" })
     await f2.dispose()
     f2.events.close()
+  })
+})
+describe("淘汰并发竞态", () => {
+  const normalChild = (id: string, created: number, running = false): FakeSession => ({
+    id,
+    parentID: "ses_root",
+    agent: "worker",
+    model: FLASH_MODEL,
+    outcome: running ? null : "succeeded",
+    time: running ? { created, busy: created } : { created },
+  })
+
+  test("两个并发 new 选中同一 victim：后到者 NotFound 后刷新继续，不误拒", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        normalChild("ses_run1", NOW - 5000, true),
+        normalChild("ses_run2", NOW - 4000, true),
+        normalChild("ses_run3", NOW - 3000, true),
+        normalChild("ses_fin1", NOW - 2000),
+        normalChild("ses_fin2", NOW - 1000),
+      ]),
+      entries: { ses_root: rootEntries() },
+      barrier: true,
+    })
+
+    const results = await Promise.allSettled([
+      h.hooks["tool:execute.before"](call("race1")),
+      h.hooks["tool:execute.before"](call("race2")),
+    ])
+
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true)
+    // 两个已结束的各删一次；后到者的 NotFound 不应把 victim 再记一次。
+    expect([...h.removed].sort()).toEqual(["ses_fin1", "ses_fin2"])
+    expect(new Set(h.removed).size).toBe(h.removed.length)
+    const rows = hookLog()
+    expect(rows.filter((row) => row.event === "subagent-denied" && row.reason === "total-limit")).toHaveLength(0)
+    const concurrent = rows.filter((row) => row.event === "evict-concurrent")
+    expect(concurrent.length).toBeGreaterThanOrEqual(1)
+    expect(["race1", "race2"]).toContain(concurrent[0].callID)
+    expect(concurrent[0].root).toBe("ses_root")
+    expect(concurrent[0].victim).toMatch(/^ses_fin[12]$/)
+    // 两个调用都放行时看到的最终口径：3 个运行中 + 2 个在途 = 5。
+    const allowed = rows.filter((row) => row.event === "subagent-allowed")
+    expect(allowed).toHaveLength(2)
+    for (const row of allowed) {
+      expect(row.exist).toBe(3)
+      expect(row.inflight).toBe(2)
+      expect(row.exist + row.inflight).toBe(5)
+    }
+    expect([...h.sessions.values()].filter((session) => session.parentID === "ses_root")).toHaveLength(3)
+
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "race1" })
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "race2" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("remove 真失败且刷新后 victim 仍在：仍拒绝，且只尝试一次不死循环", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        normalChild("ses_run1", NOW - 5000, true),
+        normalChild("ses_run2", NOW - 4000, true),
+        normalChild("ses_run3", NOW - 3000, true),
+        normalChild("ses_fin1", NOW - 2000),
+        normalChild("ses_fin2", NOW - 1000),
+      ]),
+      entries: { ses_root: rootEntries() },
+      failRemove: true,
+    })
+
+    const error = await denied(h.hooks["tool:execute.before"](call("fail1")))
+    expect(String(error.message)).toContain("Subagent 存在上限已满")
+    expect(h.removed).toEqual([])
+    const rows = hookLog()
+    expect(rows.filter((row) => row.event === "evict-failed")).toHaveLength(1)
+    expect(rows.some((row) => row.event === "evict-concurrent")).toBe(false)
+    expect(rows.filter((row) => row.event === "subagent-denied" && row.reason === "total-limit")).toHaveLength(1)
+    // 会话一个都没少：刷新确认 victim 仍在后按真实失败处理。
+    expect([...h.sessions.values()].filter((session) => session.parentID === "ses_root")).toHaveLength(5)
+
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("两个并发 steer 切旗舰选中同一 victim：NotFound 刷新后继续，不误拒 steer", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child1",
+          parentID: "ses_root",
+          agent: "worker",
+          model: FLASH_MODEL,
+          outcome: "succeeded",
+          time: { created: NOW - 4000 },
+        },
+        {
+          id: "ses_child2",
+          parentID: "ses_root",
+          agent: "worker",
+          model: FLASH_MODEL,
+          outcome: "succeeded",
+          time: { created: NOW - 3000 },
+        },
+        finishedFlagship("ses_f1", NOW - 2000),
+        finishedFlagship("ses_f2", NOW - 1000),
+      ]),
+      entries: {
+        ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 2 }]),
+      },
+      barrier: true,
+    })
+
+    const results = await Promise.allSettled([
+      h.hooks["tool:execute.before"](
+        call("steer1", { sessionID: "ses_child1", model: "acme/flagship#high" }),
+      ),
+      h.hooks["tool:execute.before"](
+        call("steer2", { sessionID: "ses_child2", model: "acme/flagship#high" }),
+      ),
+    ])
+
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true)
+    expect([...h.removed].sort()).toEqual(["ses_f1", "ses_f2"])
+    const rows = hookLog()
+    expect(rows.filter((row) => row.event === "subagent-denied")).toHaveLength(0)
+    const concurrent = rows.filter((row) => row.event === "evict-concurrent" && row.reason === "steer-switch")
+    expect(concurrent.length).toBeGreaterThanOrEqual(1)
+    expect(["steer1", "steer2"]).toContain(concurrent[0].callID)
+    expect(concurrent[0].root).toBe("ses_root")
+
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer1" })
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer2" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("remove 失败且刷新列表也失败：记录刷新原因后拒绝，不假装成功", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        normalChild("ses_run1", NOW - 5000, true),
+        normalChild("ses_run2", NOW - 4000, true),
+        normalChild("ses_run3", NOW - 3000, true),
+        normalChild("ses_fin1", NOW - 2000),
+        normalChild("ses_fin2", NOW - 1000),
+      ]),
+      entries: { ses_root: rootEntries() },
+      failRemove: true,
+    })
+    const originalList = h.ctx.session.list
+    let listCalls = 0
+    h.ctx.session.list = async (...args: any[]) => {
+      listCalls++
+      if (listCalls === 2) throw new Error("list down")
+      return originalList(...args)
+    }
+
+    const error = await denied(h.hooks["tool:execute.before"](call("fail2")))
+    expect(String(error.message)).toContain("Subagent 存在上限已满")
+    const rows = hookLog()
+    const failed = rows.filter((row) => row.event === "evict-failed")
+    expect(failed).toHaveLength(1)
+    expect(String(failed[0].refreshCause)).toContain("list down")
+    expect(rows.some((row) => row.event === "evict-concurrent")).toBe(false)
+    expect(h.removed).toEqual([])
+
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("两个并发旗舰 new 选中同一 victim：NotFound 刷新后继续，不误判旗舰超限", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([finishedFlagship("ses_f1", NOW - 2000), finishedFlagship("ses_f2", NOW - 1000)]),
+      entries: {
+        ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 2 }]),
+      },
+      barrier: true,
+    })
+
+    const results = await Promise.allSettled([
+      h.hooks["tool:execute.before"](call("flag1", { model: "acme/flagship#high" })),
+      h.hooks["tool:execute.before"](call("flag2", { model: "acme/flagship#high" })),
+    ])
+
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true)
+    expect([...h.removed].sort()).toEqual(["ses_f1", "ses_f2"])
+    const rows = hookLog()
+    expect(rows.filter((row) => row.event === "subagent-denied")).toHaveLength(0)
+    const concurrent = rows.filter((row) => row.event === "evict-concurrent" && row.reason === "flagship-limit")
+    expect(concurrent.length).toBeGreaterThanOrEqual(1)
+    expect(concurrent[0].root).toBe("ses_root")
+    expect(["flag1", "flag2"]).toContain(concurrent[0].callID)
+    expect([...h.sessions.values()].filter((session) => session.parentID === "ses_root")).toHaveLength(0)
+
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "flag1" })
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "flag2" })
+    await h.dispose()
+    h.events.close()
   })
 })
