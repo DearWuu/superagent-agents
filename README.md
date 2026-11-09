@@ -18,7 +18,7 @@ git clone https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugin
 重启 OpenCode 即生效。需要固定版本时 clone 对应 tag：
 
 ```sh
-git clone --branch v0.2.0 --depth 1 https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugins/superagent-agents
+git clone --branch v0.2.1 --depth 1 https://github.com/DearWuu/superagent-agents ~/.config/opencode/plugins/superagent-agents
 ```
 
 升级时进入该目录 `git pull`，再重启 OpenCode。
@@ -40,11 +40,11 @@ opencode plugin add github:DearWuu/superagent-agents
 OpenCode 启动时由 Bun 从 GitHub 拉取仓库、装进自己的缓存（`~/.cache/opencode/`），随后 `opencode reload` 或重启即生效。升级用 `opencode plugin update`。固定版本时在 spec 后加 ref：
 
 ```sh
-opencode plugin add github:DearWuu/superagent-agents#v0.2.0
+opencode plugin add github:DearWuu/superagent-agents#v0.2.1
 ```
 
 ```jsonc
-{ "plugins": ["github:DearWuu/superagent-agents#v0.2.0"] }
+{ "plugins": ["github:DearWuu/superagent-agents#v0.2.1"] }
 ```
 
 当前 opencode 2.2.5 上 `plugin add` / GitHub spec 可能报 `git dep preparation failed`（内嵌安装器的已知问题）。遇到时改用方式一，已实测可用。
@@ -74,7 +74,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 ```jsonc
 {
-  "plugins": ["superagent-agents@0.2.0"]
+  "plugins": ["superagent-agents@0.2.1"]
 }
 ```
 
@@ -226,7 +226,7 @@ bun bench/run.ts --dry-run --variants flagship,base,candidate --tasks all --reps
 ## 兼容
 
 - OpenCode **≥ 2.2.5**（目前只在 2.2.5 上实测，更低版本未验证）。
-- 版本 **0.2.0**，0.x 阶段不承诺存储格式兼容。升级前建议清掉旧状态：删除 `~/.local/state/opencode/superagent/` 与 `~/.local/state/opencode/latest/tui/plugin.superagent.agents.*.json`（会丢设置与审计记录）。
+- 版本 **0.2.1**，0.x 阶段不承诺存储格式兼容。升级前建议清掉旧状态：删除 `~/.local/state/opencode/superagent/` 与 `~/.local/state/opencode/latest/tui/plugin.superagent.agents.*.json`（会丢设置与审计记录）。
 - 设置与审计都落在本地状态目录，不联网、不上传。
 
 ## 卸载
