@@ -54,20 +54,30 @@ function theme() {
   return tokens as never
 }
 
-async function mount(options: { current?: { providerID: string; id: string }; onSelect?: (m: ModelInfo) => void } = {}) {
+async function mount(
+  options: {
+    current?: { providerID: string; id: string }
+    groups?: PickerGroup[]
+    providerNames?: Record<string, string>
+    onSelect?: (m: ModelInfo) => void
+  } = {},
+) {
   const commands: Command[] = []
   const favorites = new Set(["acme/alpha"])
   const picked: ModelInfo[] = []
   const favorited: ModelInfo[] = []
   const closes: string[] = []
+  const activeGroups = options.groups ?? groups
   const app = await testRender(
     () => (
       <ModelPicker
         context={{ theme: theme(), keymap: { layer: (factory: () => { commands?: Command[] }) => void commands.push(...(factory().commands ?? [])) } } as never}
         title="Select model"
-        groups={() => groups}
+        groups={() => activeGroups}
         favorites={() => favorites}
-        providerName={(providerID) => providerID.charAt(0).toUpperCase() + providerID.slice(1)}
+        providerName={(providerID) =>
+          options.providerNames?.[providerID] ?? providerID.charAt(0).toUpperCase() + providerID.slice(1)
+        }
         current={options.current}
         onFavorite={(item) => favorited.push(item)}
         onSelect={(item) => {
@@ -81,6 +91,8 @@ async function mount(options: { current?: { providerID: string; id: string }; on
   )
   app.renderer.start()
   await app.waitForFrame((frame) => frame.includes("Select model"))
+  // The input ref focuses on a short timer; let it run before tests type.
+  await new Promise((resolve) => setTimeout(resolve, 10))
   const press = (bind: string) => commands.find((command) => command.bind.split(",").includes(bind))!.run()
   return { app, picked, favorited, closes, press }
 }
@@ -134,6 +146,65 @@ test("typing filters to a flat list without section titles", async () => {
   } finally {
     picker.app.renderer.destroy()
   }
+})
+
+test("search finds Recent and Favorites entries by provider", async () => {
+  const flash = model("qoder", "qwen3-8-flash", "Qwen3 8 Flash")
+  const max = model("qoder", "qwen3-8-max", "Qwen3 8 Max")
+  const deepseek = model("qoder", "deepseek-flash", "DeepSeek Flash")
+  const picker = await mount({
+    groups: [
+      { title: "Favorites", models: [max as never] },
+      { title: "Recent", models: [flash as never] },
+      { title: "Qoder", models: [deepseek as never] },
+    ],
+  })
+  try {
+    await picker.app.mockInput.typeText("qoder")
+    // A query flattens sections; wait for the header to disappear so the
+    // assertions inspect the filtered list rather than the initial frame.
+    await picker.app.waitForFrame((frame) => !frame.includes("Favorites"))
+    const frame = picker.app.captureCharFrame()
+    expect(frame).toContain("Qwen3 8 Flash")
+    expect(frame).toContain("Qwen3 8 Max")
+    expect(frame).toContain("DeepSeek Flash")
+    expect(frame).not.toContain("No results found")
+  } finally {
+    picker.app.renderer.destroy()
+  }
+})
+
+test("search still matches model id", async () => {
+  const flash = model("qoder", "qwen3-8-flash", "Qwen3 8 Flash")
+  const picker = await mount({ groups: [{ title: "Recent", models: [flash as never] }] })
+  try {
+    await picker.app.mockInput.typeText("qwen3-8-flash")
+    const frame = await picker.app.waitForFrame((value) => !value.includes("Recent"))
+    expect(frame).toContain("Qwen3 8 Flash")
+  } finally {
+    picker.app.renderer.destroy()
+  }
+})
+
+test("provider display name and id distinguish same-name models", async () => {
+  const acme = model("acme-labs", "shared", "Shared")
+  const gizmo = model("gizmo", "shared", "Shared")
+  const activeGroups = [{ title: "Recent", models: [acme as never, gizmo as never] }]
+  const matchingRows = async (needle: string) => {
+    const picker = await mount({ groups: activeGroups, providerNames: { "acme-labs": "Acme Labs" } })
+    try {
+      await picker.app.mockInput.typeText(needle)
+      // A query flattens sections, so the section header disappearing proves
+      // the input reached the filter before the row count is read.
+      await picker.app.waitForFrame((frame) => !frame.includes("Recent"))
+      return (picker.app.captureCharFrame().match(/Shared/g) ?? []).length
+    } finally {
+      picker.app.renderer.destroy()
+    }
+  }
+  expect(await matchingRows("acme labs")).toBe(1)
+  expect(await matchingRows("acme-labs")).toBe(1)
+  expect(await matchingRows("gizmo")).toBe(1)
 })
 
 test("esc closes the dialog", async () => {

@@ -452,6 +452,24 @@ function pickerScore(needle: string, text: string) {
   return cursor === needle.length ? score : undefined
 }
 
+/** Searchable text for a picker row: model name/id, provider id/display name, and its section. */
+function pickerSearchText(
+  item: { model: ModelInfo; section: string },
+  providerName: (providerID: string) => string,
+) {
+  return [
+    item.model.name,
+    item.model.id,
+    item.model.providerID,
+    providerName(item.model.providerID),
+    item.section,
+  ]
+    .map((part) => (typeof part === "string" ? part.trim() : ""))
+    .filter((part) => part.length > 0)
+    .join(" ")
+    .toLowerCase()
+}
+
 /** 面板内唯一的分隔符：两侧各一个空格。 */
 const SEPARATOR = " · "
 
@@ -663,7 +681,7 @@ export function ModelPicker(props: {
         .groups()
         .flatMap((group) => group.models.map((model) => ({ model, section: group.title })))
         .flatMap((item) => {
-          const score = pickerScore(needle, `${item.model.name || item.model.id} ${item.section}`.toLowerCase())
+          const score = pickerScore(needle, pickerSearchText(item, props.providerName))
           if (score === undefined) return []
           return [
             { kind: "model" as const, ...item, favorite: favorites.has(pickerKey(item.model)), score: score * 2 },
