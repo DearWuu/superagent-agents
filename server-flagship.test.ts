@@ -10,6 +10,7 @@ import path from "node:path"
 
 import plugin from "./server"
 import { FLAGSHIP_MARKER_SOURCE, FLAGSHIP_METADATA_KEY, MAX_FLAGSHIP_SUBAGENTS_KEY } from "./flagship-admission"
+import { MODEL_DELEGATION_MARKER_SOURCE, MODEL_DELEGATION_METADATA_KEY } from "./model-delegation"
 
 const NOW = 1_800_000_000_000
 const ROOT_MODEL = { providerID: "acme", id: "flagship", variant: "high" }
@@ -865,6 +866,230 @@ describe("显式旗舰标记（tool:execute.after）", () => {
       result: { metadata: { sessionID: "ses_child", status: "completed" } },
     })
     expect(h.updates).toHaveLength(0)
+    await h.dispose()
+    h.events.close()
+  })
+})
+
+describe("显式模型委派标记（非旗舰 input.model）", () => {
+  const delegatedMarker = (model: unknown) => ({
+    [MODEL_DELEGATION_METADATA_KEY]: { model, at: 1, source: MODEL_DELEGATION_MARKER_SOURCE },
+  })
+
+  test("缺 variant 的显式模型不算旗舰，成功后仍写委派标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions(),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 0 }]) },
+    })
+    // root 是 acme/flagship#high；缺 #high 与 root 不同款，不按旗舰准入。
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_new", status: "completed" } },
+    })
+    const allowed = hookLog().find((record) => record.event === "subagent-allowed")
+    expect(allowed?.flagship).toBe(false)
+    const update = h.updates.find((item) => item.sessionID === "ses_new")
+    expect(update?.metadata?.[MODEL_DELEGATION_METADATA_KEY]).toMatchObject({
+      model: { providerID: "acme", id: "flagship" },
+      source: MODEL_DELEGATION_MARKER_SOURCE,
+    })
+    expect(update?.metadata?.[FLAGSHIP_METADATA_KEY]).toBeUndefined()
+    expect(
+      hookLog().some((record) => record.event === "model-delegation-marked" && record.sessionID === "ses_new"),
+    ).toBe(true)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("非旗舰显式模型（MiniMax）同样写委派标记", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1", { model: "minimax/MiniMax-M2" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_new", status: "completed" } },
+    })
+    const update = h.updates.find((item) => item.sessionID === "ses_new")
+    expect(update?.metadata?.[MODEL_DELEGATION_METADATA_KEY]).toMatchObject({
+      model: { providerID: "minimax", id: "MiniMax-M2" },
+      source: MODEL_DELEGATION_MARKER_SOURCE,
+    })
+    expect(update?.metadata?.[FLAGSHIP_METADATA_KEY]).toBeUndefined()
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("无显式 input.model 不写委派标记", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1"))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_new", status: "completed" } },
+    })
+    expect(h.updates).toHaveLength(0)
+    expect(hookLog().some((record) => record.event === "model-delegation-marked")).toBe(false)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("status=error 或无 sessionID 不写委派标记", async () => {
+    tempState()
+    const h = await setup({ sessions: baseSessions(), entries: { ses_root: rootEntries() } })
+    await h.hooks["tool:execute.before"](call("c1", { model: "minimax/MiniMax-M2" }))
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "error",
+      error: { message: "boom" },
+    })
+    expect(h.updates).toHaveLength(0)
+
+    await h.hooks["tool:execute.before"](call("c2", { model: "minimax/MiniMax-M2" }))
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c2", status: "completed" })
+    expect(h.updates).toHaveLength(0)
+    expect(hookLog().filter((record) => record.event === "model-delegation-mark-skip")).toHaveLength(2)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("显式 steer 成功后给目标会话写委派标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          agent: "worker",
+          model: FLASH_MODEL,
+          outcome: "succeeded",
+          time: { created: 1 },
+        },
+      ]),
+      entries: { ses_root: rootEntries() },
+    })
+    await h.hooks["tool:execute.before"](call("steer1", { sessionID: "ses_child", model: "minimax/MiniMax-M2" }))
+    // steer 的成功结果可以没有 result；目标会话由 input.sessionID 提供。
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer1", status: "completed" })
+    const update = h.updates.find((item) => item.sessionID === "ses_child")
+    expect(update?.metadata?.[MODEL_DELEGATION_METADATA_KEY]).toMatchObject({
+      model: { providerID: "minimax", id: "MiniMax-M2" },
+      source: MODEL_DELEGATION_MARKER_SOURCE,
+    })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("session.created 在工具完成前写入委派标记，默认同步可立即看到", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          agent: "worker",
+          model: { providerID: "kimi", id: "k3.1-pro" },
+          metadata: {},
+          time: { created: 1 },
+        },
+      ]),
+      entries: { ses_root: rootEntries() },
+    })
+    await h.hooks["tool:execute.before"](call("c1", { model: "kimi/k3.1-pro" }))
+    // 父会话、标题、模型任一不匹配的创建事件都不能误标。
+    for (const mismatched of [
+      { parentID: "ses_root", title: "other task", model: { providerID: "kimi", id: "k3.1-pro" } },
+      { parentID: "ses_other", title: "task", model: { providerID: "kimi", id: "k3.1-pro" } },
+      { parentID: "ses_root", title: "task", model: { providerID: "kimi", id: "k3.1-pro", variant: "high" } },
+    ]) {
+      h.events.push({
+        type: "session.created",
+        data: {
+          sessionID: "ses_child",
+          agent: "worker",
+          metadata: {},
+          ...mismatched,
+        },
+      })
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(h.updates).toHaveLength(0)
+    // 父会话、标题与模型都匹配：工具还在执行时就写标记。
+    h.events.push({
+      type: "session.created",
+      data: {
+        sessionID: "ses_child",
+        parentID: "ses_root",
+        title: "task",
+        agent: "worker",
+        model: { providerID: "kimi", id: "k3.1-pro" },
+        metadata: {},
+      },
+    })
+    await waitFor(() => h.updates.some((item) => item.sessionID === "ses_child"))
+    const early = h.updates.find((item) => item.sessionID === "ses_child")
+    expect(early?.metadata?.[MODEL_DELEGATION_METADATA_KEY]).toMatchObject({
+      model: { providerID: "kimi", id: "k3.1-pro" },
+      source: MODEL_DELEGATION_MARKER_SOURCE,
+    })
+    expect(
+      hookLog().some((record) => record.event === "model-delegation-marked" && record.phase === "created"),
+    ).toBe(true)
+    expect(
+      hookLog().some((record) => record.event === "model-delegation-marked" && record.phase === "completed"),
+    ).toBe(false)
+    // execute.after 成功后补写同一标记，创建阶段的标记已覆盖完整默认同步窗口。
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_child", status: "completed" } },
+    })
+    expect(
+      h.updates.some(
+        (item) =>
+          item.sessionID === "ses_child" &&
+          (item.metadata?.[MODEL_DELEGATION_METADATA_KEY] as Record<string, unknown>)?.source ===
+            MODEL_DELEGATION_MARKER_SOURCE,
+      ),
+    ).toBe(true)
+    expect(
+      hookLog().some((record) => record.event === "model-delegation-marked" && record.phase === "completed"),
+    ).toBe(true)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("委派标记不是旗舰，不占旗舰上限", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([
+        {
+          id: "ses_delegated",
+          parentID: "ses_root",
+          agent: "worker",
+          model: ROOT_MODEL,
+          metadata: delegatedMarker(ROOT_MODEL),
+          outcome: "succeeded",
+          time: { created: 10 },
+        },
+      ]),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 1 }]) },
+    })
+    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
+    expect(h.removed).toEqual([])
+    const allowed = hookLog().find((record) => record.event === "subagent-allowed")
+    expect(allowed?.flagship).toBe(true)
+    expect(allowed?.flagshipExist).toBe(0)
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c1" })
     await h.dispose()
     h.events.close()
   })

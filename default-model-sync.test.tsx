@@ -47,6 +47,14 @@ type Session = {
 const rootModel = { providerID: "p", id: "root" }
 const flash = { providerID: "p", id: "flash" }
 const nextModel = { providerID: "p", id: "root-next" }
+const kimiHigh = { providerID: "kimi", id: "k3.1-pro", variant: "high" }
+const kimi = { providerID: "kimi", id: "k3.1-pro" }
+const qoder = { providerID: "qoder", id: "qwen3-8-flash" }
+const qoderNext = { providerID: "qoder", id: "qwen3-8-max" }
+/** Server 为显式 `input.model` 调用写入的委派标记。 */
+const delegated = (model: { providerID: string; id: string; variant?: string }) => ({
+  "superagent.model-delegation": { model, at: 1, source: "explicit-subagent-model" },
+})
 const models = [
   { ...rootModel, name: "Root Model" },
   { ...flash, name: "Flash" },
@@ -438,7 +446,7 @@ test("默认批量同步不因目标与 root 同模型被拒绝", async () => {
     sessions: threeChildren,
     instructions: { "superagent.max-flagship-subagents": 1 },
     maxSubagents: 5,
-    policies: { a: "fixed", b: "fixed" },
+    policies: { a: "inherit", b: "inherit" },
     defaultPolicy: "fixed",
     defaultModel: flash,
     defaultSetAt: 1000,
@@ -479,6 +487,116 @@ test("默认同步跳过 default variant 等价的同模型子代理", async () 
     expect(h.switched).toEqual([])
     expect(h.calls).not.toContain("interrupt:worker")
     expect(h.sentPrompts).toEqual([])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("显式 input.model 委派的子代理不被 fixed 默认覆盖", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: kimiHigh, time: { created: 1, updated: 500 } },
+      {
+        id: "delegated",
+        parentID: "root",
+        title: "显式委派",
+        agent: "executor",
+        model: kimi,
+        metadata: delegated(kimi),
+        time: { created: 2000, updated: 400 },
+      },
+    ],
+    defaultPolicy: "fixed",
+    defaultModel: qoder,
+    defaultSetAt: 1000,
+  })
+  try {
+    await h.app.flush()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    // 新建子代理晚于 defaultSetAt，但显式模型标记优先：挂载不切。
+    expect(h.switched).toEqual([])
+    // 用户改目标后走批量同步，标记模型仍与当前模型一致：仍然不切。
+    h.setDefaultModel(qoderNext)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(h.switched).toEqual([])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("无标记或标记模型已不匹配时 fixed 默认照常覆盖", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: kimiHigh, time: { created: 1, updated: 500 } },
+      {
+        id: "plain",
+        parentID: "root",
+        title: "无标记",
+        agent: "executor",
+        model: kimi,
+        time: { created: 2000, updated: 400 },
+      },
+      {
+        id: "stale",
+        parentID: "root",
+        title: "已切走",
+        agent: "executor",
+        model: kimi,
+        metadata: delegated(kimiHigh),
+        time: { created: 3000, updated: 300 },
+      },
+    ],
+    defaultPolicy: "fixed",
+    defaultModel: qoder,
+    defaultSetAt: 1000,
+  })
+  try {
+    await h.app.flush()
+    await h.app.waitFor(() => h.switched.length >= 2)
+    expect(h.switched.map((item) => item.sessionID).sort()).toEqual(["plain", "stale"])
+    expect(h.switched.every((item) => item.model.providerID === "qoder")).toBe(true)
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("子代理手动 fixed 策略优先于 root 默认模型", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: kimiHigh, time: { created: 1, updated: 500 } },
+      {
+        id: "manual",
+        parentID: "root",
+        title: "手动指定",
+        agent: "executor",
+        model: kimi,
+        time: { created: 2000, updated: 400 },
+      },
+      {
+        id: "plain",
+        parentID: "root",
+        title: "未指定",
+        agent: "executor",
+        model: kimi,
+        time: { created: 3000, updated: 300 },
+      },
+    ],
+    policies: { manual: "fixed" },
+    defaultPolicy: "fixed",
+    defaultModel: qoder,
+    defaultSetAt: 1000,
+  })
+  try {
+    await h.app.flush()
+    await h.app.waitFor(() => h.switched.length >= 1)
+    // 手动 fixed 是显式选择：挂载默认只覆盖未指定策略的普通子代理。
+    expect(h.switched.map((item) => item.sessionID)).toEqual(["plain"])
+    expect(h.switched[0]!.model).toEqual(qoder)
+    h.setDefaultModel(qoderNext)
+    await h.app.waitFor(() => h.switched.length >= 2)
+    expect(h.switched.map((item) => item.sessionID)).toEqual(["plain", "plain"])
+    expect(h.switched.at(-1)!.model).toEqual(qoderNext)
+    expect(h.switched.some((item) => item.sessionID === "manual")).toBe(false)
   } finally {
     h.app.renderer.destroy()
   }

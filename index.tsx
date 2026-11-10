@@ -46,6 +46,7 @@ import {
   isFlagshipSession,
 } from "./flagship"
 import { DEFAULT_CONTEXT_WARN_TOKENS, contextWarnThreshold } from "./context-policy"
+import { isExplicitModelDelegation } from "./model-delegation"
 
 type ModelInfo = {
   providerID: string
@@ -1548,9 +1549,14 @@ export function SidebarAgents(props: {
       if (item.id === rootID || !family.has(item.id)) continue
       if ((item.time?.created ?? 0) <= since) continue
       const policy = root().policies[item.id]
-      if (policy && policy !== "fixed") continue
+      // A per-child policy is an explicit choice; the root default never
+      // treats it as unset.
+      if (policy) continue
       // A protected Subagent keeps its own model; the default never reaches it.
       if (kept[item.id]) continue
+      // Explicit `input.model` delegation outranks the default; the marker is
+      // valid only while the child still runs that exact model.
+      if (isExplicitModelDelegation(item)) continue
       if (item.model && sameModel(item.model, model)) continue
       try {
         // A newly created child already has a running parent/tool call. Apply
@@ -1574,12 +1580,18 @@ export function SidebarAgents(props: {
       const family = new Set(props.context.data.session.family(rootID))
       const kept = root().keptSubagents ?? {}
       const policies = root().policies
+      // Explicit per-child fixed is a manual choice and keeps its model; inherit
+      // still follows the root target and auto still manages itself. Explicit
+      // `input.model` delegation outranks the default; a stale marker (current
+      // model differs from the marked one) does not protect.
       const targets = sessions().filter(
         (item) =>
           item.id !== rootID &&
           family.has(item.id) &&
           !kept[item.id] &&
-          policies[item.id] !== "auto",
+          policies[item.id] !== "auto" &&
+          policies[item.id] !== "fixed" &&
+          !isExplicitModelDelegation(item),
       )
       if (targets.length === 0) return
       const label = names().get(modelKey(target)) ?? target.id

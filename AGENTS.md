@@ -27,6 +27,7 @@ bun run build               # 等价于 sh build.sh；Windows 用 Git Bash 跑
 | `agent-tree.ts` / `model-policy.ts` | 会话树构建与排序；模型引用、可用性校验与选择策略 |
 | `oversight.ts` / `context-policy.ts` | L0–L4 报告与验收协议；ctx 阈值 `min(300K, floor(window×0.8))` |
 | `flagship.ts` / `flagship-admission.ts` | 同款旗舰身份判定、默认 2 / 0..20 / 总上限收敛、准入与淘汰候选 |
+| `model-delegation.ts` | 显式 `input.model` 委派标记：来源、写入与「当前模型仍匹配才有效」判定 |
 | `skills.ts` | 三个内置原生 Skill 的静态内容与 id，供 server 注册 |
 | `session-scope.ts` / `storage-migration.ts` | 按 root 隔离的持久化设置与旧格式迁移 |
 | `subagent-limit.ts` / `run-duration.ts` | TUI 侧淘汰计划；运行状态、时长与长运行展示 |
@@ -43,7 +44,7 @@ bun run build               # 等价于 sh build.sh；Windows 用 Git Bash 跑
 4. **Server 辅助能力不得打挂主流程。** 查询异常按 fail-open 处理，只有明确的数量上限拒绝才阻止 `subagent` 调用；日志、critic、探针、上下文自动压缩、Skills 注册失败只记录。新增钩子、事件订阅和定时器必须在 dispose 中清理。
 5. **保持两端语义一致。** 活跃状态优先于残留 outcome；上下文用量取 compact 后最近一次 assistant 的输入侧 tokens（input + cache read/write），阈值默认 300K、已知窗口取 `min(300K, floor(window×0.8))`，严格超过才警示；长运行与探针共用 30 分钟语义。
 6. **旗舰与淘汰都有破坏性。** 旗舰只约束 Superagent 显式指定与 root 同款模型的委派；身份只认显式委派成功后写入、带 `source: "explicit-subagent-delegation"` 来源的元数据标记（无来源的历史标记按普通处理），root 切模型不清洗旧标记，子代理当前模型与标记模型不一致时标记过期。缺省 input、agent 默认、inherit/fixed/手动/F2 改到的同模型都是普通子代理，不占旗舰名额。旗舰超限只淘汰最旧已完成旗舰，运行中、正在 steer、已保护、TUI 正在查看的子会话都不删；critic 会话不占普通子代理名额；修改候选条件或计数公式时补边界与并发测试。
-7. **默认模型批量与保护。** fixed 默认模型变更、inherit 跟随 root 都批量切到当前 root 下所有未保护且非 auto 子代理（保留 variant），auto 不批量；首次挂载/reload 不批量切旧会话。运行中先中断再切换并续跑，串行且逐项报错。批量同步不做旗舰预检、不写旗舰身份。保护名单同时挡自动淘汰与模型批量修改，手动改受保护子代理模型要拒绝，手动删除始终允许。删除只移除子会话与上下文，不重建、不发新任务。
+7. **默认模型批量与保护。** fixed 默认模型变更、inherit 跟随 root 都批量切到当前 root 下未保护、未单独指定策略且非 auto 子代理（保留 variant），auto 不批量；子代理单独 fixed 是手动选择，默认模型不覆盖。首次挂载/reload 不批量切旧会话。运行中先中断再切换并续跑，串行且逐项报错。批量同步不做旗舰预检、不写旗舰身份。显式 `input.model` 委派优先：该子代理带有效 `superagent.model-delegation` 标记且当前模型仍匹配时，默认同步与 root 换模型都跳过；无标记、来源不符或模型已切走按普通子代理处理。标记在 `session.created` 即按父会话/标题/模型匹配待处理调用提前写入，`execute.after` 成功后再补写。保护名单同时挡自动淘汰与模型批量修改，手动改受保护子代理模型要拒绝，手动删除始终允许。删除只移除子会话与上下文，不重建、不发新任务。
 
 ## 代码与测试约定
 

@@ -15,6 +15,7 @@
     "flagship-admission.ts",
     "critic.ts",
     "model-policy.ts",
+    "model-delegation.ts",
     "oversight.ts",
     "run-duration.ts",
     "session-scope.ts",

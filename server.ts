@@ -50,6 +50,16 @@
  *    child 切走模型而失效时清理，不因切到 parent 同模型而新增；root 切模型不清洗旧
  *    child 标记。无该 source 的旧标记一律按普通子代理处理。
  *
+ * 显式模型委派标记：
+ *  - 任何非空 `input.model` 的新建调用在 `session.created` 时即写 child 自身
+ *    `superagent.model-delegation = { model, at, source: "explicit-subagent-model" }`，
+ *    `execute.after` 成功后再补写；steer 只在成功后落到目标会话。新建按父会话/
+ *    标题/模型匹配唯一待处理调用，面板默认模型同步无需等工具结束。该标记独立于
+ *    旗舰标记，只记录模型由调用方显式指定；非旗舰模型同样写。
+ *  - TUI 默认模型批量同步（fixed/inherit）跳过该标记有效且 child 当前模型仍与
+ *    标记一致的子代理；标记缺失、来源不符或模型已切走时不保护。默认模型只作用于
+ *    未显式指定模型的子代理。
+ *
  * 保护子会话的模型硬约束：
  *  - 命中保护名单（`superagent.kept-subagents`）的子会话，steer 到它时模型也不可改：
  *    显式 `input.model`、或切换 agent 时 `agent.model` 带来的模型变化都被拒绝（ToolError，
@@ -109,6 +119,11 @@ import {
   withFlagshipMarker,
   withoutFlagshipMarker,
 } from "./flagship-admission"
+import {
+  normalizeModelDelegationModel,
+  sameModelDelegationModel,
+  withModelDelegationMarker,
+} from "./model-delegation"
 import { DEFAULT_OVERSIGHT_LEVEL } from "./oversight"
 import { SUPERAGENT_SKILLS } from "./skills"
 
@@ -1179,6 +1194,32 @@ export async function markFlagshipSession(
   return true
 }
 
+/** 把显式模型委派标记写到 child 自身；保留原有 metadata，不写 root。 */
+export async function markModelDelegationSession(
+  ctx: any,
+  input: {
+    sessionID: string
+    parentID?: string
+    model: unknown
+    metadata?: Record<string, unknown>
+    phase?: "created" | "completed"
+  },
+): Promise<boolean> {
+  const existing = input.metadata ?? (await readSessionMetadata(ctx, input.sessionID))
+  const next = withModelDelegationMarker(existing, input.model, Date.now())
+  if (!next) return false
+  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  log({
+    event: "model-delegation-marked",
+    decision: "allow",
+    sessionID: input.sessionID,
+    parentID: input.parentID,
+    model: formatModelRef(input.model),
+    phase: input.phase ?? "completed",
+  })
+  return true
+}
+
 async function clearFlagshipSession(ctx: any, input: { sessionID: string; parentID?: string; reason: string }) {
   const existing = await readSessionMetadata(ctx, input.sessionID)
   if (!hasFlagshipMarker(existing)) return false
@@ -1586,7 +1627,15 @@ export default {
     /** callID → 本次调用的登记信息；flagshipRoot/flagshipModel 记本次占的显式旗舰槽。 */
     const pending = new Map<
       string,
-      { rootID?: string; steerTarget?: string; flagshipRoot?: string; flagshipModel?: unknown }
+      {
+        rootID?: string
+        steerTarget?: string
+        flagshipRoot?: string
+        flagshipModel?: unknown
+        delegatedModel?: unknown
+        callerSessionID?: string
+        delegatedTitle?: string
+      }
     >()
     /** root → 飞行中（子会话尚未创建）的 subagent 调用数。 */
     const flying = new Map<string, number>()
@@ -1728,6 +1777,8 @@ export default {
       const base = { sessionID: event.sessionID, callID: event.id, agent: event.agent }
       const explicitModel =
         typeof input?.model === "string" && input.model.trim() !== "" ? input.model : undefined
+      // 任何显式 input.model 都登记到本次调用：成功后写独立于旗舰的委派标记。
+      const delegatedModel = normalizeModelDelegationModel(explicitModel)
       let reserved: string | undefined
       let reservedFlagship: string | undefined
 
@@ -1755,7 +1806,7 @@ export default {
       try {
         if (steerTarget) {
           // 续跑已有子会话：不占新的总槽。显式 `input.model` 升级成旗舰才占旗舰槽。
-          pending.set(event.id, { steerTarget })
+          pending.set(event.id, { steerTarget, delegatedModel, callerSessionID })
           steered.add(steerTarget)
           let steerRoot: string | undefined
           let targetFlagship = false
@@ -1986,7 +2037,15 @@ export default {
           // 先占槽再看子会话：并发调用必须互相看见，否则会同时放行、超发。
           bump(rootID, 1)
           reserved = rootID
-          pending.set(event.id, { rootID })
+          pending.set(event.id, {
+            rootID,
+            delegatedModel,
+            callerSessionID,
+            delegatedTitle:
+              typeof input?.description === "string" && input.description.trim() !== ""
+                ? input.description
+                : undefined,
+          })
           const found = await readLimit(ctx, event.sessionID, rootID)
           limit = found.limit
           limitSource = found.source
@@ -2319,7 +2378,16 @@ export default {
 
     const after = await ctx.tool.hook("execute.after", async (event: any) => {
       if (event?.tool !== TOOL_NAME) return
-      let entry: { rootID?: string; steerTarget?: string; flagshipRoot?: string; flagshipModel?: unknown } | undefined
+      let entry:
+        | {
+            rootID?: string
+            steerTarget?: string
+            flagshipRoot?: string
+            flagshipModel?: unknown
+            delegatedModel?: unknown
+            callerSessionID?: string
+          }
+        | undefined
       try {
         entry = pending.get(event.id)
         if (!entry) return
@@ -2331,46 +2399,129 @@ export default {
         // after 钩子抛错会波及工具体本身，这里绝不能抛。
         return
       }
-      // 显式旗舰委派成功后才写标记：只有 status=completed 才算成功（steer 失败也
-      // 不写）。新建从 result.metadata.sessionID 取 child，steer 落到目标会话。
-      if (!entry.flagshipModel) return
-      if (event?.status !== "completed") {
-        log({
-          event: "flagship-mark-skip",
-          decision: "allow",
-          root: entry.flagshipRoot ?? null,
-          callID: event.id,
-          note: "status!=completed，不写旗舰标记",
-        })
-        return
-      }
-      const childSessionID = resultSessionID(event) ?? entry.steerTarget
+      // 显式委派标记只在 status=completed 的成功调用后写（steer 失败也不写）。
+      // 新建从 result.metadata.sessionID 取 child，steer 落到目标会话。
+      if (!entry.flagshipModel && !entry.delegatedModel) return
+      const root = entry.rootID ?? entry.flagshipRoot ?? null
+      const childSessionID = event?.status === "completed" ? resultSessionID(event) ?? entry.steerTarget : undefined
       if (!childSessionID) {
+        if (entry.flagshipModel) {
+          log({
+            event: "flagship-mark-skip",
+            decision: "allow",
+            root: entry.flagshipRoot ?? null,
+            callID: event.id,
+            note:
+              event?.status === "completed"
+                ? "无 result.metadata.sessionID，不写旗舰标记"
+                : "status!=completed，不写旗舰标记",
+          })
+        }
+        if (entry.delegatedModel) {
+          log({
+            event: "model-delegation-mark-skip",
+            decision: "allow",
+            root,
+            steerTarget: entry.steerTarget ?? null,
+            callID: event.id,
+            note:
+              event?.status === "completed"
+                ? "无 result.metadata.sessionID，不写显式模型委派标记"
+                : "status!=completed，不写显式模型委派标记",
+          })
+        }
+        return
+      }
+      if (entry.flagshipModel) {
+        try {
+          await markFlagshipSession(ctx, {
+            sessionID: childSessionID,
+            parentID: entry.flagshipRoot,
+            model: entry.flagshipModel,
+          })
+        } catch (cause) {
+          log({
+            event: "flagship-mark-failed",
+            decision: "error",
+            root: entry.flagshipRoot ?? null,
+            childSessionID,
+            cause: errorText(cause),
+          })
+        }
+      }
+      if (entry.delegatedModel) {
+        try {
+          await markModelDelegationSession(ctx, {
+            sessionID: childSessionID,
+            parentID: entry.callerSessionID,
+            model: entry.delegatedModel,
+          })
+        } catch (cause) {
+          log({
+            event: "model-delegation-mark-failed",
+            decision: "error",
+            root,
+            childSessionID,
+            cause: errorText(cause),
+          })
+        }
+      }
+    })
+
+    /**
+     * `session.created` 时提前写显式委派标记：新建子会话一出现就带上标记，
+     * 面板的默认模型同步无需等 `execute.after`。只匹配父会话、标题与模型都一致
+     * 的单个待处理调用；多个候选时不猜，留给 after 逐个补写。
+     */
+    const markDelegationOnSessionCreated = async (event: any) => {
+      const data = eventData(event)
+      const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
+      const parentID = typeof data.parentID === "string" ? data.parentID : undefined
+      if (!sessionID || !parentID) return
+      if (!normalizeModelDelegationModel(data.model)) return
+      const title = typeof data.title === "string" ? data.title : undefined
+      const candidates = [...pending.entries()].filter(
+        ([, entry]) =>
+          entry.delegatedModel !== undefined &&
+          !entry.steerTarget &&
+          entry.callerSessionID === parentID &&
+          sameModelDelegationModel(entry.delegatedModel, data.model) &&
+          (entry.delegatedTitle === undefined || title === entry.delegatedTitle),
+      )
+      if (candidates.length === 0) return
+      if (candidates.length > 1) {
         log({
-          event: "flagship-mark-skip",
+          event: "model-delegation-mark-skip",
           decision: "allow",
-          root: entry.flagshipRoot ?? null,
-          callID: event.id,
-          note: "无 result.metadata.sessionID，不写旗舰标记",
+          phase: "created",
+          sessionID,
+          parentID,
+          callIDs: candidates.map(([callID]) => callID),
+          note: "多个待处理显式委派匹配同一新建子会话，留给 execute.after",
         })
         return
       }
+      const callID = candidates[0]![0]
       try {
-        await markFlagshipSession(ctx, {
-          sessionID: childSessionID,
-          parentID: entry.flagshipRoot,
-          model: entry.flagshipModel,
+        await markModelDelegationSession(ctx, {
+          sessionID,
+          parentID,
+          model: data.model,
+          metadata: isObject(data.metadata) ? data.metadata : undefined,
+          phase: "created",
         })
       } catch (cause) {
         log({
-          event: "flagship-mark-failed",
+          event: "model-delegation-mark-failed",
           decision: "error",
-          root: entry.flagshipRoot ?? null,
-          childSessionID,
+          phase: "created",
+          callID,
+          sessionID,
+          parentID,
           cause: errorText(cause),
         })
       }
-    })
+    }
 
     // 限额重试：core 在每次重试决策前触发 retry 钩子，此时的切换只影响下一 attempt，
     // 不会打断正在执行的轮次；切换成功时把决策翻成继续重试。钩子里的异常一律吞掉。
@@ -2424,9 +2575,24 @@ export default {
     const resetSubscription = (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.step.ended", "session.execution.succeeded", "session.model.selected"],
+          types: ["session.created", "session.step.ended", "session.execution.succeeded", "session.model.selected"],
           signal: resetAbort.signal,
         })) {
+          if (event?.type === "session.created") {
+            try {
+              await markDelegationOnSessionCreated(event)
+            } catch (cause) {
+              log({
+                event: "model-delegation-mark-failed",
+                decision: "error",
+                phase: "created",
+                type: event.type,
+                childSessionID: eventSessionID(event),
+                cause: errorText(cause),
+              })
+            }
+            continue
+          }
           if (event?.type === "session.model.selected") {
             try {
               await handleSessionModelSelected(ctx, event)
