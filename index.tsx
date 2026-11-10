@@ -197,6 +197,22 @@ export function SidebarAgents(props: {
   const sessions = createMemo(() =>
     props.context.data.session.list().filter((item) => item.time?.archived === undefined),
   )
+  /** 子会话消息不会随列表自动加载；每个子代理同步一次，失败允许下一轮重试。 */
+  const messageSyncPending = new Set<string>()
+  createEffect(() => {
+    const rootID = rootSessionID()
+    if (!rootID || !collabOn()) return
+    const family = new Set(props.context.data.session.family(rootID))
+    for (const item of sessions()) {
+      if (item.id === rootID || !family.has(item.id) || messageSyncPending.has(item.id)) continue
+      const sync = props.context.data.session.message.sync
+      if (typeof sync !== "function") continue
+      messageSyncPending.add(item.id)
+      void sync(item.id).catch(() => {
+        messageSyncPending.delete(item.id)
+      })
+    }
+  })
   /** The direct, non-archived children of the family root. */
   const directSubagents = createMemo(() => {
     const family = new Set(props.context.data.session.family(rootSessionID()))
@@ -577,7 +593,9 @@ export function SidebarAgents(props: {
       tasks: [],
       autoConfigured: autoModels().length > 0,
     })
-    decorate(value, root(), rootNode.model, names())
+    decorate(value, root(), rootNode.model, names(), (sessionID) =>
+      isExplicitModelDelegation(props.context.data.session.get(sessionID)),
+    )
     value.title = rootTitle()
     return value
   })

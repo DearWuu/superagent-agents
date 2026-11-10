@@ -59,6 +59,7 @@ async function mount(
     current?: { providerID: string; id: string }
     groups?: PickerGroup[]
     providerNames?: Record<string, string>
+    height?: number
     onSelect?: (m: ModelInfo) => void
   } = {},
 ) {
@@ -87,7 +88,7 @@ async function mount(
         onClose={() => closes.push("closed")}
       />
     ),
-    { width: 80, height: 40, kittyKeyboard: true },
+    { width: 80, height: options.height ?? 40, kittyKeyboard: true },
   )
   app.renderer.start()
   await app.waitForFrame((frame) => frame.includes("Select model"))
@@ -169,6 +170,29 @@ test("search finds Recent and Favorites entries by provider", async () => {
     expect(frame).toContain("Qwen3 8 Max")
     expect(frame).toContain("DeepSeek Flash")
     expect(frame).not.toContain("No results found")
+  } finally {
+    picker.app.renderer.destroy()
+  }
+})
+
+test("filtered results beyond the viewport remain reachable by keyboard", async () => {
+  const many = Array.from({ length: 12 }, (_, index) =>
+    model("qoder", `qoder-${index}`, `Qoder Search ${String(index).padStart(2, "0")}`),
+  )
+  const picker = await mount({ groups: [{ title: "Recent", models: many as never[] }], height: 20 })
+  try {
+    await picker.app.mockInput.typeText("qoder")
+    await picker.app.waitForFrame((frame) => frame.includes("Qoder Search 00"))
+    expect(picker.app.captureCharFrame()).not.toContain("Qoder Search 11")
+
+    picker.press("end")
+    const tail = await picker.app.waitForFrame((frame) => frame.includes("Qoder Search 11"))
+    expect(tail).not.toContain("Qoder Search 00")
+
+    picker.press("home")
+    await picker.app.waitForFrame((frame) => frame.includes("Qoder Search 00"))
+    picker.press("pagedown")
+    await picker.app.waitForFrame((frame) => frame.includes("Qoder Search 10"))
   } finally {
     picker.app.renderer.destroy()
   }

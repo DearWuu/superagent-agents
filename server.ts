@@ -98,6 +98,8 @@
  */
 
 
+import { Schema } from "effect"
+
 import { criticReview, lastAssistantText } from "./critic"
 import { isFlagshipSession } from "./flagship"
 import {
@@ -144,6 +146,7 @@ import {
   readLimit,
   readRootCollabEnabled,
   readSessionModel,
+  toChild,
 } from "./server-session"
 import {
   DEFAULT_MAX_SUBAGENTS,
@@ -275,6 +278,247 @@ export async function registerSuperagentSkills(ctx: any, write: (record: Record<
   }
 }
 
+/** 续跑前中断的默认等待上限与轮询间隔；与 TUI 换模型时的空闲等待同量级。 */
+export const SUBAGENT_INTERRUPT_TIMEOUT_MS = 10_000
+export const SUBAGENT_INTERRUPT_POLL_MS = 50
+
+const SUBAGENT_INTERRUPT_DESCRIPTION =
+  "续跑已有子代理时先中断它正在执行的回合并等待真正停止，再投递本次消息；默认 true。设为 false 时完全保持原生 steer 语义。仅对传了 sessionID 的续跑生效，新建子代理不受影响。"
+
+function abortError(signal?: AbortSignal) {
+  const reason = signal?.reason
+  if (reason instanceof Error && reason.name !== "AbortError") return reason
+  if (reason instanceof Error) return new Error(`续跑投递已取消：${reason.message}`)
+  return new Error(reason === undefined ? "续跑投递已取消" : `续跑投递已取消：${String(reason)}`)
+}
+
+function sleepWithSignal(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal))
+      return
+    }
+    const done = () => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+      reject(abortError(signal))
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+export type SubagentInterruptDeps = {
+  getSession: (sessionID: string) => Promise<unknown>
+  interrupt: (sessionID: string) => Promise<unknown>
+  now?: () => number
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  timeoutMs?: number
+  pollMs?: number
+}
+
+type SubagentInterruptOutcome = "idle" | "interrupted"
+
+/**
+ * 对已有子会话做一次“先停后投递”的前置检查。返回 idle 表示无需中断；
+ * interrupted 表示已中断且确认停止。读取、中断或等待失败都明确抛错。
+ */
+export async function interruptBeforeSubagentSteer(
+  deps: SubagentInterruptDeps,
+  sessionID: string,
+  signal?: AbortSignal,
+): Promise<SubagentInterruptOutcome> {
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? sleepWithSignal
+  const timeoutMs = deps.timeoutMs ?? SUBAGENT_INTERRUPT_TIMEOUT_MS
+  const pollMs = deps.pollMs ?? SUBAGENT_INTERRUPT_POLL_MS
+
+  const running = async () => {
+    try {
+      const raw: any = await deps.getSession(sessionID)
+      const item = isObject(raw) && isObject(raw.data) ? raw.data : raw
+      if (!isObject(item)) throw new Error("会话不存在或返回为空")
+      return toChild(item, now()).running
+    } catch (cause) {
+      if (signal?.aborted) throw abortError(signal)
+      throw new Error(`读取子会话 ${sessionID} 状态失败：${errorText(cause)}`)
+    }
+  }
+
+  if (signal?.aborted) throw abortError(signal)
+  if (!(await running())) return "idle"
+  if (signal?.aborted) throw abortError(signal)
+  if (typeof deps.interrupt !== "function") {
+    throw new Error(`中断子会话 ${sessionID} 失败：宿主不支持 session.interrupt`)
+  }
+  try {
+    await deps.interrupt(sessionID)
+  } catch (cause) {
+    if (signal?.aborted) throw abortError(signal)
+    throw new Error(`中断子会话 ${sessionID} 失败：${errorText(cause)}`)
+  }
+  if (signal?.aborted) throw abortError(signal)
+
+  const deadline = now() + timeoutMs
+  for (;;) {
+    if (signal?.aborted) throw abortError(signal)
+    if (!(await running())) {
+      if (signal?.aborted) throw abortError(signal)
+      return "interrupted"
+    }
+    const remaining = deadline - now()
+    if (remaining <= 0) {
+      throw new Error(`中断子会话 ${sessionID} 后等待停止超时（${timeoutMs}ms）`)
+    }
+    await sleep(Math.min(pollMs, remaining), signal)
+  }
+}
+
+/** 原生 subagent 的工具输入：只关心续跑目标与 interrupt 开关。 */
+function subagentInput(input: unknown): { sessionID?: string; interrupt?: unknown; native: unknown } {
+  if (!isObject(input)) return { native: input }
+  const sessionID = typeof input.sessionID === "string" && input.sessionID.length > 0 ? input.sessionID : undefined
+  const { interrupt, ...native } = input
+  return { sessionID, interrupt, native }
+}
+
+/**
+ * 包装原生 subagent 执行：续跑且 interrupt 未显式关闭时，先中断并等待目标
+ * 真正停止，再把去掉 interrupt 的原生输入交给宿主。新建与 idle 不额外查询。
+ */
+export async function executeSubagentWithInterrupt(
+  ctx: any,
+  execute: (input: any, context: any) => Promise<any>,
+  input: unknown,
+  context: any,
+) {
+  const parsed = subagentInput(input)
+  if (parsed.sessionID && parsed.interrupt !== false) {
+    const started = Date.now()
+    const outcome = await interruptBeforeSubagentSteer(
+      {
+        getSession: (sessionID) => ctx.session.get({ sessionID }),
+        interrupt: (sessionID) => ctx.session.interrupt({ sessionID }),
+      },
+      parsed.sessionID,
+      context?.signal,
+    )
+    if (outcome === "interrupted") {
+      log({
+        event: "subagent-interrupt",
+        decision: "allow",
+        childSessionID: parsed.sessionID,
+        elapsedMs: Date.now() - started,
+      })
+    }
+  }
+  return execute(parsed.native, context)
+}
+
+function hasSubagentInterruptField(input: any) {
+  const fields = input?.fields
+  if (isObject(fields)) return Object.prototype.hasOwnProperty.call(fields, "interrupt")
+  if (isObject(input) && input.type === "object" && isObject(input.properties)) {
+    return Object.prototype.hasOwnProperty.call(input.properties, "interrupt")
+  }
+  return false
+}
+
+/** 给原生 subagent schema 追加可选 interrupt；返回 undefined 表示无法安全扩展。 */
+function withSubagentInterruptField(input: any) {
+  const fields = input?.fields
+  if (isObject(fields)) {
+    if (hasSubagentInterruptField(input)) return input
+    if (typeof input.pipe !== "function" || typeof Schema.fieldsAssign !== "function") return undefined
+    return input.pipe(
+      Schema.fieldsAssign({
+        interrupt: Schema.optional(Schema.Boolean).annotate({ description: SUBAGENT_INTERRUPT_DESCRIPTION }),
+      }),
+    )
+  }
+  if (isObject(input) && input.type === "object" && isObject(input.properties)) {
+    if (hasSubagentInterruptField(input)) return input
+    return {
+      ...input,
+      properties: {
+        ...input.properties,
+        interrupt: { type: "boolean", description: SUBAGENT_INTERRUPT_DESCRIPTION },
+      },
+    }
+  }
+  return undefined
+}
+
+const wrappedSubagentExecutes = new WeakSet<Function>()
+
+/**
+ * 注册原生 subagent 的 schema 扩展与执行包装。schema 无法扩展时不包装：
+ * 此时 interrupt:false 可能在宿主参数修复阶段被剥离，继续包装会违背显式 false。
+ */
+export async function registerSubagentInterrupt(ctx: any, write: (record: Record<string, unknown>) => void = log) {
+  if (typeof ctx?.tool?.transform !== "function") return undefined
+  try {
+    const registration = await ctx.tool.transform((editor: any) => {
+      try {
+        const tool = typeof editor?.get === "function" ? editor.get(TOOL_NAME) : undefined
+        if (!tool) {
+          write({
+            event: "subagent-interrupt-skip",
+            decision: "allow",
+            note: "原生 subagent 工具不存在，未注册",
+          })
+          return
+        }
+        editor.update(TOOL_NAME, (mutable: any) => {
+          const alreadyExtended = hasSubagentInterruptField(mutable.input)
+          const extended = withSubagentInterruptField(mutable.input)
+          if (extended === undefined) {
+            write({
+              event: "subagent-interrupt-unavailable",
+              decision: "error",
+              note: "原生 subagent schema 无法追加 interrupt，保留原生 steer 以避免剥离显式 false",
+            })
+            return
+          }
+          mutable.input = extended
+          if (!alreadyExtended) {
+            write({
+              event: "subagent-interrupt-schema-extended",
+              decision: "allow",
+              note: "原生 subagent schema 已追加 interrupt",
+            })
+          }
+          const execute = mutable.execute
+          if (typeof execute !== "function") {
+            write({
+              event: "subagent-interrupt-wrap-failed",
+              decision: "error",
+              note: "原生 subagent 没有可包装的 execute",
+            })
+            return
+          }
+          if (wrappedSubagentExecutes.has(execute)) return
+          const wrapped = (input: any, context: any) =>
+            executeSubagentWithInterrupt(ctx, execute, input, context)
+          wrappedSubagentExecutes.add(wrapped)
+          mutable.execute = wrapped
+        })
+      } catch (cause) {
+        write({ event: "subagent-interrupt-register-failed", decision: "error", cause: errorText(cause) })
+      }
+    })
+    write({ event: "subagent-interrupt-registered", decision: "allow" })
+    return registration
+  } catch (cause) {
+    write({ event: "subagent-interrupt-register-failed", decision: "error", cause: errorText(cause) })
+    return undefined
+  }
+}
+
 export default {
   id: PLUGIN_ID,
   async setup(ctx: any) {
@@ -290,6 +534,8 @@ export default {
 
     // 原生 Skills 是静态流程资产，注册与协作总开关无关；失败只记日志。
     const skillRegistration = await registerSuperagentSkills(ctx)
+    // 续跑消息默认先中断；schema 无法扩展时退回原生 steer，避免破坏显式 false。
+    const interruptRegistration = await registerSubagentInterrupt(ctx)
 
     /** callID → 本次调用的登记信息；flagshipRoot/flagshipModel 记本次占的显式旗舰槽。 */
     const pending = new Map<
@@ -1322,6 +1568,9 @@ export default {
       } catch {}
       try {
         probeTimer.stop()
+      } catch {}
+      try {
+        await interruptRegistration?.dispose?.()
       } catch {}
       try {
         await skillRegistration?.dispose?.()

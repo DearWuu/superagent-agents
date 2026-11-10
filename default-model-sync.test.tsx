@@ -515,6 +515,11 @@ test("显式 input.model 委派的子代理不被 fixed 默认覆盖", async () 
     await new Promise((resolve) => setTimeout(resolve, 100))
     // 新建子代理晚于 defaultSetAt，但显式模型标记优先：挂载不切。
     expect(h.switched).toEqual([])
+    const lines = h.app.captureCharFrame().split("\n")
+    const row = lines.findIndex((line) => line.includes("显式委派"))
+    const delegatedRow = lines.slice(row, row + 4).join("\n")
+    expect(delegatedRow).toContain("k3.1-pro")
+    expect(delegatedRow).not.toContain("qwen3-8-flash")
     // 用户改目标后走批量同步，标记模型仍与当前模型一致：仍然不切。
     h.setDefaultModel(qoderNext)
     await new Promise((resolve) => setTimeout(resolve, 100))

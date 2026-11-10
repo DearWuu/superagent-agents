@@ -13,6 +13,7 @@ type RowInfo = {
   usage?: string
   usageWarning?: boolean
   badge: string
+  failure?: { status: string; error: string; warning: boolean }
 }
 
 /**
@@ -229,6 +230,26 @@ export function AgentPanelView(props: {
                       </text>
                     </box>
                   </Show>
+                </Show>
+                <Show when={props.rowInfo(row).failure}>
+                  {(failure) => (
+                    <box flexDirection="column">
+                      <text
+                        id={`sidebar.agents.retry.${row.node.id}`}
+                        fg={failure().warning ? props.warningColor() : theme.text.muted}
+                        wrapMode="none"
+                      >
+                        {failure().status}
+                      </text>
+                      <text
+                        id={`sidebar.agents.failure.${row.node.id}`}
+                        fg={failure().warning ? props.warningColor() : theme.text.muted}
+                        wrapMode="word"
+                      >
+                        {failure().error}
+                      </text>
+                    </box>
+                  )}
                 </Show>
                 <Show when={row.node.kind === "subagent" ? props.criticRecord(row.node.sessionID) : undefined}>
                   {(record) => (

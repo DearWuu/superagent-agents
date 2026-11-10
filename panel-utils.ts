@@ -135,7 +135,13 @@ export function toSessionInput(context: Plugin.Context, session: SessionInfo): S
   }
 }
 
-export function decorate(node: AgentNode, settings: RootSettings, parentModel: ModelRef | undefined, names: Map<string, string>) {
+export function decorate(
+  node: AgentNode,
+  settings: RootSettings,
+  parentModel: ModelRef | undefined,
+  names: Map<string, string>,
+  isDelegated: (sessionID: string) => boolean = () => false,
+) {
   const applyName = (model: ModelRef | undefined) => {
     if (!model) return
     const name = names.get(modelKey(model)) ?? names.get(`${model.providerID}/${model.id}`)
@@ -153,8 +159,11 @@ export function decorate(node: AgentNode, settings: RootSettings, parentModel: M
 
   if (node.kind !== "root" && node.sessionID) {
     const explicit = settings.policies[node.sessionID]
-    const policy = explicit ?? settings.defaultPolicy ?? "inherit"
+    // 显式 input.model 委派只在展示层等价于手动 fixed；不反向写用户策略。
+    const delegated = isDelegated(node.sessionID)
+    const policy = delegated ? ("fixed" as const) : explicit ?? settings.defaultPolicy ?? "inherit"
     const newerThanDefault =
+      !delegated &&
       node.created !== undefined && settings.defaultSetAt !== undefined && node.created > settings.defaultSetAt
     const fixedDefault =
       settings.defaultPolicy === "fixed" &&
@@ -183,5 +192,5 @@ export function decorate(node: AgentNode, settings: RootSettings, parentModel: M
             : undefined
   }
   applyName(node.model?.actual)
-  for (const child of node.children) decorate(child, settings, parentModel, names)
+  for (const child of node.children) decorate(child, settings, parentModel, names, isDelegated)
 }

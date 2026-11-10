@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import { readFileSync } from "node:fs"
+import path from "node:path"
 
 import { OVERSIGHT_ACCEPTANCE } from "./oversight"
 import {
@@ -32,11 +34,11 @@ describe("superagent skills", () => {
   test("orchestration covers delegation, the seven-field brief and upgrades", () => {
     const content = SUPERAGENT_ORCHESTRATION_SKILL.content
     expect(content).toContain("先判断是否适合 Flash")
-    expect(content).toContain("新建还是续跑")
+    expect(content).toContain("默认新建并行")
     expect(content).toContain("input.sessionID")
     for (const field of ["目标：", "范围：", "既定设计：", "关键指针：", "验收：", "歧义处理：", "交付格式："])
       expect(content).toContain(field)
-    expect(content).toContain("耦合任务合并")
+    expect(content).toContain("并行拆分与耦合合并")
     expect(content).toContain("能力升级与限额切换分离")
     expect(content).toContain("旗舰子代理默认上限 2")
     expect(content).toContain("总子代理上限")
@@ -47,6 +49,26 @@ describe("superagent skills", () => {
     expect(content).toContain("不要让 Superagent 直接写实现")
     expect(content).not.toContain("或自己完成")
     expect(content).toContain("不得通过换工具")
+  })
+
+  test("orchestration and user docs share the parallel, resume and interrupt contract", () => {
+    const docs = [
+      SUPERAGENT_ORCHESTRATION_SKILL.content,
+      readFileSync(path.join(import.meta.dir, "README.md"), "utf8"),
+      readFileSync(path.join(import.meta.dir, "AGENTS.md"), "utf8"),
+    ]
+    for (const content of docs) {
+      expect(content).toContain("无关联的独立任务默认新建")
+      expect(content).toContain("尽量并行")
+      expect(content).toContain("同文件或强耦合")
+      expect(content).toContain("合并")
+      expect(content).toContain("续跑只用于同一模块")
+      expect(content).toContain("禁止重复派工")
+      expect(content).toContain("不得绕过")
+      expect(content).toContain("会先中断当前运行再发送新任务")
+      expect(content).toContain("interrupt: false")
+      expect(content).toContain("会保留当前运行并直接 steer")
+    }
   })
 
   test("orchestration explains the authorized same-flagship model path", () => {

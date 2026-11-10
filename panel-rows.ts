@@ -9,11 +9,13 @@ import type { Plugin } from "@opencode/plugin/tui"
 import type { FlatNode } from "./agent-tree"
 import { modelLabel } from "./agent-tree"
 import { contextUsageView } from "./panel-context"
+import { failureRetryView, formatFailureRetryStatus } from "./panel-retry"
 import {
   MIN_CONTENT_WIDTH,
   SEPARATOR,
   displayStatus,
   displayWidth,
+  isSessionRunning,
   rootModelLabel,
   truncate,
 } from "./panel-utils"
@@ -101,6 +103,13 @@ export function createRowHelpers(deps: {
     const badge = rowBadge(row)
     const usage = rowUsage(row)
     const usageText = usage ? `${usage.text}${usage.warning ? " ⚠" : ""}` : undefined
+    const sessionID = row.node.kind === "subagent" ? row.node.sessionID : undefined
+    const retry = sessionID
+      ? failureRetryView(context.data.session.message.list(sessionID), {
+          running: isSessionRunning(context, sessionID),
+          outcome: context.data.session.get(sessionID)?.outcome,
+        })
+      : undefined
     const room = Math.max(MIN_CONTENT_WIDTH, panelWidth() - displayWidth(indent))
     const head = status ? `${status}${SEPARATOR}${model}` : model
     const oneLine = displayWidth(head) <= room
@@ -116,6 +125,13 @@ export function createRowHelpers(deps: {
       usageWarning: usage?.warning ?? false,
       badge: inline || usageText ? `${SEPARATOR}${badge}` : `${indent}${badge}`,
       ownLine: !inline,
+      failure: retry
+        ? {
+            status: `${indent}${formatFailureRetryStatus(retry)}`,
+            error: truncate(`${indent}上次失败：${retry.error}`, room * 2),
+            warning: retry.phase !== "recovered",
+          }
+        : undefined,
     }
   }
 
