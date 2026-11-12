@@ -48,6 +48,7 @@ export type SettingsAction =
   | { kind: "subagentFallbackModel" }
   | { kind: "fallbackEnabled" }
   | { kind: "criticEnabled" }
+  | { kind: "statusWatch" }
 
 export type FallbackAction = { kind: "on" } | { kind: "off" } | { kind: "threshold" }
 

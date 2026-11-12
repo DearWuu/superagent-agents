@@ -21,6 +21,7 @@ export const INSTRUCTION_KEYS = {
   fallbackThreshold: "superagent.fallback-threshold",
   fallbackEnabled: "superagent.fallback-enabled",
   criticEnabled: "superagent.critic-enabled",
+  statusWatch: "superagent.status-watch",
   keptSubagents: "superagent.kept-subagents",
 } as const
 
@@ -66,6 +67,7 @@ export const SUPERAGENT_DEFAULTS = {
   fallbackThreshold: 3,
   fallbackEnabled: true,
   criticEnabled: false,
+  statusWatch: true,
   sessionPrompt: [
     "主代理（Superagent）负责：分析需求、拆解任务、方案设计（架构/接口/交互/版面等具体设计）、编写任务书与验收标准、派工和验收。设计产物由主代理产出后交给 Subagent 实现，不让 Subagent 自行决定设计方向。",
     "主代理不做具体实现：改代码、写文件、调试、测试执行交给 Subagent；只读分析（读代码/查文档/调研）主代理可自己做。",

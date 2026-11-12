@@ -124,6 +124,7 @@ export function createInstructionActions(deps: {
       INSTRUCTION_KEYS.fallbackThreshold,
       INSTRUCTION_KEYS.fallbackEnabled,
       INSTRUCTION_KEYS.criticEnabled,
+      INSTRUCTION_KEYS.statusWatch,
       INSTRUCTION_KEYS.maxFlagshipSubagents,
       INSTRUCTION_KEYS.oversightLevel,
     ])
@@ -180,6 +181,7 @@ export function createInstructionActions(deps: {
       [INSTRUCTION_KEYS.fallbackThreshold, SUPERAGENT_DEFAULTS.fallbackThreshold],
       [INSTRUCTION_KEYS.fallbackEnabled, String(SUPERAGENT_DEFAULTS.fallbackEnabled)],
       [INSTRUCTION_KEYS.criticEnabled, String(SUPERAGENT_DEFAULTS.criticEnabled)],
+      [INSTRUCTION_KEYS.statusWatch, String(SUPERAGENT_DEFAULTS.statusWatch)],
     ]
     for (const [key, model] of [
       [INSTRUCTION_KEYS.fallbackModel, SUPERAGENT_DEFAULTS.fallbackModel],

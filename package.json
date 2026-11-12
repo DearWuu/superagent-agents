@@ -39,6 +39,7 @@
     "skills.ts",
     "storage-migration.ts",
     "subagent-limit.ts",
+    "subagent-status.ts",
     "build.sh",
     "README.md"
   ],

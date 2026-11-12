@@ -109,6 +109,7 @@ export function subagentTitle(session: SessionInfo) {
 /**
  * 一行的状态。活跃执行集合优先（与原生 Subagents 面板同源）：取消后重启仍在跑的
  * 会话即使残留 outcome，也必须显示运行中。运行中的子代理附带已运行时长。
+ * 会话不在运行、但带有「后台任务仍在跑」标记时，显示 `⏳ 后台 N 个任务`。
  */
 export function displayStatus(context: Plugin.Context, sessionID: string, options?: { now?: number; duration?: boolean }) {
   return sessionStatusView(context.data.session.get(sessionID), isSessionRunning(context, sessionID), {

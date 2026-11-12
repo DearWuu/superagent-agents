@@ -129,6 +129,7 @@ import {
 } from "./server-models"
 import {
   classifyEvictFailure,
+  clearRuntimeState,
   collabEnabledForSession,
   detectSteerModelChange,
   eventData,
@@ -139,6 +140,7 @@ import {
   listChildren,
   markFlagshipSession,
   markModelDelegationSession,
+  markRuntimeBackground,
   pickVictim,
   readAgentInfo,
   readKeptSubagents,
@@ -165,6 +167,18 @@ import {
   pruneClaims,
 } from "./server-state"
 import { SUPERAGENT_SKILLS } from "./skills"
+import {
+  DISPATCH_LEDGER_LIMIT,
+  SHELL_SETTLE_DELAY_MS,
+  STATUS_RECONCILE_INTERVAL_MS,
+  attachDispatchReceipt,
+  createDispatchLedger,
+  createStatusWatcher,
+  formatDispatchReceipt,
+  type CompletionState,
+  type DispatchLedger,
+  type DispatchPatch,
+} from "./subagent-status"
 
 export {
   CRITIC_ENABLED_KEY,
@@ -282,6 +296,12 @@ export async function registerSuperagentSkills(ctx: any, write: (record: Record<
 export const SUBAGENT_INTERRUPT_TIMEOUT_MS = 10_000
 export const SUBAGENT_INTERRUPT_POLL_MS = 50
 
+/** 对账周期：默认 60s；`SUPERAGENT_STATUS_RECONCILE_MS` 只用于测试与排查。 */
+function reconcileIntervalMs() {
+  const raw = Number(process.env.SUPERAGENT_STATUS_RECONCILE_MS)
+  return Number.isFinite(raw) && raw >= 50 ? raw : STATUS_RECONCILE_INTERVAL_MS
+}
+
 const SUBAGENT_INTERRUPT_DESCRIPTION =
   "续跑已有子代理时先中断它正在执行的回合并等待真正停止，再投递本次消息；默认 true。设为 false 时完全保持原生 steer 语义。仅对传了 sessionID 的续跑生效，新建子代理不受影响。"
 
@@ -378,45 +398,140 @@ export async function interruptBeforeSubagentSteer(
   }
 }
 
-/** 原生 subagent 的工具输入：只关心续跑目标与 interrupt 开关。 */
-function subagentInput(input: unknown): { sessionID?: string; interrupt?: unknown; native: unknown } {
-  if (!isObject(input)) return { native: input }
+/** 原生 subagent 的工具输入：只关心续跑目标、interrupt 开关与后台标记。 */
+function subagentInput(input: unknown): {
+  sessionID?: string
+  interrupt?: unknown
+  background: boolean
+  native: unknown
+} {
+  if (!isObject(input)) return { background: false, native: input }
   const sessionID = typeof input.sessionID === "string" && input.sessionID.length > 0 ? input.sessionID : undefined
+  const background = input.background === true
   const { interrupt, ...native } = input
-  return { sessionID, interrupt, native }
+  return { sessionID, interrupt, background, native }
 }
+
+/** 派发成功后回调：让宿主接线登记看护项。 */
+export type SubagentDispatchHook = (input: {
+  callID?: string
+  childID: string
+  parentID?: string
+  description: string
+  agent: string
+  background: boolean
+  state: string
+}) => Promise<void> | void
 
 /**
  * 包装原生 subagent 执行：续跑且 interrupt 未显式关闭时，先中断并等待目标
  * 真正停止，再把去掉 interrupt 的原生输入交给宿主。新建与 idle 不额外查询。
+ *
+ * 派发台账（ledger）在这里落定：中断结果、子会话 ID、后台标记与耗时都会写进去，
+ * 回执也挂到工具结果上，让 Superagent 当场看到这次派发发生了什么。
  */
 export async function executeSubagentWithInterrupt(
   ctx: any,
   execute: (input: any, context: any) => Promise<any>,
   input: unknown,
   context: any,
+  ledger?: DispatchLedger,
+  onDispatch?: SubagentDispatchHook,
 ) {
   const parsed = subagentInput(input)
-  if (parsed.sessionID && parsed.interrupt !== false) {
-    const started = Date.now()
-    const outcome = await interruptBeforeSubagentSteer(
-      {
-        getSession: (sessionID) => ctx.session.get({ sessionID }),
-        interrupt: (sessionID) => ctx.session.interrupt({ sessionID }),
-      },
-      parsed.sessionID,
-      context?.signal,
-    )
-    if (outcome === "interrupted") {
+  const callID = typeof context?.id === "string" ? context.id : undefined
+  const patch = (value: DispatchPatch) => {
+    if (callID) ledger?.update(callID, value)
+  }
+  const started = Date.now()
+  if (parsed.sessionID) {
+    if (parsed.interrupt === false) {
+      patch({ interrupt: "off" })
+    } else {
+      let outcome: SubagentInterruptOutcome
+      try {
+        outcome = await interruptBeforeSubagentSteer(
+          {
+            getSession: (sessionID) => ctx.session.get({ sessionID }),
+            interrupt: (sessionID) => ctx.session.interrupt({ sessionID }),
+          },
+          parsed.sessionID,
+          context?.signal,
+        )
+      } catch (cause) {
+        patch({ interrupt: "failed" })
+        if (callID) ledger?.warn(callID, `中断失败：${errorText(cause)}`)
+        log({
+          event: "status-dispatch",
+          decision: "error",
+          callID: callID ?? null,
+          childSessionID: parsed.sessionID,
+          interrupt: "failed",
+          cause: errorText(cause),
+        })
+        throw cause
+      }
+      if (outcome === "interrupted") {
+        log({
+          event: "subagent-interrupt",
+          decision: "allow",
+          childSessionID: parsed.sessionID,
+          elapsedMs: Date.now() - started,
+        })
+        patch({ interrupt: "interrupted" })
+      } else {
+        patch({ interrupt: "not-needed" })
+      }
+    }
+  }
+  const result = await execute(parsed.native, context)
+  const metadata = isObject(result?.metadata) ? result.metadata : {}
+  const childID =
+    typeof metadata.sessionID === "string" && metadata.sessionID ? metadata.sessionID : parsed.sessionID
+  const background = parsed.background || metadata.status === "running"
+  const state = typeof metadata.status === "string" ? metadata.status : background ? "running" : "completed"
+  patch({ childID, background, state, elapsedMs: Date.now() - started })
+  const record = callID ? ledger?.peek(callID) : undefined
+  if (record) {
+    attachDispatchReceipt(result, formatDispatchReceipt(record, { ok: true, state }))
+    log({
+      event: "status-dispatch",
+      decision: "allow",
+      callID: record.callID,
+      mode: record.mode,
+      childSessionID: childID ?? null,
+      parentID: record.parentID,
+      state,
+      interrupt: record.interrupt,
+      background,
+      evicted: record.evicted,
+      warnings: record.warnings,
+      elapsedMs: record.elapsedMs ?? null,
+    })
+  }
+  if (childID && onDispatch) {
+    const nativeInput = isObject(parsed.native) ? parsed.native : {}
+    try {
+      await onDispatch({
+        callID,
+        childID,
+        parentID: typeof context?.sessionID === "string" ? context.sessionID : undefined,
+        description: typeof nativeInput.description === "string" ? nativeInput.description : "",
+        agent: typeof nativeInput.agent === "string" ? nativeInput.agent : "",
+        background,
+        state,
+      })
+    } catch (cause) {
       log({
-        event: "subagent-interrupt",
-        decision: "allow",
-        childSessionID: parsed.sessionID,
-        elapsedMs: Date.now() - started,
+        event: "status-notify-failed",
+        decision: "error",
+        phase: "dispatch",
+        childSessionID: childID,
+        cause: errorText(cause),
       })
     }
   }
-  return execute(parsed.native, context)
+  return result
 }
 
 function hasSubagentInterruptField(input: any) {
@@ -459,7 +574,12 @@ const wrappedSubagentExecutes = new WeakSet<Function>()
  * 注册原生 subagent 的 schema 扩展与执行包装。schema 无法扩展时不包装：
  * 此时 interrupt:false 可能在宿主参数修复阶段被剥离，继续包装会违背显式 false。
  */
-export async function registerSubagentInterrupt(ctx: any, write: (record: Record<string, unknown>) => void = log) {
+export async function registerSubagentInterrupt(
+  ctx: any,
+  ledger?: DispatchLedger,
+  write: (record: Record<string, unknown>) => void = log,
+  onDispatch?: SubagentDispatchHook,
+) {
   if (typeof ctx?.tool?.transform !== "function") return undefined
   try {
     const registration = await ctx.tool.transform((editor: any) => {
@@ -503,7 +623,7 @@ export async function registerSubagentInterrupt(ctx: any, write: (record: Record
           }
           if (wrappedSubagentExecutes.has(execute)) return
           const wrapped = (input: any, context: any) =>
-            executeSubagentWithInterrupt(ctx, execute, input, context)
+            executeSubagentWithInterrupt(ctx, execute, input, context, ledger, onDispatch)
           wrappedSubagentExecutes.add(wrapped)
           mutable.execute = wrapped
         })
@@ -534,8 +654,55 @@ export default {
 
     // 原生 Skills 是静态流程资产，注册与协作总开关无关；失败只记日志。
     const skillRegistration = await registerSuperagentSkills(ctx)
+
+    /* ---------------- 状态回传：台账、看护、通知与对账 ---------------- */
+
+    /** 派发台账：回执、告警与中断结果都按 callID 记在这里。 */
+    const ledger = createDispatchLedger(DISPATCH_LEDGER_LIMIT)
+
+    /** 看护器：登记子代理、完成/后台通知与周期对账都在这里。 */
+    const watcher = createStatusWatcher({
+      readSession: async (sessionID) => ctx.session.get({ sessionID }),
+      readMessages: async (sessionID) => asArray(await ctx.session.context({ sessionID })),
+      readEntries: async (sessionID) => asArray(await ctx.session.instructions.entry.list({ sessionID })),
+      notifyParent: async (input) => {
+        if (typeof ctx.session?.synthetic !== "function") throw new Error("宿主不支持 session.synthetic")
+        await ctx.session.synthetic(input)
+      },
+      markRuntime: async (sessionID, background) => {
+        await markRuntimeBackground(ctx, { sessionID, background })
+      },
+      clearRuntime: async (sessionID) => {
+        await clearRuntimeState(ctx, sessionID)
+      },
+      write: log,
+      reconcileIntervalMs: reconcileIntervalMs(),
+    })
+
+    /** 派发成功后的接线：登记看护项并触发第一次收尾检查。 */
+    const onDispatch: SubagentDispatchHook = async (input) => {
+      if (!input.childID || !input.parentID) return
+      const record = input.callID ? ledger.peek(input.callID) : undefined
+      let rootID = record?.rootID
+      if (!rootID) {
+        try {
+          rootID = await findRoot(ctx, input.parentID)
+        } catch {
+          rootID = undefined
+        }
+      }
+      await watcher.register({
+        childID: input.childID,
+        parentID: input.parentID,
+        rootID,
+        description: record?.description || input.description,
+        agent: record?.agent || input.agent,
+        background: input.background,
+      })
+    }
+
     // 续跑消息默认先中断；schema 无法扩展时退回原生 steer，避免破坏显式 false。
-    const interruptRegistration = await registerSubagentInterrupt(ctx)
+    const interruptRegistration = await registerSubagentInterrupt(ctx, ledger, log, onDispatch)
 
     /** callID → 本次调用的登记信息；flagshipRoot/flagshipModel 记本次占的显式旗舰槽。 */
     const pending = new Map<
@@ -692,6 +859,16 @@ export default {
         typeof input?.model === "string" && input.model.trim() !== "" ? input.model : undefined
       // 任何显式 input.model 都登记到本次调用：成功后写独立于旗舰的委派标记。
       const delegatedModel = normalizeModelDelegationModel(explicitModel)
+      // 派发台账：协作开启的调用才登记，回执也只对登记过的调用生效。
+      ledger.begin(event.id, {
+        parentID: event.sessionID,
+        description: typeof input?.description === "string" ? input.description : "",
+        agent: typeof input?.agent === "string" ? input.agent : typeof event.agent === "string" ? event.agent : "",
+        model: explicitModel,
+        mode: steerTarget ? "steer" : "new",
+        decision: "allowed",
+        background: input?.background === true,
+      })
       let reserved: string | undefined
       let reservedFlagship: string | undefined
 
@@ -765,6 +942,7 @@ export default {
                   message,
                   ...base,
                 })
+                ledger.update(event.id, { decision: "denied", reason: "kept-model-locked" })
                 throw new DenyError(message)
               }
             }
@@ -890,6 +1068,7 @@ export default {
                   message,
                   ...base,
                 })
+                ledger.update(event.id, { decision: "denied", reason: "flagship-limit" })
                 throw new DenyError(message)
               }
             }
@@ -910,6 +1089,8 @@ export default {
               ...base,
             })
           }
+          if (steerRoot) ledger.update(event.id, { rootID: steerRoot })
+          ledger.update(event.id, { evicted: evictedIds })
           log({
             event: "subagent-steer",
             decision: "allow",
@@ -947,6 +1128,7 @@ export default {
         let flagLimit: number | undefined
         try {
           rootID = await findRoot(ctx, event.sessionID)
+          ledger.update(event.id, { rootID })
           // 先占槽再看子会话：并发调用必须互相看见，否则会同时放行、超发。
           bump(rootID, 1)
           reserved = rootID
@@ -990,6 +1172,8 @@ export default {
             cause: errorText(cause),
             ...base,
           })
+          // fail-open 不是静默的：回执里带上告警，模型能看见这次判定没查成。
+          ledger.warn(event.id, `查询失败，已放行：${errorText(cause)}`)
           return
         }
 
@@ -1027,6 +1211,7 @@ export default {
               cause: errorText(cause),
               ...base,
             })
+            ledger.warn(event.id, `保护名单读取失败，已放行：${errorText(cause)}`)
             return
           }
         }
@@ -1211,6 +1396,7 @@ export default {
             ...flagshipFields,
             ...base,
           })
+          ledger.update(event.id, { decision: "denied", reason: "total-limit" })
           throw new DenyError(message)
         }
 
@@ -1242,9 +1428,11 @@ export default {
             ...flagshipFields,
             ...base,
           })
+          ledger.update(event.id, { decision: "denied", reason: "flagship-limit" })
           throw new DenyError(message)
         }
 
+        ledger.update(event.id, { evicted: evictedIds })
         log({
           event: "subagent-allowed",
           decision: "allow",
@@ -1277,6 +1465,8 @@ export default {
           cause: errorText(cause),
           ...base,
         })
+        // fail-open 不是静默的：回执里带上告警，模型能看见这次判定没查成。
+        ledger.warn(event.id, `插件判定异常，已放行：${errorText(cause)}`)
       }
     })
 
@@ -1488,7 +1678,16 @@ export default {
     const resetSubscription = (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.created", "session.step.ended", "session.execution.succeeded", "session.model.selected"],
+          types: [
+            "session.created",
+            "session.step.ended",
+            "session.execution.succeeded",
+            "session.execution.failed",
+            "session.execution.interrupted",
+            "session.shell.started",
+            "session.shell.ended",
+            "session.model.selected",
+          ],
           signal: resetAbort.signal,
         })) {
           if (event?.type === "session.created") {
@@ -1519,6 +1718,33 @@ export default {
               })
             }
             continue
+          }
+          // 状态回传：子会话结束与 shell 起止只驱动看护项，不参与限额计数清零。
+          if (
+            event?.type === "session.execution.succeeded" ||
+            event?.type === "session.execution.failed" ||
+            event?.type === "session.execution.interrupted" ||
+            event?.type === "session.shell.started" ||
+            event?.type === "session.shell.ended"
+          ) {
+            const watchedID = eventSessionID(event)
+            if (watchedID) {
+              if (event.type === "session.shell.ended") {
+                watcher.settle(watchedID, { delayMs: SHELL_SETTLE_DELAY_MS })
+              } else if (event.type === "session.shell.started") {
+                watcher.settle(watchedID)
+              } else {
+                const state: CompletionState =
+                  event.type === "session.execution.failed"
+                    ? "error"
+                    : event.type === "session.execution.interrupted"
+                      ? "cancelled"
+                      : "completed"
+                watcher.settle(watchedID, { state })
+              }
+            }
+            // 成功事件还要清零限额计数并触发复核，走原有路径。
+            if (event?.type !== "session.execution.succeeded") continue
           }
           const sessionID = eventSessionID(event)
           if (!sessionID) continue
@@ -1568,6 +1794,9 @@ export default {
       } catch {}
       try {
         probeTimer.stop()
+      } catch {}
+      try {
+        watcher.stop()
       } catch {}
       try {
         await interruptRegistration?.dispose?.()

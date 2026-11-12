@@ -406,6 +406,12 @@ export function SidebarAgents(props: {
     if (!value) return SUPERAGENT_DEFAULTS.criticEnabled
     return value === "true" || value === "1"
   })
+  /** 子代理状态监测：只有明确的 false 才停用，其余按启用处理（与服务端口径一致）。 */
+  const statusWatch = createMemo(() => {
+    const value = instructionText(INSTRUCTION_KEYS.statusWatch).trim().toLowerCase()
+    if (!value) return SUPERAGENT_DEFAULTS.statusWatch
+    return value !== "false"
+  })
   /** `GLM-5.3 · 连续3次失败切换 · 已启用`; `未设置` without a model. */
   const fallbackSummary = createMemo(() => {
     const label = modelEntryLabel(INSTRUCTION_KEYS.fallbackModel)
@@ -1024,6 +1030,22 @@ export function SidebarAgents(props: {
     })
   }
 
+  async function editStatusWatch() {
+    const selected = await props.context.ui.dialog.select<{ kind: "on" | "off" }>({
+      title: "子代理状态监测",
+      options: [
+        { value: { kind: "on" }, title: "已启用", description: "子代理结束或后台任务在跑时回传状态，并做周期对账" },
+        { value: { kind: "off" }, title: "已停用", description: "不登记监测、不做对账、不补发状态提醒" },
+      ],
+      current: { kind: statusWatch() ? "on" : "off" },
+    })
+    if (!selected) return
+    await putInstruction(INSTRUCTION_KEYS.statusWatch, selected.kind === "on" ? "true" : "false")
+    props.context.ui.toast.show({
+      message: selected.kind === "on" ? "已启用子代理状态监测。" : "已停用子代理状态监测。",
+    })
+  }
+
   async function openPolicyEditor() {
     await loadInstructions()
     while (true) {
@@ -1230,6 +1252,11 @@ export function SidebarAgents(props: {
           description: criticEnabled() ? "已启用" : "已停用",
         },
         {
+          value: { kind: "statusWatch" },
+          title: "子代理状态监测",
+          description: statusWatch() ? "已启用" : "已停用",
+        },
+        {
           value: { kind: "auto" },
           title: "配置全局自动模型",
           description: autoModels().length > 0 ? `${autoModels().length} 个已选模型` : "未配置（禁用）",
@@ -1255,6 +1282,7 @@ export function SidebarAgents(props: {
     if (selected.kind === "subagentFallbackModel") return editFallbackModel("subagent")
     if (selected.kind === "fallbackEnabled") return editFallbackEnabled()
     if (selected.kind === "criticEnabled") return editCriticEnabled()
+    if (selected.kind === "statusWatch") return editStatusWatch()
     return configureAutoModels()
   }
 

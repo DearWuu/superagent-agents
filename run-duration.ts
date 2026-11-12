@@ -3,6 +3,8 @@
  * 共用同一阈值语义（30 分钟）。这里只产生文案，不中断、不淘汰任何会话。
  */
 
+import { RUNTIME_METADATA_KEY, RUNTIME_STATE_BACKGROUND } from "./subagent-status"
+
 /** 超时警示阈值：运行超过 30 分钟即标记。 */
 export const LONG_RUNNING_THRESHOLD_MS = 30 * 60 * 1000
 
@@ -16,6 +18,7 @@ export function formatRunDuration(elapsedMs: number) {
 type SessionStatusInfo = {
   outcome?: string
   time?: { busy?: number; idle?: number }
+  metadata?: Record<string, unknown>
 }
 
 /**
@@ -47,7 +50,23 @@ export type SessionStatusView = {
 }
 
 /**
- * 一行的状态。优先级：活跃执行集合 → 结束结果 → busy/idle 时间戳兜底。
+ * 运行状态标记派生的视图：子代理回合已结束、后台任务还在跑。
+ * 标记缺失或非法时返回 undefined，交给常规状态判定。
+ */
+export function runtimeStatusView(metadata: Record<string, unknown> | undefined): SessionStatusView | undefined {
+  if (!metadata) return undefined
+  const runtime = metadata[RUNTIME_METADATA_KEY]
+  if (typeof runtime !== "object" || runtime === null || Array.isArray(runtime)) return undefined
+  const marker = runtime as Record<string, unknown>
+  if (marker.state !== RUNTIME_STATE_BACKGROUND) return undefined
+  const background = marker.background
+  const count = Array.isArray(background) ? background.length : 0
+  if (count <= 0) return undefined
+  return { glyph: "⏳", text: `后台 ${count} 个任务`, longRunning: false }
+}
+
+/**
+ * 一行的状态。优先级：活跃执行集合 → 运行状态标记 → 结束结果 → busy/idle 时间戳兜底。
  * 只有运行中的行显示时长；root 行与结束态不显示。
  */
 export function sessionStatusView(
@@ -57,13 +76,18 @@ export function sessionStatusView(
 ): SessionStatusView {
   const outcome = info?.outcome
   const busy = info?.time?.busy
-  if (sessionRunning(running) || (!outcome && inferredRunning(info))) {
+  const runningView = (): SessionStatusView => {
     if (!options.duration || busy === undefined) return { glyph: "●", text: "进行中", longRunning: false }
     const elapsed = Math.max(0, options.now - busy)
     const longRunning = elapsed >= LONG_RUNNING_THRESHOLD_MS
     const suffix = longRunning ? " ⚠" : ""
     return { glyph: "●", text: `进行中 ${formatRunDuration(elapsed)}${suffix}`, longRunning }
   }
+  if (sessionRunning(running)) return runningView()
+  // 回合已结束但后台任务还在跑：先显示后台状态，再看结束结果。
+  const runtime = runtimeStatusView(info?.metadata)
+  if (runtime) return runtime
+  if (!outcome && inferredRunning(info)) return runningView()
   if (sessionEnded(info, running)) {
     if (outcome === "succeeded") return { glyph: "✓", text: "已完成", longRunning: false }
     if (outcome === "failed") return { glyph: "✗", text: "失败", longRunning: false }

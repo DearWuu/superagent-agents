@@ -16,6 +16,7 @@ import {
   withoutFlagshipMarker,
 } from "./flagship-admission"
 import { withModelDelegationMarker } from "./model-delegation"
+import { RUNTIME_METADATA_KEY, RUNTIME_STATE_BACKGROUND, isSessionBusy } from "./subagent-status"
 import {
   DEFAULT_MAX_SUBAGENTS,
   KEPT_SUBAGENTS_KEY,
@@ -157,6 +158,44 @@ export async function markModelDelegationSession(
     model: formatModelRef(input.model),
     phase: input.phase ?? "completed",
   })
+  return true
+}
+
+/**
+ * 写运行状态标记：子代理回合已结束、后台任务仍在跑。
+ * 合并写回，保留旗舰与显式委派标记。
+ */
+export async function markRuntimeBackground(
+  ctx: any,
+  input: { sessionID: string; background: unknown; at?: number },
+): Promise<boolean> {
+  const existing = await readSessionMetadata(ctx, input.sessionID)
+  const next = {
+    ...(existing ?? {}),
+    [RUNTIME_METADATA_KEY]: {
+      state: RUNTIME_STATE_BACKGROUND,
+      at: input.at ?? Date.now(),
+      background: input.background,
+    },
+  }
+  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  log({
+    event: "runtime-marked",
+    decision: "allow",
+    sessionID: input.sessionID,
+    state: RUNTIME_STATE_BACKGROUND,
+  })
+  return true
+}
+
+/** 清掉运行状态标记：后台任务结束或通知送达后调用；其余标记原样保留。 */
+export async function clearRuntimeState(ctx: any, sessionID: string): Promise<boolean> {
+  const existing = await readSessionMetadata(ctx, sessionID)
+  if (!existing || !(RUNTIME_METADATA_KEY in existing)) return false
+  const next = { ...existing }
+  delete next[RUNTIME_METADATA_KEY]
+  await ctx.session.update({ sessionID, metadata: next })
+  log({ event: "runtime-cleared", decision: "allow", sessionID })
   return true
 }
 
@@ -352,7 +391,7 @@ export function toChild(item: any, now: number): Child {
   const outcome = item?.outcome ?? null
   // time.busy 是最近一次执行的开始，time.idle 是最近一次执行的结束；
   // 终态会把 idle 推到 busy 之后，所以 busy > idle（或没有 idle）即仍在运行。
-  const running = busy !== undefined && (idle === undefined || busy > idle)
+  const running = isSessionBusy(item)
   const finished = outcome != null
   // 被 shutdown 打断的子会话：outcome 为空、开了工却没有 idle，既没结束也早就不在跑了，
   // 于是永远进不了淘汰候选、永久占着名额。开工时间超过阈值就按陈旧处理，允许兜底淘汰。
