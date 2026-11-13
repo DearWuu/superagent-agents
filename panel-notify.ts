@@ -116,8 +116,8 @@ export async function notifyManualOp(
       text: manualOpText(input.action, detail),
       description: "用户手动操作",
       metadata,
-      // 手动操作不插当前轮：排队到下一轮，避免打断正在进行的推理。
-      delivery: "queue",
+      // 操作发生时立刻投递：通知成为对话里的一条 inline 记录、随会话上移；会话空闲时宿主会唤醒它跑一轮，因此不打断正在进行的推理，但一定会被读到。
+      delivery: "steer",
     })
     return true
   } catch {

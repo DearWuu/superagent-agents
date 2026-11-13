@@ -83,8 +83,10 @@ describe("notifyManualOp", () => {
     expect(calls[0].sessionID).toBe("ses_root")
     expect(calls[0].description).toBe("用户手动操作")
     expect(calls[0].text).toContain("用户")
-    // 手动操作不插当前轮：统一排队投递。
-    expect(calls[0].delivery).toBe("queue")
+    // 手动操作在操作发生时立即投递，进入对话记录并随会话上移。
+    expect(calls[0].delivery).toBe("steer")
+    // 保持默认唤醒语义：空闲会话由宿主唤醒读这条通知，不需要显式 resume。
+    expect("resume" in calls[0]).toBe(false)
     expect(calls[0].metadata).toEqual({
       source: "superagent-agents",
       kind: "manual-op",
@@ -154,7 +156,7 @@ describe("createManualNotifier", () => {
     expect(await notifier.notify({ action: "delete", childID: "ses_x" })).toBe(true)
     expect(calls).toHaveLength(1)
     expect(calls[0].metadata.action).toBe("delete")
-    expect(calls[0].delivery).toBe("queue")
+    expect(calls[0].delivery).toBe("steer")
     notifier.dispose()
   })
 
@@ -171,8 +173,8 @@ describe("createManualNotifier", () => {
     expect(await second).toBe(true)
     expect(calls).toHaveLength(1)
     expect(String(calls[0].text)).toContain("乙")
-    // 所有手动操作通知都排队投递。
-    expect(calls.every((call: any) => call.delivery === "queue")).toBe(true)
+    // 所有手动操作通知都在操作发生时立即投递。
+    expect(calls.every((call: any) => call.delivery === "steer")).toBe(true)
     notifier.dispose()
   })
 

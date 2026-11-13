@@ -300,8 +300,8 @@ test("deleting a subagent tells the Superagent that the user did it", async () =
   expect(synthetics).toHaveLength(1)
   expect(synthetics[0].sessionID).toBe("root")
   expect(synthetics[0].description).toBe("用户手动操作")
-  // 手动操作排队投递，不插当前轮。
-  expect(synthetics[0].delivery).toBe("queue")
+  // 手动操作立即投递成对话里的 inline 记录，随会话上移。
+  expect(synthetics[0].delivery).toBe("steer")
   expect(String(synthetics[0].text)).toContain("用户")
   expect(String(synthetics[0].text)).toContain("删除")
   expect(synthetics[0].metadata).toEqual({
