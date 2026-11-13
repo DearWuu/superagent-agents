@@ -314,7 +314,7 @@ function fallbackTimeoutMs() {
 }
 
 const SUBAGENT_INTERRUPT_DESCRIPTION =
-  "续跑已有子代理时先中断它正在执行的回合并等待真正停止，再投递本次消息；默认 true。设为 false 时完全保持原生 steer 语义。仅对传了 sessionID 的续跑生效，新建子代理不受影响。"
+  "续跑已有子代理时默认排队，不打断当前运行；只有显式 true 才先中断并等待停止。设为 false 与缺省行为相同。"
 
 function abortError(signal?: AbortSignal) {
   const reason = signal?.reason
@@ -435,8 +435,9 @@ export type SubagentDispatchHook = (input: {
 }) => Promise<void> | void
 
 /**
- * 包装原生 subagent 执行：续跑且 interrupt 未显式关闭时，先中断并等待目标
- * 真正停止，再把去掉 interrupt 的原生输入交给宿主。新建与 idle 不额外查询。
+ * 包装原生 subagent 执行：续跑默认排队不抢占，直接把去掉 interrupt 的原生输入
+ * 交给宿主（原生 steer 自己排队）；只有显式 interrupt:true 才先中断并等待目标
+ * 真正停止再投递。新建与 idle 不额外查询。
  *
  * 派发台账（ledger）在这里落定：中断结果、子会话 ID、后台标记与耗时都会写进去，
  * 回执也挂到工具结果上，让 Superagent 当场看到这次派发发生了什么。
@@ -455,8 +456,11 @@ export async function executeSubagentWithInterrupt(
     if (callID) ledger?.update(callID, value)
   }
   const started = Date.now()
+  // 调用已取消：不查询、不中断、不投递。
+  if (context?.signal?.aborted) throw abortError(context.signal)
   if (parsed.sessionID) {
-    if (parsed.interrupt === false) {
+    if (parsed.interrupt !== true) {
+      // 默认排队：不抢占当前运行，交给原生 steer 排队投递。
       patch({ interrupt: "off" })
     } else {
       let outcome: SubagentInterruptOutcome
@@ -583,7 +587,7 @@ const wrappedSubagentExecutes = new WeakSet<Function>()
 
 /**
  * 注册原生 subagent 的 schema 扩展与执行包装。schema 无法扩展时不包装：
- * 此时 interrupt:false 可能在宿主参数修复阶段被剥离，继续包装会违背显式 false。
+ * 此时宿主可能已剥离未知的 interrupt 字段，继续包装会误判调用方的意图。
  */
 export async function registerSubagentInterrupt(
   ctx: any,
@@ -611,7 +615,7 @@ export async function registerSubagentInterrupt(
             write({
               event: "subagent-interrupt-unavailable",
               decision: "error",
-              note: "原生 subagent schema 无法追加 interrupt，保留原生 steer 以避免剥离显式 false",
+              note: "原生 subagent schema 无法追加 interrupt，保留原生 steer，不包装执行",
             })
             return
           }
@@ -712,7 +716,7 @@ export default {
       })
     }
 
-    // 续跑消息默认先中断；schema 无法扩展时退回原生 steer，避免破坏显式 false。
+    // 续跑默认排队不抢占；只有显式 interrupt:true 才先中断。schema 无法扩展时不包装。
     const interruptRegistration = await registerSubagentInterrupt(ctx, ledger, log, onDispatch)
 
     /** callID → 本次调用的登记信息；flagshipRoot/flagshipModel 记本次占的显式旗舰槽。 */

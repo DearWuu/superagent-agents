@@ -118,7 +118,7 @@ GitHub 是当前的分发方式，npm 包还没发布；下面写法等包上线
 
 **先判断再派工**：派工前先判断任务是否适合 Flash，再决定新建并行、合并还是续跑。适合 Flash 的是边界清晰、步骤机械、能写成短任务契约、结果可快速验证的工作；目标含糊、跨模块设计、需要取舍、强耦合或高风险不可逆操作不适合。无关联的独立任务默认新建 Subagent 并尽量并行；能独立验收、上下文可独立携带的任务尽量拆分。同文件或强耦合、并行会冲突的任务合并给一个子代理。续跑只用于同一模块的后续修改、验收打回后的返工与类似任务的迭代，用 `input.sessionID` steer；同一目标禁止重复派工，并行仍受子代理总上限与旗舰上限约束，不得绕过。
 
-**续跑中断语义**：续跑运行中的子代理时，`interrupt` 默认 `true`，会先中断当前运行再发送新任务；显式传 `interrupt: false` 会保留当前运行并直接 steer。
+**续跑中断语义**：续跑运行中的子代理时默认排队，不打断当前运行，由原生 steer 排队投递；只有显式传 `interrupt: true` 才先中断当前运行、等它停下再发送新任务；`interrupt: false` 与缺省行为相同。
 
 **七字段任务契约**：目标、范围、既定设计、关键指针、验收、歧义处理、交付格式，七项写全才算合格任务书。
 
@@ -174,7 +174,7 @@ OpenCode 按技能描述在匹配场景按需加载。若已存在同名用户�
 
 每次子代理派发都有可追踪的状态，Superagent 当场就能看到「派了什么、子会话是谁、后台还有什么在跑」，结束后也会收到明确的完成确认。
 
-**派发回执**：协作开启的调用，工具结果末尾会附一行回执（`[superagent] dispatch=ok · mode=new · child=ses_x · state=running · model=p/m · interrupt=not-needed · evicted=ses_y · 完成后自动通知`）。字段含义：`dispatch` 派发是否成功、`mode` 新建还是续跑、`child` 子会话 ID、`state` 子会话当前状态、`model` 显式指定的模型、`interrupt` 续跑前置中断结果（`not-needed` / `interrupted` / `off` / `failed`）、`evicted` 本次淘汰的子会话。判定失败但已放行（fail-open）时追加 `warning=`，不再静默。
+**派发回执**：协作开启的调用，工具结果末尾会附一行回执（`[superagent] dispatch=ok · mode=new · child=ses_x · state=running · model=p/m · interrupt=not-needed · evicted=ses_y · 完成后自动通知`）。字段含义：`dispatch` 派发是否成功、`mode` 新建还是续跑、`child` 子会话 ID、`state` 子会话当前状态、`model` 显式指定的模型、`interrupt` 续跑前置中断结果（`not-needed` 无需中断 / `interrupted` 已抢占并停下 / `off` 未抢占、默认排队 / `failed` 中断失败）、`evicted` 本次淘汰的子会话。判定失败但已放行（fail-open）时追加 `warning=`，不再静默。
 
 **完成通知**：子代理完成、失败或中断时，插件向主会话投递一条 `<subagent sessionID="..." state="completed|error|cancelled">…</subagent>` 通知，正文是子代理的最终输出（超长截断）。原生已经通知过的子代理不重复发。收尾通知同样判重：主会话里已经有这个子代理的终态通知（原生、插件或前台工具结果正文）时不再补发，只清掉运行标记。
 

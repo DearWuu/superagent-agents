@@ -96,6 +96,7 @@ function harness(options: HarnessOptions) {
   const synthetics: any[] = []
   const updates: Array<{ sessionID: string; metadata?: Record<string, unknown> }> = []
   const calls: any[] = []
+  const interrupts: string[] = []
   const events = eventQueue()
   const transformCallbacks: Array<(editor: any) => void> = []
 
@@ -192,6 +193,7 @@ function harness(options: HarnessOptions) {
         return { id: `msg_syn_${synthetics.length}` }
       },
       async interrupt({ sessionID }: { sessionID: string }) {
+        interrupts.push(sessionID)
         if (options.interruptError) throw options.interruptError
         const found = sessions.get(sessionID)
         if (found) found.time = { ...found.time, busy: found.time?.busy ?? 1, idle: (found.time?.busy ?? 1) + 1 }
@@ -221,6 +223,7 @@ function harness(options: HarnessOptions) {
     synthetics,
     updates,
     calls,
+    interrupts,
     events,
     sessions,
     messages,
@@ -364,25 +367,40 @@ describe("派发回执", () => {
 })
 
 describe("interrupt 结果回传", () => {
-  test("运行中的子会话被中断：回执写 interrupt=interrupted", async () => {
+  test("默认续跑不抢占：回执写 interrupt=off，且不调用 interrupt", async () => {
     tempState()
     const h = await setup({
       sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
     })
     const result = await dispatch(h, { sessionID: "ses_child" })
-    expect(String(result.output)).toContain("interrupt=interrupted")
+    expect(String(result.output)).toContain("interrupt=off")
     expect(String(result.output)).toContain("mode=steer")
+    expect(h.interrupts).toEqual([])
     await h.dispose()
     h.events.close()
   })
 
-  test("显式 interrupt:false：回执写 interrupt=off", async () => {
+  test("显式 interrupt:true：运行中的子会话被中断，回执写 interrupt=interrupted", async () => {
+    tempState()
+    const h = await setup({
+      sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
+    })
+    const result = await dispatch(h, { sessionID: "ses_child", interrupt: true })
+    expect(String(result.output)).toContain("interrupt=interrupted")
+    expect(String(result.output)).toContain("mode=steer")
+    expect(h.interrupts).toEqual(["ses_child"])
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("显式 interrupt:false：回执写 interrupt=off 且不调用 interrupt", async () => {
     tempState()
     const h = await setup({
       sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
     })
     const result = await dispatch(h, { sessionID: "ses_child", interrupt: false })
     expect(String(result.output)).toContain("interrupt=off")
+    expect(h.interrupts).toEqual([])
     await h.dispose()
     h.events.close()
   })
@@ -395,7 +413,7 @@ describe("interrupt 结果回传", () => {
     })
     let failed: any
     try {
-      await dispatch(h, { sessionID: "ses_child" })
+      await dispatch(h, { sessionID: "ses_child", interrupt: true })
     } catch (cause) {
       failed = cause
     }

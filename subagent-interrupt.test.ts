@@ -1,5 +1,6 @@
 /**
- * 原生 subagent 续跑默认先中断的接线与边界：schema 追加 interrupt、运行中先停后投递、
+ * 原生 subagent 续跑默认排队、显式 interrupt:true 才抢占的接线与边界：
+ * schema 追加 interrupt、默认不中断、显式 true 才先停后投递、
  * interrupt:false / idle / 新建透传、失败与取消明确抛错。
  */
 import { afterEach, describe, expect, test } from "bun:test"
@@ -229,18 +230,18 @@ describe("subagent interrupt schema", () => {
   })
 })
 
-describe("subagent 续跑默认先中断", () => {
-  test("运行中默认 get→interrupt→确认 idle→投递，且不把 interrupt 传给宿主", async () => {
+describe("subagent 续跑默认排队", () => {
+  test("默认续跑不抢占：不查询、不中断，原生 execute 收到去掉 interrupt 的输入", async () => {
     const h = await setup({
       sessions: [{ id: "ses_child", time: { created: 1, busy: 2 } }],
     })
     await h.tool.execute(steerInput(), { signal: new AbortController().signal })
-    expect(h.calls).toEqual(["get:running", "interrupt", "get:idle", "execute"])
+    expect(h.calls).toEqual(["execute"])
     expect(h.executions).toEqual([{ agent: "worker", prompt: "continue", sessionID: "ses_child" }])
     await h.dispose()
   })
 
-  test("interrupt:false 完全保持原生 steer：不查询、不中断", async () => {
+  test("默认续跑显式 interrupt:false：同样不查询、不中断", async () => {
     const h = await setup({
       sessions: [{ id: "ses_child", time: { created: 1, busy: 2 } }],
     })
@@ -250,14 +251,36 @@ describe("subagent 续跑默认先中断", () => {
     await h.dispose()
   })
 
-  test("宿主重复应用 transform 不会重复包 execute：默认仍只中断一次", async () => {
+  test("显式 interrupt:true：get→interrupt→确认 idle→投递，且不把 interrupt 传给宿主", async () => {
+    const h = await setup({
+      sessions: [{ id: "ses_child", time: { created: 1, busy: 2 } }],
+    })
+    await h.tool.execute(steerInput({ interrupt: true }), { signal: new AbortController().signal })
+    expect(h.calls).toEqual(["get:running", "interrupt", "get:idle", "execute"])
+    expect(h.executions).toEqual([{ agent: "worker", prompt: "continue", sessionID: "ses_child" }])
+    await h.dispose()
+  })
+
+  test("宿主重复应用 transform 不会重复包 execute：显式 true 仍只中断一次", async () => {
+    const h = await setup({
+      sessions: [{ id: "ses_child", time: { created: 1, busy: 2 } }],
+    })
+    h.applyToolTransforms()
+    h.applyToolTransforms()
+    await h.tool.execute(steerInput({ interrupt: true }), { signal: new AbortController().signal })
+    expect(h.calls).toEqual(["get:running", "interrupt", "get:idle", "execute"])
+    expect(h.executions).toEqual([{ agent: "worker", prompt: "continue", sessionID: "ses_child" }])
+    await h.dispose()
+  })
+
+  test("宿主重复应用 transform 后默认续跑仍不抢占", async () => {
     const h = await setup({
       sessions: [{ id: "ses_child", time: { created: 1, busy: 2 } }],
     })
     h.applyToolTransforms()
     h.applyToolTransforms()
     await h.tool.execute(steerInput(), { signal: new AbortController().signal })
-    expect(h.calls).toEqual(["get:running", "interrupt", "get:idle", "execute"])
+    expect(h.calls).toEqual(["execute"])
     expect(h.executions).toEqual([{ agent: "worker", prompt: "continue", sessionID: "ses_child" }])
     await h.dispose()
   })
@@ -278,7 +301,7 @@ describe("subagent 续跑默认先中断", () => {
     const h = await setup({
       sessions: [{ id: "ses_child", time: { created: 1, busy: 2, idle: 3 } }],
     })
-    await h.tool.execute(steerInput(), { signal: new AbortController().signal })
+    await h.tool.execute(steerInput({ interrupt: true }), { signal: new AbortController().signal })
     expect(h.calls).toEqual(["get:idle", "execute"])
     await h.dispose()
   })
@@ -295,7 +318,7 @@ describe("subagent 续跑默认先中断", () => {
       sessions: [{ id: "ses_child", time: { created: 1, busy: 2 } }],
       interruptError: new Error("host refused"),
     })
-    const error = await rejected(h.tool.execute(steerInput(), { signal: new AbortController().signal }))
+    const error = await rejected(h.tool.execute(steerInput({ interrupt: true }), { signal: new AbortController().signal }))
     expect(String(error.message)).toContain("中断子会话 ses_child 失败")
     expect(String(error.message)).toContain("host refused")
     expect(h.calls).toEqual(["get:running", "interrupt"])
@@ -321,7 +344,7 @@ describe("subagent 续跑默认先中断", () => {
       stopsOnInterrupt: false,
     })
     const controller = new AbortController()
-    const pending = h.tool.execute(steerInput(), { signal: controller.signal })
+    const pending = h.tool.execute(steerInput({ interrupt: true }), { signal: controller.signal })
     await h.interrupted.promise
     controller.abort()
     const error = await rejected(pending)

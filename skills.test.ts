@@ -65,9 +65,10 @@ describe("superagent skills", () => {
       expect(content).toContain("续跑只用于同一模块")
       expect(content).toContain("禁止重复派工")
       expect(content).toContain("不得绕过")
-      expect(content).toContain("会先中断当前运行再发送新任务")
+      expect(content).toContain("默认排队，不打断当前运行")
+      expect(content).toContain("interrupt: true")
       expect(content).toContain("interrupt: false")
-      expect(content).toContain("会保留当前运行并直接 steer")
+      expect(content).toContain("与缺省行为相同")
     }
   })
 
