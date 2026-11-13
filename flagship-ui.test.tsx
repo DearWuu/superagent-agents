@@ -189,6 +189,8 @@ function harness(options?: {
           if (index >= 0) sessions.splice(index, 1)
           byId.delete(sessionID)
         },
+        /** 面板手动操作回传：真实宿主有这条 API，假客户端也要跟上。 */
+        synthetic: async () => ({ id: "syn_1" }),
       },
     },
     keymap: { layer: () => {} },

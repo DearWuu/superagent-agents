@@ -21,6 +21,7 @@
     "panel-instructions.ts",
     "panel-rows.ts",
     "panel-model-actions.tsx",
+    "panel-notify.ts",
     "panel-eviction.ts",
     "server-state.ts",
     "server-models.ts",

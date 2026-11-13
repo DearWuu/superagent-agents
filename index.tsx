@@ -40,6 +40,7 @@ import { pickerKey, type PickerGroup } from "./model-picker"
 import { AgentPanelView } from "./panel-view"
 import { createInstructionActions } from "./panel-instructions"
 import { createModelActions } from "./panel-model-actions"
+import { createManualNotifier, type ManualOpAction, type ManualOpDetail } from "./panel-notify"
 import { createRowHelpers } from "./panel-rows"
 import { createEvictionActions } from "./panel-eviction"
 import {
@@ -779,11 +780,45 @@ export function SidebarAgents(props: {
   const clock = setInterval(() => setNow(Date.now()), 60_000)
   onCleanup(() => clearInterval(clock))
 
+  /**
+   * 面板手动操作回传：告诉 root 会话「这是用户手动做的」。
+   * 受「子代理状态监测」开关控制，连续操作防抖合并；投递失败只提示，不影响操作本身。
+   */
+  const manualNotifier = createManualNotifier(props.context, {
+    rootID: () => rootSessionID(),
+    enabled: () => statusWatch(),
+  })
+  onCleanup(() => manualNotifier.dispose())
+
+  async function notifyManual(input: {
+    action: ManualOpAction
+    childID?: string
+    childTitle?: string
+    detail?: ManualOpDetail
+    immediate?: boolean
+  }) {
+    const sent = await manualNotifier.notify(
+      {
+        action: input.action,
+        childID: input.childID,
+        childTitle: input.childTitle,
+        detail: input.detail,
+      },
+      { immediate: input.immediate },
+    )
+    if (!sent) props.context.ui.toast.show({ message: "已完成，但未能通知 Superagent。" })
+  }
+
   /** 协作模式总开关：只写当前 root 的 `superagent.collab-enabled` 条目。 */
   async function setCollabEnabled(enabled: boolean) {
     await putInstruction(INSTRUCTION_KEYS.collabEnabled, String(enabled))
     props.context.ui.toast.show({
       message: enabled ? "本会话 agents协作已启用。" : "本会话 agents协作已停用。",
+    })
+    await notifyManual({
+      action: "collab",
+      detail: { value: enabled ? "启用" : "停用" },
+      immediate: true,
     })
   }
 
@@ -911,6 +946,10 @@ export function SidebarAgents(props: {
         draft.maxSubagents = SUPERAGENT_DEFAULTS.maxSubagents
       })
       props.context.ui.toast.show({ message: "最大子代理数量已清除。" })
+      await notifyManual({
+        action: "max-subagents",
+        detail: { value: String(SUPERAGENT_DEFAULTS.maxSubagents) },
+      })
       return
     }
     const parsed = Number(text)
@@ -923,6 +962,7 @@ export function SidebarAgents(props: {
       draft.maxSubagents = parsed
     })
     props.context.ui.toast.show({ message: `最大子代理数量已设为 ${parsed}。` })
+    await notifyManual({ action: "max-subagents", detail: { value: String(parsed) } })
   }
 
   async function editMaxFlagshipSubagents() {
@@ -938,6 +978,10 @@ export function SidebarAgents(props: {
     if (!text) {
       await removeInstruction(INSTRUCTION_KEYS.maxFlagshipSubagents)
       props.context.ui.toast.show({ message: "旗舰子代理数量已清除。" })
+      await notifyManual({
+        action: "max-flagship",
+        detail: { value: String(DEFAULT_MAX_FLAGSHIP_SUBAGENTS) },
+      })
       return
     }
     const parsed = Number(text)
@@ -947,6 +991,7 @@ export function SidebarAgents(props: {
     }
     await putInstruction(INSTRUCTION_KEYS.maxFlagshipSubagents, parsed)
     props.context.ui.toast.show({ message: `旗舰子代理数量已设为 ${parsed}。` })
+    await notifyManual({ action: "max-flagship", detail: { value: String(parsed) } })
   }
 
   async function editAssignmentPrompt() {
@@ -1161,6 +1206,12 @@ export function SidebarAgents(props: {
         next: null,
       }).catch(() => {})
       props.context.ui.toast.show({ message: `${node.title} 已恢复跟随默认 L${contract.level}。` })
+      await notifyManual({
+        action: "oversight",
+        childID: sessionID,
+        childTitle: node.title,
+        detail: { value: `跟随默认 L${contract.level}` },
+      })
       return
     }
     await updateRoot((draft) => {
@@ -1176,6 +1227,12 @@ export function SidebarAgents(props: {
       next: selected.level,
     }).catch(() => {})
     props.context.ui.toast.show({ message: `${node.title} 的监管力度已固定为 L${selected.level}。` })
+    await notifyManual({
+      action: "oversight",
+      childID: sessionID,
+      childTitle: node.title,
+      detail: { value: `L${selected.level}` },
+    })
   }
 
   async function openSettings() {
@@ -1289,26 +1346,33 @@ export function SidebarAgents(props: {
   /** Deletes the Subagent session and its context; nothing is recreated. */
   async function deleteSubagent(node: AgentNode) {
     if (!node.sessionID) return
+    const sessionID = node.sessionID
+    const title = node.title
     const confirmed = await props.context.ui.dialog.confirm({
       title: "删除 Subagent",
       message: `删除 ${node.title}？该子会话及其上下文会被永久删除，无法恢复。`,
       label: { confirm: "删除 Subagent", cancel: "取消" },
     })
     if (!confirmed) return
-    await props.context.client.session.remove({ sessionID: node.sessionID })
+    await props.context.client.session.remove({ sessionID })
     props.context.ui.toast.show({ message: `${node.title} 已删除。` })
+    await notifyManual({ action: "delete", childID: sessionID, childTitle: title, immediate: true })
   }
 
   async function compactSubagent(node: AgentNode) {
     if (!node.sessionID) return
-    await props.context.client.session.compact({ sessionID: node.sessionID })
+    const sessionID = node.sessionID
+    const title = node.title
+    await props.context.client.session.compact({ sessionID })
     props.context.ui.toast.show({ message: `已发起 ${node.title} 的原生上下文压缩。` })
+    await notifyManual({ action: "compact", childID: sessionID, childTitle: title, immediate: true })
   }
 
   /** Protects a Subagent from automatic eviction and from model changes. */
   async function toggleKeep(node: AgentNode) {
     const sessionID = node.sessionID
     if (!sessionID) return
+    const title = node.title
     const kept = Boolean(root().keptSubagents?.[sessionID])
     const next = { ...root().keptSubagents }
     if (kept) delete next[sessionID]
@@ -1321,6 +1385,11 @@ export function SidebarAgents(props: {
       message: kept
         ? `${node.title} 已取消保护，可被自动淘汰，模型也可以被修改。`
         : `${node.title} 已保护，不会被自动淘汰，模型也不会被修改；取消保护后才可改。`,
+    })
+    await notifyManual({
+      action: kept ? "unkeep" : "keep",
+      childID: sessionID,
+      childTitle: title,
     })
   }
 

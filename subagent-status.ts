@@ -362,7 +362,7 @@ export function formatCompletionNotice(input: {
 
 /** 对账兜底的提醒正文。 */
 export function formatWatchReminder(input: { childID: string; state: CompletionState }): string {
-  return `[superagent] 监测到子代理 ${input.childID} 已停止（${input.state}），但此前未收到完成确认。请验收或续跑。`
+  return `[superagent] 监测到子代理 ${input.childID} 已停止（${input.state}），此前没有收到完成确认；如已知晓可忽略。`
 }
 
 function noticeMetadata(message: Record<string, any>): Record<string, any> | undefined {
@@ -483,6 +483,17 @@ export function hasNotice(
   return false
 }
 
+/**
+ * 终态通知判重：原生通知、插件自己的通知、前台工具结果正文里的 `<subagent ...>` 都算。
+ */
+export function terminalNoticeSeen(messages: unknown, childID: string, state: CompletionState): boolean {
+  return hasNotice(messages, {
+    childID,
+    state: noticeStates(state),
+    sources: ["subagent", "superagent-agents"],
+  })
+}
+
 /** 运行状态标记的元数据键：子代理回合已结束但后台任务还在跑。 */
 export const RUNTIME_METADATA_KEY = "superagent.runtime"
 /** 运行状态标记的取值：回合已结束、后台任务仍在跑。 */
@@ -557,6 +568,8 @@ export type StatusWatch = {
   startedAt: number
   /** 首次看到完成通知的时间；parent 之后一直没动作才补发提醒。 */
   noticeSeenAt?: number
+  /** 首次发现子代理停掉的时间：只 arm，提醒要等下一个对账周期。 */
+  reminderArmedAt?: number
   remindedStates: string[]
 }
 
@@ -618,6 +631,9 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
 
   const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+  /** 对账周期：提醒要等 arm 之后至少再过一个周期。 */
+  const reconcileIntervalMs = deps.reconcileIntervalMs ?? STATUS_RECONCILE_INTERVAL_MS
+
   /** 状态监测开关（root 级）：缺省与非法值一律按启用处理。 */
   const watchEnabledFor = async (rootID: string | undefined, fallbackID: string) => {
     const id = rootID ?? fallbackID
@@ -670,8 +686,23 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       void reconcile().catch((cause) =>
         write({ event: "status-notify-failed", decision: "error", phase: "reconcile", cause: errorText(cause) }),
       )
-    }, deps.reconcileIntervalMs ?? STATUS_RECONCILE_INTERVAL_MS)
+    }, reconcileIntervalMs)
     ;(reconcileTimer as any)?.unref?.()
+  }
+
+  /** 只更新运行状态标记：后台任务集合变了但不再重复通知时用。 */
+  const markRuntimeOnly = async (childID: string, jobs: BackgroundJob[]) => {
+    try {
+      await deps.markRuntime(childID, jobs)
+    } catch (cause) {
+      write({
+        event: "status-notify-failed",
+        decision: "error",
+        phase: "runtime-mark",
+        childSessionID: childID,
+        cause: errorText(cause),
+      })
+    }
   }
 
   /** 通知 parent：子代理回合已结束但后台任务还在跑。 */
@@ -694,17 +725,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       })
       return false
     }
-    try {
-      await deps.markRuntime(childID, jobs)
-    } catch (cause) {
-      write({
-        event: "status-notify-failed",
-        decision: "error",
-        phase: "runtime-mark",
-        childSessionID: childID,
-        cause: errorText(cause),
-      })
-    }
+    await markRuntimeOnly(childID, jobs)
     write({
       event: "status-background",
       decision: "allow",
@@ -808,6 +829,14 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     const jobs = collectBackgroundJobs(messages)
     if (jobs.length > 0) {
       const signature = jobSignature(jobs)
+      if (watch.backgroundNotified) {
+        // 这一代已经提醒过：任务集合变了只更新运行标记（面板计数跟着变），不再重复通知。
+        if (watch.backgroundSignature !== signature) {
+          watch.backgroundSignature = signature
+          await markRuntimeOnly(childID, jobs)
+        }
+        return
+      }
       if (watch.backgroundSignature !== signature) {
         const sent = await notifyBackground(childID, watch, jobs)
         if (sent) {
@@ -828,11 +857,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       } catch {
         parentMessages = []
       }
-      const seen = hasNotice(parentMessages, {
-        childID,
-        state: noticeStates(state),
-        sources: ["subagent", "superagent-agents"],
-      })
+      const seen = terminalNoticeSeen(parentMessages, childID, state)
       if (!seen) {
         const text = finalAssistantText(messages) || defaultCompletionText(state)
         const sent = await notifyCompletion(childID, watch, state, text)
@@ -840,10 +865,18 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       }
       watch.noticeSeenAt = Date.now()
     } else if (watch.backgroundNotified) {
-      // 前台派发：工具结果已经回传，只在先前提过后台任务时补一条收尾通知。
-      const sent = await notifyCompletion(childID, watch, state, BACKGROUND_DONE_TEXT)
-      if (!sent) return
-      watch.noticeSeenAt = Date.now()
+      // 前台派发：工具结果已经回传；parent 里已有终态通知（原生、插件或工具结果正文）就不再补，只清运行标记。
+      let parentMessages: any[] = []
+      try {
+        parentMessages = await deps.readMessages(watch.parentID)
+      } catch {
+        parentMessages = []
+      }
+      if (!terminalNoticeSeen(parentMessages, childID, state)) {
+        const sent = await notifyCompletion(childID, watch, state, BACKGROUND_DONE_TEXT)
+        if (!sent) return
+        watch.noticeSeenAt = Date.now()
+      }
     }
     try {
       await deps.clearRuntime(childID)
@@ -934,19 +967,23 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       // parent 自上次提醒之后动过：它已经在处理，不再打扰。
       const baseline = parentReminderBaseline.get(watch.parentID)
       if (baseline !== undefined && activity > baseline) continue
-      const noticed = hasNotice(parentMessages, {
-        childID,
-        state: noticeStates(state),
-        sources: ["subagent", "superagent-agents"],
-      })
-      if (noticed) {
-        // 刚发现通知：先给 parent 一次反应机会，下一轮再判断它有没有动。
-        if (watch.noticeSeenAt === undefined) {
-          watch.noticeSeenAt = now
-          continue
-        }
-        if (hasParentActivityAfter(parentMessages, watch.noticeSeenAt, childID)) continue
+      const noticed = terminalNoticeSeen(parentMessages, childID, state)
+      if (noticed && watch.noticeSeenAt === undefined) watch.noticeSeenAt = now
+      // 第一次发现子代理停了：只 arm 不提醒，给 parent 一个反应窗口，下一拍再决定。
+      if (watch.reminderArmedAt === undefined) {
+        watch.reminderArmedAt = now
+        write({
+          event: "status-reminder-armed",
+          decision: "allow",
+          childSessionID: childID,
+          parentID: watch.parentID,
+          state,
+        })
+        continue
       }
+      // arm 之后至少再过一个对账周期才提醒。
+      if (now - watch.reminderArmedAt < reconcileIntervalMs) continue
+      if (noticed && hasParentActivityAfter(parentMessages, watch.noticeSeenAt ?? watch.reminderArmedAt, childID)) continue
       // parent 正在跑就等它空闲。
       let parentInfo: Record<string, any> | undefined
       try {

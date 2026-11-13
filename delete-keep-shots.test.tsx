@@ -76,8 +76,14 @@ const [menu, setMenu] = createSignal<{ title: string; options: Array<{ title: st
 const removed: string[] = []
 const created: unknown[] = []
 const prompted: unknown[] = []
+/** 面板手动操作回传给 root 的 synthetic 通知。 */
+const synthetics: any[] = []
+/** toast 文案：用来确认动作本身真的执行了。 */
+const toasts: string[] = []
 /** The action the row menu returns; unset means the user just opened the menu. */
 let nextSelection: unknown
+/** 连续多个弹窗的返回值：行菜单 + 后续弹窗按顺序取。 */
+const selectionQueue: unknown[] = []
 const context = {
   theme,
   storage: {
@@ -127,6 +133,10 @@ const context = {
         byId.delete(sessionID)
         setSessionVersion((version) => version + 1)
       },
+      synthetic: async (input: unknown) => {
+        synthetics.push(input)
+        return { id: "syn_1" }
+      },
     },
   },
   keymap: { layer: () => {} },
@@ -139,15 +149,19 @@ const context = {
       prompt: async () => undefined,
       select: async (options: any) => {
         setMenu({ title: options.title, options: options.options })
-        const picked = nextSelection
-        nextSelection = undefined
+        const picked = selectionQueue.length > 0 ? selectionQueue.shift() : nextSelection
+        if (selectionQueue.length === 0) nextSelection = undefined
         if (picked !== undefined) setMenu(undefined)
         return picked
       },
       show: () => {},
     },
     router: { navigate: () => {} },
-    toast: { show: () => {} },
+    toast: {
+      show: ({ message }: { message: string }) => {
+        toasts.push(message)
+      },
+    },
   },
 }
 
@@ -248,4 +262,99 @@ test("deleting a subagent removes its row and creates nothing", async () => {
   expect(shot.charFrame).not.toContain("实现侧栏标记")
   expect(shot.charFrame).toContain("保留的子代理")
   save("delete-result", shot)
+})
+
+/** 等真实定时器：防抖通知不经过渲染帧，渲染器的 waitFor 等不到。 */
+async function waitUntil(check: () => boolean, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (!check() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return check()
+}
+
+/** 追加一个子会话并让面板重绘。 */
+function addSession(id: string, title: string) {
+  const item = {
+    id,
+    parentID: "root",
+    title,
+    agent: "executor",
+    model: flash,
+    time: { created: 10, updated: 200 },
+  }
+  sessions.push(item)
+  byId.set(id, item)
+  setSessionVersion((version) => version + 1)
+}
+
+test("deleting a subagent tells the Superagent that the user did it", async () => {
+  addSession("victim", "被删的子代理")
+  synthetics.length = 0
+  selectionQueue.push({ kind: "delete" })
+  await capture("被删的子代理", async (app) => {
+    const title = app.renderer.root.findDescendantById("sidebar.agents.title.victim")!
+    await app.mockMouse.click(title.x, title.y)
+    await app.waitFor(() => synthetics.length === 1, 8000)
+  })
+  expect(synthetics).toHaveLength(1)
+  expect(synthetics[0].sessionID).toBe("root")
+  expect(synthetics[0].description).toBe("用户手动操作")
+  // 手动操作排队投递，不插当前轮。
+  expect(synthetics[0].delivery).toBe("queue")
+  expect(String(synthetics[0].text)).toContain("用户")
+  expect(String(synthetics[0].text)).toContain("删除")
+  expect(synthetics[0].metadata).toEqual({
+    source: "superagent-agents",
+    kind: "manual-op",
+    action: "delete",
+    childID: "victim",
+  })
+})
+
+test("protecting a subagent tells the Superagent that the user did it", async () => {
+  addSession("keeper", "被保护的子代理")
+  synthetics.length = 0
+  selectionQueue.push({ kind: "keep" })
+  await capture("被保护的子代理", async (app) => {
+    const title = app.renderer.root.findDescendantById("sidebar.agents.title.keeper")!
+    await app.mockMouse.click(title.x, title.y)
+    // 保护类通知有防抖窗口，不走渲染帧，用真实定时器等。
+    await waitUntil(() => synthetics.length === 1)
+  })
+  expect(synthetics).toHaveLength(1)
+  expect(synthetics[0].sessionID).toBe("root")
+  expect(String(synthetics[0].text)).toContain("用户")
+  expect(String(synthetics[0].text)).toContain("保护")
+  expect(synthetics[0].metadata.action).toBe("keep")
+  expect(synthetics[0].metadata.childID).toBe("keeper")
+})
+
+test("releasing the protection tells the Superagent that the user did it", async () => {
+  synthetics.length = 0
+  selectionQueue.push({ kind: "keep" })
+  await capture("保留的子代理", async (app) => {
+    const title = app.renderer.root.findDescendantById("sidebar.agents.title.locked")!
+    await app.mockMouse.click(title.x, title.y)
+    await waitUntil(() => synthetics.length === 1)
+  })
+  expect(synthetics).toHaveLength(1)
+  expect(String(synthetics[0].text)).toContain("用户")
+  expect(String(synthetics[0].text)).toContain("解除了")
+  expect(synthetics[0].metadata.action).toBe("unkeep")
+})
+
+test("switching a model does not notify the Superagent", async () => {
+  addSession("modeler", "换模型的子代理")
+  synthetics.length = 0
+  toasts.length = 0
+  selectionQueue.push({ kind: "model" }, { kind: "auto" })
+  await capture("换模型的子代理", async (app) => {
+    const title = app.renderer.root.findDescendantById("sidebar.agents.title.modeler")!
+    await app.mockMouse.click(title.x, title.y)
+    await app.waitFor(() => toasts.some((item) => item.includes("已设为自动")), 8000)
+  })
+  // 模型切换照常执行，但不额外打扰 Superagent。
+  expect(toasts.some((item) => item.includes("已设为自动"))).toBe(true)
+  expect(synthetics).toEqual([])
 })

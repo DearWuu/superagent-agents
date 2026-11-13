@@ -492,7 +492,47 @@ describe("后台任务状态回传", () => {
     h.events.close()
   })
 
-  test("后台 shell 结束后补一条收尾通知并清掉运行标记", async () => {
+  test("后台 shell 结束后不再补第二条：终态通知已在工具结果里，只清运行标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: [rootSession, childSession()],
+      messages: {
+        ses_child: [backgroundShell()],
+        // 前台派发的工具结果里已经有终态通知：不再补收尾通知。
+        ses_root: [
+          {
+            id: "msg_tool",
+            type: "assistant",
+            parts: [
+              {
+                type: "tool",
+                state: {
+                  status: "completed",
+                  content: [
+                    { type: "text", text: '<subagent sessionID="ses_child" state="completed">done</subagent>' },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      },
+    })
+    await dispatch(h)
+    expect(await waitFor(() => h.synthetics.length === 1)).toBe(true)
+    // 后台 shell 结束：子会话里不再有运行中的后台任务。
+    h.setMessages("ses_child", [{ ...backgroundShell(), status: "exited" }])
+    h.events.push({ type: "session.shell.ended", data: { sessionID: "ses_child" } })
+    await waitFor(() => h.updates.some((update) => update.sessionID === "ses_child" && update.metadata?.["superagent.runtime"] === undefined), 4000)
+    // 只清运行标记，不补第二条通知。
+    expect(h.synthetics).toHaveLength(1)
+    const cleared = h.updates.filter((update) => update.sessionID === "ses_child").pop()
+    expect(cleared?.metadata?.["superagent.runtime"]).toBeUndefined()
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("parent 没有终态通知时仍补一条收尾通知并清掉运行标记", async () => {
     tempState()
     const h = await setup({
       sessions: [rootSession, childSession()],
@@ -509,6 +549,29 @@ describe("后台任务状态回传", () => {
     expect(String(done.text)).toContain("后台任务已全部结束")
     const cleared = h.updates.filter((update) => update.sessionID === "ses_child").pop()
     expect(cleared?.metadata?.["superagent.runtime"]).toBeUndefined()
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("同一代后台任务只提醒一次：任务集合变了只更新运行标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: [rootSession, childSession()],
+      messages: { ses_child: [backgroundShell("npm run dev")] },
+    })
+    await dispatch(h)
+    expect(await waitFor(() => h.synthetics.length === 1)).toBe(true)
+    // 又起了一个后台任务：只更新运行标记，不再发第二条 idle-background。
+    h.setMessages("ses_child", [backgroundShell("npm run build"), { ...backgroundShell("npm run dev"), shellID: "sh_0", id: "msg_shell0" }])
+    h.events.push({ type: "session.shell.started", data: { sessionID: "ses_child" } })
+    await waitFor(() => h.updates.length >= 3, 4000)
+    expect(h.synthetics).toHaveLength(1)
+    expect(h.synthetics[0].metadata?.state).toBe("idle-background")
+    // 运行标记更新到最后一次的任务集合。
+    const marked = h.updates.filter((update) => update.metadata?.["superagent.runtime"] !== undefined).pop()
+    const runtime = marked?.metadata?.["superagent.runtime"] as any
+    expect(runtime).toMatchObject({ state: "idle-background" })
+    expect(runtime.background).toHaveLength(2)
     await h.dispose()
     h.events.close()
   })
@@ -573,7 +636,7 @@ describe("周期对账兜底", () => {
     expect(await waitFor(() => h.synthetics.length === 1, 4000)).toBe(true)
     const reminder = h.synthetics[0]
     expect(String(reminder.text)).toBe(
-      "[superagent] 监测到子代理 ses_child 已停止（completed），但此前未收到完成确认。请验收或续跑。",
+      "[superagent] 监测到子代理 ses_child 已停止（completed），此前没有收到完成确认；如已知晓可忽略。",
     )
     expect(reminder.metadata).toEqual({
       source: "superagent-agents",
@@ -581,6 +644,34 @@ describe("周期对账兜底", () => {
       state: "watch-reminder",
     })
     expect(hookLog().some((record) => record.event === "status-reminder")).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(h.synthetics).toHaveLength(1)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("对账提醒等两拍：首个 tick 只 arm，下一拍才提醒", async () => {
+    tempState()
+    process.env.SUPERAGENT_STATUS_RECONCILE_MS = "60"
+    const h = await setup({
+      sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
+      result: { output: "done", metadata: { sessionID: "ses_child", status: "running" } },
+    })
+    await dispatch(h, { background: true })
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    const child = h.sessions.get("ses_child")!
+    child.outcome = "succeeded"
+    child.time = { created: 1, busy: 2, idle: 3 }
+    // 第一个 tick：只 arm，不提醒。
+    expect(await waitFor(() => hookLog().some((record) => record.event === "status-reminder-armed"), 4000)).toBe(true)
+    expect(h.synthetics).toEqual([])
+    // 第二个 tick 才提醒。
+    expect(await waitFor(() => h.synthetics.length === 1, 4000)).toBe(true)
+    const log = hookLog()
+    const armed = log.find((record) => record.event === "status-reminder-armed")!
+    const reminder = log.find((record) => record.event === "status-reminder")!
+    expect(Date.parse(reminder.at) - Date.parse(armed.at)).toBeGreaterThanOrEqual(50)
+    // 重复 tick 不重复提醒。
     await new Promise((resolve) => setTimeout(resolve, 300))
     expect(h.synthetics).toHaveLength(1)
     await h.dispose()

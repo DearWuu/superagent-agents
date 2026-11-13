@@ -279,7 +279,7 @@ describe("通知与提醒文案", () => {
 
   test("提醒文案写清子会话与状态", () => {
     expect(formatWatchReminder({ childID: "ses_x", state: "error" })).toBe(
-      "[superagent] 监测到子代理 ses_x 已停止（error），但此前未收到完成确认。请验收或续跑。",
+      "[superagent] 监测到子代理 ses_x 已停止（error），此前没有收到完成确认；如已知晓可忽略。",
     )
   })
 })
