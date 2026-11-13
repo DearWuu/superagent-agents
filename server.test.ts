@@ -238,12 +238,25 @@ function quotaError(message = "429 Too Many Requests") {
   return { type: "provider.rate-limit", message, status: 429 }
 }
 
-function fallbackHarness(overrides: { entries?: any[]; failSwitch?: boolean } = {}) {
+function fallbackHarness(
+  overrides: {
+    entries?: any[]
+    failSwitch?: boolean
+    timeoutMs?: number
+    canSwitch?: (input: { sessionID: string; rootID: string }) => Promise<boolean>
+    readEntries?: (input: { sessionID: string; rootID: string }) => Promise<any[]>
+    /** 切换过程中的钩子：用来制造「切换进行中被打断」的竞态。 */
+    onSwitch?: (input: { sessionID: string; model: any }) => void | Promise<void>
+  } = {},
+) {
   const calls: Array<{ sessionID: string; model: any }> = []
   const writes: Array<{ sessionID: string; limit: number }> = []
   const logs: Array<Record<string, any>> = []
+  /** 可推进的假时钟：用来测「到期回调还没排到」的同步路径。 */
+  const clock = { value: NOW }
   const controller = createQuotaFallback({
     switchModel: async (input) => {
+      if (overrides.onSwitch) await overrides.onSwitch(input)
       if (overrides.failSwitch) throw new Error("switch failed")
       calls.push(input)
     },
@@ -251,9 +264,30 @@ function fallbackHarness(overrides: { entries?: any[]; failSwitch?: boolean } = 
       writes.push(input)
     },
     log: (record) => logs.push(record),
-    now: () => NOW,
+    now: () => clock.value,
+    timeoutMs: overrides.timeoutMs ?? 20,
+    canSwitch: overrides.canSwitch,
+    readEntries: overrides.readEntries,
   })
-  return { controller, calls, writes, logs }
+  return { controller, calls, writes, logs, clock }
+}
+
+/** 等真实定时器：备用切换是计时器驱动的，不经过渲染帧。 */
+async function waitFor(check: () => boolean, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (!check() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  return check()
+}
+
+/** 可控 Promise：测试里手动 resolve，用来制造「等待期间被打断」的竞态。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
 }
 
 async function failTimes(
@@ -375,16 +409,17 @@ describe("denyMessage", () => {
 })
 
 describe("createQuotaFallback", () => {
-  test("连续 3 次限额失败才切换，切到 glm-5.3", async () => {
-    const { controller, calls } = fallbackHarness()
-    expect(await failTimes(controller, 2)).toEqual({ switched: false })
-    expect(calls).toHaveLength(0)
+  test("首次限额失败只开始计时，不切模型", async () => {
+    const { controller, calls, logs } = fallbackHarness()
     const result = await failTimes(controller, 1)
-    expect(result.switched).toBe(true)
-    expect(calls).toHaveLength(1)
-    expect(calls[0].sessionID).toBe("ses_root")
-    expect(calls[0].model).toEqual({ providerID: "zhipuai-coding-plan", id: "glm-5.3" })
-    expect(`${calls[0].model.providerID}/${calls[0].model.id}`).toBe("zhipuai-coding-plan/glm-5.3")
+    expect(result.switched).toBe(false)
+    expect(calls).toHaveLength(0)
+    expect(controller.isArmed("ses_root")).toBe(true)
+    const armed = logs.find((record) => record.event === "fallback-armed")
+    expect(armed?.failures).toBe(1)
+    expect(armed?.timeoutMs).toBe(20)
+    expect(typeof armed?.deadline).toBe("string")
+    controller.dispose()
   })
 
   test("子会话用 subagent-fallback-model", async () => {
@@ -394,38 +429,123 @@ describe("createQuotaFallback", () => {
       { key: "superagent.subagent-fallback-model", value: "zhipuai-coding-plan/glm-5.3" },
     ]
     const { controller, calls } = fallbackHarness({ entries })
-    await failTimes(controller, 3, { sessionID: "ses_child", isRoot: false, entries })
+    await failTimes(controller, 1, { sessionID: "ses_child", isRoot: false, entries })
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
     expect(calls[0].model).toEqual({ providerID: "zhipuai-coding-plan", id: "glm-5.3" })
+    controller.dispose()
   })
 
-  test("每个会话只自动切一次，备用模型继续失败也不回切/再切", async () => {
-    const { controller, calls, logs } = fallbackHarness()
-    await failTimes(controller, 3)
-    await failTimes(controller, 3, { model: { providerID: "zhipuai-coding-plan", id: "glm-5.3" } })
-    expect(calls).toHaveLength(1)
+  test("窗口到期仍未恢复：切一次备用模型并把上限降一档", async () => {
+    const { controller, calls, writes, logs } = fallbackHarness()
+    await failTimes(controller, 1)
+    expect(calls).toHaveLength(0)
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
+    expect(calls[0].sessionID).toBe("ses_root")
+    expect(calls[0].model).toEqual({ providerID: "zhipuai-coding-plan", id: "glm-5.3" })
+    const switched = logs.find((record) => record.event === "fallback-model-switch")
+    expect(switched?.reason).toBe("timeout")
+    expect(writes).toEqual([{ sessionID: "ses_root", limit: 4 }])
+    const tierDown = logs.find((record) => record.event === "quota-tier-down")
+    expect(tierDown?.from).toBe(5)
+    expect(tierDown?.to).toBe(4)
+    expect(tierDown?.root).toBe("ses_root")
     expect(controller.hasSwitched("ses_root")).toBe(true)
-    expect(logs.some((record) => record.event === "fallback-already-switched")).toBe(true)
+    controller.dispose()
   })
 
-  test("成功清零：reset 后要重新累计 3 次", async () => {
+  test("窗口内成功恢复（reset）：取消计时，不切模型", async () => {
     const { controller, calls } = fallbackHarness()
     await failTimes(controller, 2)
     controller.reset("ses_root")
-    expect(controller.failuresOf("ses_root")).toBe(0)
-    await failTimes(controller, 2)
+    expect(controller.isArmed("ses_root")).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 80))
     expect(calls).toHaveLength(0)
+    expect(controller.failuresOf("ses_root")).toBe(0)
+    controller.dispose()
+  })
+
+  test("超时前连续多次失败：不重复计时，也不提前切", async () => {
+    const { controller, calls, logs } = fallbackHarness()
+    await failTimes(controller, 3)
+    expect(calls).toHaveLength(0)
+    expect(logs.filter((record) => record.event === "fallback-armed")).toHaveLength(1)
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
+    expect(calls).toHaveLength(1)
+    controller.dispose()
+  })
+
+  test("切换失败：再重试一次，两次之后放弃", async () => {
+    const { controller, calls, logs } = fallbackHarness({ failSwitch: true })
+    await failTimes(controller, 1)
+    expect(await waitFor(() => logs.some((record) => record.event === "fallback-retry-armed"))).toBe(true)
+    expect(await waitFor(() => logs.some((record) => record.event === "fallback-timeout-giveup"))).toBe(true)
+    expect(logs.filter((record) => record.event === "fallback-switch-failed")).toHaveLength(2)
+    expect(calls).toHaveLength(0)
+    expect(controller.hasSwitched("ses_root")).toBe(false)
+    expect(controller.isArmed("ses_root")).toBe(false)
+    controller.dispose()
+  })
+
+  test("到点时不允许切换（协作停用或受保护）：不切模型", async () => {
+    const { controller, calls, logs } = fallbackHarness({ canSwitch: async () => false })
+    await failTimes(controller, 1)
+    expect(await waitFor(() => logs.some((record) => record.event === "fallback-timeout-skip"))).toBe(true)
+    expect(calls).toHaveLength(0)
+    expect(controller.isArmed("ses_root")).toBe(false)
+    controller.dispose()
+  })
+
+  test("到点时读到停用配置：不切模型", async () => {
+    const { controller, calls, logs } = fallbackHarness({
+      readEntries: async () => [{ key: "superagent.fallback-enabled", value: "false" }],
+    })
+    await failTimes(controller, 1)
+    expect(await waitFor(() => logs.some((record) => record.event === "fallback-disabled"))).toBe(true)
+    expect(calls).toHaveLength(0)
+    controller.dispose()
+  })
+
+  test("到点时读配置失败：沿用首次快照照常切换", async () => {
+    const { controller, calls, logs } = fallbackHarness({
+      readEntries: async () => {
+        throw new Error("instructions down")
+      },
+    })
+    await failTimes(controller, 1)
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
+    expect(logs.some((record) => record.event === "fallback-entries-read-failed")).toBe(true)
+    controller.dispose()
+  })
+
+  test("目标与当前模型相同：不切并标记已切", async () => {
+    const { controller, calls, logs } = fallbackHarness()
+    await failTimes(controller, 1, { model: { providerID: "zhipuai-coding-plan", id: "glm-5.3" } })
+    expect(await waitFor(() => logs.some((record) => record.event === "fallback-same-model"))).toBe(true)
+    expect(calls).toHaveLength(0)
+    expect(controller.hasSwitched("ses_root")).toBe(true)
+    controller.dispose()
+  })
+
+  test("每个会话只自动切一次：已切过再失败不回切", async () => {
+    const { controller, calls, logs } = fallbackHarness()
+    await failTimes(controller, 1)
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
     await failTimes(controller, 1)
     expect(calls).toHaveLength(1)
+    expect(logs.some((record) => record.event === "fallback-already-switched")).toBe(true)
+    controller.dispose()
   })
 
-  test("非限额错误不计数", async () => {
+  test("非限额错误：不计时", async () => {
     const { controller, calls } = fallbackHarness()
-    await failTimes(controller, 5, { error: { type: "provider.timeout", message: "timed out" } })
+    await failTimes(controller, 3, { error: { type: "provider.timeout", message: "timed out" } })
     expect(controller.failuresOf("ses_root")).toBe(0)
+    expect(controller.isArmed("ses_root")).toBe(false)
     expect(calls).toHaveLength(0)
+    controller.dispose()
   })
 
-  test("停用或未配置对应模型时不切换", async () => {
+  test("停用或未配置对应模型时不计时", async () => {
     const disabledEntries = [
       { key: "superagent.fallback-enabled", value: "false" },
       { key: "superagent.fallback-model", value: "p/m" },
@@ -433,45 +553,106 @@ describe("createQuotaFallback", () => {
     const disabled = fallbackHarness({ entries: disabledEntries })
     await failTimes(disabled.controller, 5, { entries: disabledEntries })
     expect(disabled.calls).toHaveLength(0)
+    expect(disabled.controller.isArmed("ses_root")).toBe(false)
 
     const unconfigured = fallbackHarness({ entries: [] })
     await failTimes(unconfigured.controller, 5, { entries: [] })
     expect(unconfigured.calls).toHaveLength(0)
     expect(unconfigured.logs.some((record) => record.event === "fallback-unconfigured")).toBe(true)
+    expect(unconfigured.controller.isArmed("ses_root")).toBe(false)
+    disabled.controller.dispose()
+    unconfigured.controller.dispose()
   })
 
-  test("切换时把 root 的 max-subagents 降一档并写回", async () => {
-    const { controller, writes, logs } = fallbackHarness()
-    await failTimes(controller, 3)
-    expect(writes).toEqual([{ sessionID: "ses_root", limit: 4 }])
-    const record = logs.find((item) => item.event === "quota-tier-down")
-    expect(record?.from).toBe(5)
-    expect(record?.to).toBe(4)
-    expect(record?.root).toBe("ses_root")
-  })
-
-  test("已经 ≤2 时不再降档", async () => {
+  test("上限已到 2 时不再降档", async () => {
     const entries = [
       ...FALLBACK_ENTRIES.filter((entry) => entry.key !== "superagent.max-subagents"),
       { key: "superagent.max-subagents", value: 2 },
     ]
     const { controller, writes, logs } = fallbackHarness({ entries })
-    await failTimes(controller, 3, { entries })
+    await failTimes(controller, 1, { entries })
+    expect(await waitFor(() => logs.some((record) => record.event === "quota-tier-down-skip"))).toBe(true)
     expect(writes).toHaveLength(0)
-    expect(logs.some((record) => record.event === "quota-tier-down-skip")).toBe(true)
+    controller.dispose()
   })
 
-  test("切换失败不标记已切，下一次限额失败会重试", async () => {
-    const { controller, calls } = fallbackHarness({ failSwitch: true })
-    await failTimes(controller, 3)
+  test("计时已到期但回调还没排到：当场同步切换", async () => {
+    const { controller, calls, clock } = fallbackHarness()
+    await failTimes(controller, 1)
+    clock.value = NOW + 60_000
+    const result = await failTimes(controller, 1)
+    expect(result.switched).toBe(true)
+    expect(result.to).toEqual({ providerID: "zhipuai-coding-plan", id: "glm-5.3" })
+    expect(calls).toHaveLength(1)
+    controller.dispose()
+  })
+
+  test("dispose 之后计时不再触发切换", async () => {
+    const { controller, calls } = fallbackHarness()
+    await failTimes(controller, 1)
+    controller.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 80))
     expect(calls).toHaveLength(0)
-    expect(controller.hasSwitched("ses_root")).toBe(false)
-    expect(controller.failuresOf("ses_root")).toBe(3)
+  })
+
+  test("等待 canSwitch 期间被 reset：不再切模型", async () => {
+    const gate = deferred<boolean>()
+    const { controller, calls } = fallbackHarness({ canSwitch: async () => gate.promise })
+    await failTimes(controller, 1)
+    // 到点后停在 canSwitch 上。
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    controller.reset("ses_root")
+    gate.resolve(true)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(calls).toHaveLength(0)
+    expect(controller.isArmed("ses_root")).toBe(false)
+    controller.dispose()
+  })
+
+  test("等待 readEntries 期间被 reset：不再切模型", async () => {
+    const gate = deferred<any[]>()
+    const { controller, calls } = fallbackHarness({ readEntries: async () => gate.promise })
+    await failTimes(controller, 1)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    controller.reset("ses_root")
+    gate.resolve(FALLBACK_ENTRIES)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(calls).toHaveLength(0)
+    expect(controller.isArmed("ses_root")).toBe(false)
+    controller.dispose()
+  })
+
+  test("切换进行中被 dispose：不再重试计时，也不抛", async () => {
+    let controllerRef: ReturnType<typeof createQuotaFallback> | undefined
+    const { controller, calls, logs } = fallbackHarness({
+      failSwitch: true,
+      onSwitch: async () => {
+        // 切换过程中插件被卸载。
+        controllerRef?.dispose()
+      },
+    })
+    controllerRef = controller
+    await failTimes(controller, 1)
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    // 只记一条切换失败，不再有重试计时，也不会有第二次切换。
+    expect(logs.filter((record) => record.event === "fallback-switch-failed")).toHaveLength(1)
+    expect(logs.some((record) => record.event === "fallback-retry-armed")).toBe(false)
+    expect(calls).toHaveLength(0)
+    expect(controller.isArmed("ses_root")).toBe(false)
+  })
+
+  test("dispose 之后再来限额失败：不再起计时", async () => {
+    const { controller, calls } = fallbackHarness()
+    controller.dispose()
+    await failTimes(controller, 1)
+    expect(controller.isArmed("ses_root")).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(calls).toHaveLength(0)
   })
 })
 
 describe("限额切换实测（fake 会话）", () => {
-  test("连续 3 次限额失败后 fake 会话的模型变成 glm-5.3", async () => {
+  test("首次限额失败后到点：fake 会话的模型变成 glm-5.3", async () => {
     const session = {
       sessionID: "ses_root",
       model: { providerID: "kimi-code-plan-global", id: "k3.1-pro" },
@@ -484,24 +665,24 @@ describe("限额切换实测（fake 会话）", () => {
       writeLimit: async () => {},
       log: (record) => logs.push(record),
       now: () => NOW,
+      timeoutMs: 20,
     })
-    for (let index = 1; index <= 3; index++) {
-      await controller.onFailure({
-        sessionID: "ses_root",
-        rootID: "ses_root",
-        isRoot: true,
-        error: quotaError(),
-        model: session.model,
-        entries: FALLBACK_ENTRIES,
-        attempt: index,
-      })
-    }
-    expect(`${session.model.providerID}/${session.model.id}`).toBe("zhipuai-coding-plan/glm-5.3")
+    await controller.onFailure({
+      sessionID: "ses_root",
+      rootID: "ses_root",
+      isRoot: true,
+      error: quotaError(),
+      model: session.model,
+      entries: FALLBACK_ENTRIES,
+      attempt: 1,
+    })
+    expect(`${session.model.providerID}/${session.model.id}`).toBe("kimi-code-plan-global/k3.1-pro")
+    expect(await waitFor(() => `${session.model.providerID}/${session.model.id}` === "zhipuai-coding-plan/glm-5.3")).toBe(true)
     const switched = logs.find((record) => record.event === "fallback-model-switch")
     expect(switched?.from).toBe("kimi-code-plan-global/k3.1-pro")
     expect(switched?.to).toBe("zhipuai-coding-plan/glm-5.3")
-    expect(switched?.failures).toBe(3)
-    expect(switched?.at).toBe(new Date(NOW).toISOString())
+    expect(switched?.reason).toBe("timeout")
+    controller.dispose()
   })
 })
 

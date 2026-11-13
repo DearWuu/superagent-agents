@@ -392,11 +392,6 @@ export function SidebarAgents(props: {
     const id = value.slice(slash + 1)
     return names().get(`${providerID}/${id}`) ?? names().get(modelKey({ providerID, id })) ?? id
   }
-  const fallbackThreshold = createMemo(() => {
-    const parsed = Number(instructionText(INSTRUCTION_KEYS.fallbackThreshold))
-    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 10) return parsed
-    return SUPERAGENT_DEFAULTS.fallbackThreshold
-  })
   const fallbackEnabled = createMemo(() => {
     const value = instructionText(INSTRUCTION_KEYS.fallbackEnabled)
     if (!value) return SUPERAGENT_DEFAULTS.fallbackEnabled
@@ -413,11 +408,11 @@ export function SidebarAgents(props: {
     if (!value) return SUPERAGENT_DEFAULTS.statusWatch
     return value !== "false"
   })
-  /** `GLM-5.3 · 连续3次失败切换 · 已启用`; `未设置` without a model. */
+  /** `GLM-5.3 · 60 秒未恢复自动切换 · 已启用`; `未设置` without a model. */
   const fallbackSummary = createMemo(() => {
     const label = modelEntryLabel(INSTRUCTION_KEYS.fallbackModel)
     const status = fallbackEnabled() ? "已启用" : "已停用"
-    return `${label || "未设置"}${SEPARATOR}连续${fallbackThreshold()}次失败切换${SEPARATOR}${status}`
+    return `${label || "未设置"}${SEPARATOR}60 秒未恢复自动切换${SEPARATOR}${status}`
   })
   const subagentFallbackSummary = createMemo(() => {
     const label = modelEntryLabel(INSTRUCTION_KEYS.subagentFallbackModel)
@@ -1023,36 +1018,16 @@ export function SidebarAgents(props: {
     props.context.ui.toast.show({ message: `${title}已设为 ${picked.model.name || picked.model.id}。` })
   }
 
-  async function editFallbackThreshold() {
-    const value = await props.context.ui.dialog.prompt({
-      title: "连续失败次数",
-      description: "同一次运行内连续出现多少次限额错误后切换备用模型（1–10 的整数）。",
-      placeholder: "例如：3",
-      value: String(fallbackThreshold()),
-    })
-    if (value === undefined) return
-    const text = value.trim()
-    const parsed = Number(text)
-    if (!/^\d+$/.test(text) || !Number.isInteger(parsed) || parsed < 1 || parsed > 10) {
-      props.context.ui.toast.show({ message: "连续失败次数必须是 1–10 的整数。" })
-      return
-    }
-    await putInstruction(INSTRUCTION_KEYS.fallbackThreshold, parsed)
-    props.context.ui.toast.show({ message: `连续失败 ${parsed} 次后切换备用模型。` })
-  }
-
   async function editFallbackEnabled() {
     const selected = await props.context.ui.dialog.select<FallbackAction>({
       title: "限额自动切换备用模型",
       options: [
-        { value: { kind: "on" }, title: "已启用", description: "连续失败达到阈值后切换到备用模型" },
+        { value: { kind: "on" }, title: "已启用", description: "首次限额失败后 60 秒内没恢复就切到备用模型" },
         { value: { kind: "off" }, title: "已停用", description: "限额错误只报错，不切换模型" },
-        { value: { kind: "threshold" }, title: "连续失败次数…", description: `当前 ${fallbackThreshold()} 次` },
       ],
       current: fallbackEnabled() ? { kind: "on" } : { kind: "off" },
     })
     if (!selected) return
-    if (selected.kind === "threshold") return editFallbackThreshold()
     await putInstruction(INSTRUCTION_KEYS.fallbackEnabled, selected.kind === "on" ? "true" : "false")
     props.context.ui.toast.show({
       message: selected.kind === "on" ? "已启用限额自动切换备用模型。" : "已停用限额自动切换备用模型。",
@@ -1299,9 +1274,7 @@ export function SidebarAgents(props: {
         {
           value: { kind: "fallbackEnabled" },
           title: "限额自动切换备用模型",
-          description: fallbackEnabled()
-            ? `已启用${SEPARATOR}连续${fallbackThreshold()}次失败切换`
-            : "已停用",
+          description: fallbackEnabled() ? `已启用${SEPARATOR}60 秒未恢复自动切换` : "已停用",
         },
         {
           value: { kind: "criticEnabled" },

@@ -33,6 +33,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.SUPERAGENT_HOOK_LOG
   delete process.env.SUPERAGENT_STATE_DIR
+  delete process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS
   rmSync(root, { recursive: true, force: true })
 })
 
@@ -272,7 +273,8 @@ describe("root A 停用时服务端短路", () => {
     await dispose()
   })
 
-  test("限额切换不执行：A 连续三次失败也不切模型", async () => {
+  test("限额切换不执行：A 停用协作，多次失败并等到点也不切模型", async () => {
+    process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS = "20"
     const { ctx, hooks, calls } = fakeCtx({ entries })
     const dispose = await (plugin as any).setup(ctx)
 
@@ -285,24 +287,31 @@ describe("root A 停用时服务端短路", () => {
     }
     expect(calls.switchModel).toBe(0)
     expect(calls.instructionSessions).toEqual(["ses_a_root", "ses_a_root", "ses_a_root"])
+    // 过了计时窗口也不切：停用协作的 root 根本不进入计时。
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(calls.switchModel).toBe(0)
 
     await dispose()
   })
 
-  test("root B 的同一 retry 会切换备用模型（对照）", async () => {
+  test("root B 的同一 retry 到点后切备用模型（对照）", async () => {
+    process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS = "20"
     const { ctx, hooks, calls } = fakeCtx({
       entries: {
-        ses_b_root: { "superagent.fallback-model": "acme/backup", "superagent.fallback-threshold": 3 },
+        ses_b_root: { "superagent.fallback-model": "acme/backup" },
       },
     })
     const dispose = await (plugin as any).setup(ctx)
 
-    for (let i = 0; i < 3; i += 1) {
-      await hooks["session:retry"]({
-        sessionID: "ses_b_root",
-        error: quotaError,
-        model: { providerID: "acme", id: "big" },
-      })
+    await hooks["session:retry"]({
+      sessionID: "ses_b_root",
+      error: quotaError,
+      model: { providerID: "acme", id: "big" },
+    })
+    expect(calls.switchModel).toBe(0)
+    const deadline = Date.now() + 3000
+    while (calls.switchModel === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
     }
     expect(calls.switchModel).toBe(1)
 

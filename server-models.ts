@@ -210,17 +210,293 @@ export type QuotaFallbackDeps = {
   log: (record: Record<string, unknown>) => void
   now?: () => number
   tierDown?: boolean
+  /** 计时窗口（毫秒）：窗口内没恢复就切备用模型。 */
+  timeoutMs?: number
+  /** 到点时的切换尝试次数上限（含首次）。 */
+  maxSwitchAttempts?: number
+  /** 到点时是否允许切换（协作开关、保护名单）；返回 false 就不切。 */
+  canSwitch?: (input: { sessionID: string; rootID: string }) => Promise<boolean>
+  /** 到点时重读配置条目；读失败回退首次快照。 */
+  readEntries?: (input: { sessionID: string; rootID: string }) => Promise<any[]>
+}
+
+/** 首次限额失败开始计时的窗口（毫秒）：窗口内没恢复就切备用模型。 */
+export const FALLBACK_TIMEOUT_MS = 60_000
+/** 到点切换的尝试次数上限（含首次）：失败后再试一次，仍失败就放弃。 */
+export const FALLBACK_MAX_SWITCH_ATTEMPTS = 2
+
+/** 一个会话正在计时的限额备用切换。 */
+type PendingFallback = {
+  /** 首次失败时的快照：会话、根、模型与配置条目。 */
+  input: RetryFailure
+  /** 已发起的切换尝试次数。 */
+  attempts: number
+  /** 开始计时的时刻。 */
+  armedAt: number
+  /** 最近一次累计到的失败次数。 */
+  failures: number
+  /** 最近一次失败的重试次数（宿主侧 attempt）。 */
+  lastAttempt?: number
+  /** 正在切换：避免定时器与同步到期路径同时切。 */
+  switching?: boolean
+  timer?: ReturnType<typeof setTimeout>
 }
 
 /**
- * 限额备用模型状态机：按 sessionID 累计连续限额失败，达到阈值后切一次模型，
- * 并把 root 的 max-subagents 降一档。远端读写在调用方完成，这里只做判定与状态。
+ * 限额备用模型状态机：首次限额失败开始计时，窗口内任一成功恢复就取消，
+ * 窗口到期仍未恢复才切一次模型，并把 root 的 max-subagents 降一档。
+ * 远端读写在调用方完成，这里只做判定与状态。
  */
 export function createQuotaFallback(deps: QuotaFallbackDeps) {
   const failures = new Map<string, number>()
   const switched = new Set<string>()
+  /** 正在计时的会话：每个会话最多一条。 */
+  const pending = new Map<string, PendingFallback>()
   const now = deps.now ?? Date.now
   const tierDown = deps.tierDown ?? QUOTA_TIER_DOWN
+  const timeoutMs = deps.timeoutMs ?? FALLBACK_TIMEOUT_MS
+  const maxSwitchAttempts = deps.maxSwitchAttempts ?? FALLBACK_MAX_SWITCH_ATTEMPTS
+  /** 插件已卸载：dispose 之后不再切模型。 */
+  let disposed = false
+
+  /** 取消计时并丢掉待办（保留「已切过」标记）。 */
+  const clearPending = (sessionID: string) => {
+    const entry = pending.get(sessionID)
+    if (!entry) return
+    if (entry.timer) clearTimeout(entry.timer)
+    pending.delete(sessionID)
+  }
+
+  /** 启动（或重启）计时：只负责定时器本身。dispose 之后不再起计时。 */
+  const arm = (sessionID: string, entry: PendingFallback) => {
+    if (disposed) return
+    const timer = setTimeout(() => {
+      void runTimeout(sessionID, entry).catch((cause) =>
+        deps.log({
+          event: "fallback-timeout-failed",
+          decision: "error",
+          sessionID,
+          root: entry.input.rootID,
+          cause: errorText(cause),
+        }),
+      )
+    }, timeoutMs)
+    ;(timer as any)?.unref?.()
+    entry.timer = timer
+    pending.set(sessionID, entry)
+  }
+
+  /** 切换成功后把 root 的上限降一档。 */
+  const tierDownLimit = async (input: {
+    rootID: string
+    entries: any[]
+    failures: number
+  }) => {
+    const current = readMaxSubagents(input.entries)
+    const next = downgradeLimit(current)
+    if (next === undefined) {
+      deps.log({ event: "quota-tier-down-skip", decision: "allow", root: input.rootID, limit: current })
+      return
+    }
+    try {
+      await deps.writeLimit({ sessionID: input.rootID, limit: next })
+      deps.log({
+        event: "quota-tier-down",
+        decision: "allow",
+        root: input.rootID,
+        from: current,
+        to: next,
+        at: new Date(now()).toISOString(),
+      })
+    } catch (cause) {
+      deps.log({
+        event: "quota-tier-down-failed",
+        decision: "error",
+        root: input.rootID,
+        from: current,
+        to: next,
+        cause: errorText(cause),
+      })
+    }
+  }
+
+  /** 到点处理：判重、读最新配置、切模型。失败最多再试一次。 */
+  const runTimeout = async (
+    sessionID: string,
+    entry: PendingFallback,
+  ): Promise<{ switched: boolean; to?: ModelRef }> => {
+    // 插件已卸载：不再切模型。
+    if (disposed) return { switched: false }
+    // 计时已被取消或换人：不处理。
+    if (pending.get(sessionID) !== entry) return { switched: false }
+    // 已经在切：定时器与同步到期路径不重复切。
+    if (entry.switching) return { switched: false }
+    entry.switching = true
+    try {
+      return await switchOnTimeout(sessionID, entry)
+    } finally {
+      entry.switching = false
+    }
+  }
+
+  /** 计时是否仍然有效：pending 被 reset/cancel/dispose 清掉就作废。 */
+  const stillArmed = (sessionID: string, entry: PendingFallback) =>
+    !disposed && pending.get(sessionID) === entry
+
+  /** 到点切换的主体：判重、读最新配置、切模型。 */
+  const switchOnTimeout = async (
+    sessionID: string,
+    entry: PendingFallback,
+  ): Promise<{ switched: boolean; to?: ModelRef }> => {
+    // 插件已卸载或计时已被取消：不处理。
+    if (!stillArmed(sessionID, entry)) return { switched: false }
+    const snapshot = entry.input
+    const base = {
+      sessionID,
+      root: snapshot.rootID,
+      failures: entry.failures,
+      attempt: snapshot.attempt,
+    }
+    if (switched.has(sessionID)) {
+      clearPending(sessionID)
+      return { switched: false }
+    }
+    if (deps.canSwitch) {
+      let allowed = true
+      try {
+        allowed = await deps.canSwitch({ sessionID, rootID: snapshot.rootID })
+      } catch (cause) {
+        allowed = false
+        deps.log({
+          event: "fallback-timeout-check-failed",
+          decision: "error",
+          ...base,
+          cause: errorText(cause),
+        })
+      }
+      // 等待期间可能已被 reset/cancel/dispose 作废：不再切。
+      if (!stillArmed(sessionID, entry)) return { switched: false }
+      if (!allowed) {
+        deps.log({
+          event: "fallback-timeout-skip",
+          decision: "allow",
+          ...base,
+          note: "协作停用或会话受保护：不切模型",
+        })
+        clearPending(sessionID)
+        failures.set(sessionID, 0)
+        return { switched: false }
+      }
+    }
+    let entries = snapshot.entries
+    if (deps.readEntries) {
+      try {
+        entries = await deps.readEntries({ sessionID, rootID: snapshot.rootID })
+      } catch (cause) {
+        entries = snapshot.entries
+        deps.log({
+          event: "fallback-entries-read-failed",
+          decision: "error",
+          ...base,
+          note: "读取最新配置失败，沿用首次快照",
+          cause: errorText(cause),
+        })
+      }
+      // 等待期间可能已被 reset/cancel/dispose 作废：不再切。
+      if (!stillArmed(sessionID, entry)) return { switched: false }
+    }
+    const config = readFallbackConfig(entries)
+    if (!config.enabled) {
+      deps.log({ event: "fallback-disabled", decision: "allow", ...base, phase: "timeout" })
+      clearPending(sessionID)
+      failures.set(sessionID, 0)
+      return { switched: false }
+    }
+    const target = snapshot.isRoot ? config.rootModel : config.subModel
+    if (!target) {
+      deps.log({
+        event: "fallback-unconfigured",
+        decision: "allow",
+        ...base,
+        phase: "timeout",
+        kind: snapshot.isRoot ? "root" : "subagent",
+      })
+      clearPending(sessionID)
+      failures.set(sessionID, 0)
+      return { switched: false }
+    }
+    const from = formatModelRef(snapshot.model)
+    const to = formatModelRef(target)
+    if (from && to && from === to) {
+      // 已经在备用模型上：不再切，标记已切避免反复触发。
+      deps.log({ event: "fallback-same-model", decision: "allow", ...base, from, to })
+      switched.add(sessionID)
+      clearPending(sessionID)
+      failures.set(sessionID, 0)
+      return { switched: false }
+    }
+    const attempt = entry.attempts + 1
+    // 切之前最后一次确认：计时可能已被 reset/cancel/dispose 作废。
+    if (!stillArmed(sessionID, entry)) return { switched: false }
+    try {
+      await deps.switchModel({ sessionID, model: target })
+    } catch (cause) {
+      deps.log({
+        event: "fallback-switch-failed",
+        decision: "error",
+        ...base,
+        from,
+        to,
+        attempts: attempt,
+        cause: errorText(cause),
+      })
+      // 切换期间可能已被 reset/cancel/dispose 作废：不再重试计时。
+      if (!stillArmed(sessionID, entry)) {
+        clearPending(sessionID)
+        return { switched: false }
+      }
+      if (attempt < maxSwitchAttempts) {
+        entry.attempts = attempt
+        arm(sessionID, entry)
+        deps.log({
+          event: "fallback-retry-armed",
+          decision: "allow",
+          ...base,
+          attempts: attempt,
+          timeoutMs,
+        })
+      } else {
+        deps.log({
+          event: "fallback-timeout-giveup",
+          decision: "allow",
+          ...base,
+          attempts: attempt,
+          note: "切换尝试次数用尽，等下一次新的限额失败",
+        })
+        clearPending(sessionID)
+        failures.set(sessionID, 0)
+      }
+      return { switched: false }
+    }
+    switched.add(sessionID)
+    failures.set(sessionID, 0)
+    clearPending(sessionID)
+    deps.log({
+      event: "fallback-model-switch",
+      decision: "allow",
+      ...base,
+      from,
+      to,
+      reason: "timeout",
+      attempts: attempt,
+      waitedMs: now() - entry.armedAt,
+      at: new Date(now()).toISOString(),
+    })
+    if (tierDown) {
+      await tierDownLimit({ rootID: snapshot.rootID, entries, failures: entry.failures })
+    }
+    return { switched: true, to: target }
+  }
 
   return {
     failuresOf(sessionID: string) {
@@ -229,11 +505,30 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
     hasSwitched(sessionID: string) {
       return switched.has(sessionID)
     },
-    /** 任一 LLM 成功：清零连续失败，但保留「已切过」标记。 */
+    /** 是否正在计时（测试与排查用）。 */
+    isArmed(sessionID: string) {
+      return pending.has(sessionID)
+    },
+    /** 任一 LLM 成功：取消计时并清零失败，但保留「已切过」标记。 */
     reset(sessionID: string) {
+      clearPending(sessionID)
       failures.delete(sessionID)
     },
+    /** 放弃这次计时（中断、非限额失败、会话删除）：不切模型。 */
+    cancel(sessionID: string) {
+      clearPending(sessionID)
+      failures.set(sessionID, 0)
+    },
+    /** 停掉所有计时（插件卸载时调用）：dispose 之后到点的切换也不再执行。 */
+    dispose() {
+      disposed = true
+      for (const entry of pending.values()) {
+        if (entry.timer) clearTimeout(entry.timer)
+      }
+      pending.clear()
+    },
     async onFailure(input: RetryFailure): Promise<{ switched: boolean; to?: ModelRef }> {
+      if (disposed) return { switched: false }
       if (!isQuotaFailure(input.error)) return { switched: false }
       const count = (failures.get(input.sessionID) ?? 0) + 1
       failures.set(input.sessionID, count)
@@ -254,8 +549,6 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
         deps.log({ event: "fallback-disabled", decision: "allow", ...base })
         return { switched: false }
       }
-      if (count < config.threshold) return { switched: false }
-
       const target = input.isRoot ? config.rootModel : config.subModel
       if (!target) {
         deps.log({
@@ -267,48 +560,36 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
         return { switched: false }
       }
 
-      const from = formatModelRef(input.model)
-      const to = formatModelRef(target)
-      try {
-        await deps.switchModel({ sessionID: input.sessionID, model: target })
-      } catch (cause) {
-        deps.log({ event: "fallback-switch-failed", decision: "error", ...base, from, to, cause: errorText(cause) })
+      const existing = pending.get(input.sessionID)
+      if (existing) {
+        // 已经在计时：只更新快照，不重复计时、不切换。
+        existing.failures = count
+        existing.lastAttempt = input.attempt ?? existing.lastAttempt
+        existing.input = { ...existing.input, ...input, entries: input.entries ?? existing.input.entries }
+        // 计时已到期但回调还没排到：当场同步走一次到期逻辑。
+        if (now() - existing.armedAt >= timeoutMs) {
+          if (existing.timer) clearTimeout(existing.timer)
+          return runTimeout(input.sessionID, existing)
+        }
         return { switched: false }
       }
-      switched.add(input.sessionID)
-      failures.set(input.sessionID, 0)
+
+      const entry: PendingFallback = {
+        input: { ...input },
+        attempts: 0,
+        armedAt: now(),
+        failures: count,
+        lastAttempt: input.attempt,
+      }
+      arm(input.sessionID, entry)
       deps.log({
-        event: "fallback-model-switch",
+        event: "fallback-armed",
         decision: "allow",
         ...base,
-        from,
-        to,
-        at: new Date(now()).toISOString(),
+        timeoutMs,
+        deadline: new Date(entry.armedAt + timeoutMs).toISOString(),
       })
-
-      if (tierDown) {
-        const current = readMaxSubagents(input.entries)
-        const next = downgradeLimit(current)
-        if (next === undefined) {
-          deps.log({ event: "quota-tier-down-skip", decision: "allow", root: input.rootID, limit: current })
-        } else {
-          try {
-            await deps.writeLimit({ sessionID: input.rootID, limit: next })
-            deps.log({
-              event: "quota-tier-down",
-              decision: "allow",
-              root: input.rootID,
-              from: current,
-              to: next,
-              at: new Date(now()).toISOString(),
-            })
-          } catch (cause) {
-            deps.log({ event: "quota-tier-down-failed", decision: "error", root: input.rootID, from: current, to: next, cause: errorText(cause) })
-          }
-        }
-      }
-
-      return { switched: true, to: target }
+      return { switched: false }
     },
   }
 }

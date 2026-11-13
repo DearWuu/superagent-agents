@@ -50,7 +50,7 @@ export type SettingsAction =
   | { kind: "criticEnabled" }
   | { kind: "statusWatch" }
 
-export type FallbackAction = { kind: "on" } | { kind: "off" } | { kind: "threshold" }
+export type FallbackAction = { kind: "on" } | { kind: "off" }
 
 export type PolicyAction = { kind: "report" } | { kind: "prompt" } | { kind: "close" }
 export type DefaultAction = { kind: "auto" } | { kind: "inherit" } | { kind: "choose" } | { kind: "configure" }

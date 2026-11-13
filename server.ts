@@ -25,13 +25,16 @@
  *  - TUI 的上限读的是指令条目 + TUI 存储，server 端只能读指令条目。
  *
  * 限额备用模型：
- *  - 监听 `session.retry` 钩子；只有限额类错误（RateLimit / 429 / quota / 余额不足文本）
- *    计数，其他错误不计数。同一 session 连续失败达到 `superagent.fallback-threshold`
- *    （缺省 3）且已启用（`superagent.fallback-enabled`，缺省 true）时，经
- *    `ctx.session.switchModel` 切到 root 的 `superagent.fallback-model`、子会话的
- *    `superagent.subagent-fallback-model`；每个 session 只自动切一次，切完不回切。
- *    切换成功时把当次 retry 决策翻成「继续重试」，下一 attempt 就用新模型。
- *  - 成功信号（`session.step.ended` / `session.execution.succeeded`）清零计数。
+ *  - 限额类错误（RateLimit / 429 / quota / 余额不足文本）开始计时：来源是 `session.retry`
+ *    钩子与 `session.execution.failed` 事件（宿主没触发 retry 钩子时也能计时）；
+ *    首次限额失败开始 60 秒窗口（`FALLBACK_TIMEOUT_MS`），
+ *    窗口内任一成功恢复就取消；窗口到期仍未恢复且已启用
+ *    （`superagent.fallback-enabled`，缺省 true）时，经 `ctx.session.switchModel` 切到
+ *    root 的 `superagent.fallback-model`、子会话的 `superagent.subagent-fallback-model`；
+ *    每个 session 只自动切一次，切完不回切。到点切换失败最多再试一次。
+ *  - 成功信号（`session.step.ended` / `session.execution.succeeded`）取消计时；
+ *    步骤失败（`session.step.ended` 且 `finish=error`）不取消；
+ *    中断、非限额失败与会话删除放弃计时。
  *  - 切换触发时把 root 的 `superagent.max-subagents` 降一档（5→4→3→2，下限 2），
  *    由常量 `QUOTA_TIER_DOWN` 控制；不自动恢复。
  *
@@ -122,10 +125,12 @@ import {
 import {
   createQuotaFallback,
   denyMessage,
+  FALLBACK_TIMEOUT_MS,
   forceRetryAfterSwitch,
   isQuotaFailure,
   readOversightLevel,
   shouldCriticReview,
+  type ModelRef,
 } from "./server-models"
 import {
   classifyEvictFailure,
@@ -300,6 +305,12 @@ export const SUBAGENT_INTERRUPT_POLL_MS = 50
 function reconcileIntervalMs() {
   const raw = Number(process.env.SUPERAGENT_STATUS_RECONCILE_MS)
   return Number.isFinite(raw) && raw >= 50 ? raw : STATUS_RECONCILE_INTERVAL_MS
+}
+
+/** 限额备用模型的计时窗口（毫秒）：默认 60s；`SUPERAGENT_FALLBACK_TIMEOUT_MS` 只用于测试与排查。 */
+function fallbackTimeoutMs() {
+  const raw = Number(process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw >= 10 ? raw : FALLBACK_TIMEOUT_MS
 }
 
 const SUBAGENT_INTERRUPT_DESCRIPTION =
@@ -724,7 +735,7 @@ export default {
     /** 正在被 steer 的子会话：淘汰时避开。 */
     const steered = new Set<string>()
 
-    /** 限额备用模型：连续失败计数与每会话只切一次的标记都在里面。 */
+    /** 限额备用模型：首次限额失败开始计时，窗口内恢复就取消，每会话只切一次。 */
     const quotaFallback = createQuotaFallback({
       switchModel: async ({ sessionID, model }) => {
         await ctx.session.switchModel({ sessionID, model })
@@ -734,6 +745,16 @@ export default {
       },
       log,
       tierDown: QUOTA_TIER_DOWN,
+      timeoutMs: fallbackTimeoutMs(),
+      // 到点再确认一次：协作停用或会话受保护都不切。
+      canSwitch: async ({ sessionID, rootID }) => {
+        if (!(await readRootCollabEnabled(ctx, rootID))) return false
+        const kept = await readKeptSubagentsSafe(ctx, sessionID, rootID, { sessionID })
+        if (kept?.has(sessionID)) return false
+        return true
+      },
+      // 到点时读最新配置：期间用户可能改了开关或备用模型。
+      readEntries: async ({ rootID }) => asArray(await ctx.session.instructions.entry.list({ sessionID: rootID })),
     })
 
     /** critic.ts 认的 client：消息列表在顶层 `message.list`，V2 里由 `session.context` 提供。 */
@@ -1626,38 +1647,59 @@ export default {
       }
     }
 
-    // 限额重试：core 在每次重试决策前触发 retry 钩子，此时的切换只影响下一 attempt，
-    // 不会打断正在执行的轮次；切换成功时把决策翻成继续重试。钩子里的异常一律吞掉。
+    /**
+     * 触发一次限额备用计时：读 root、协作开关、保护名单与配置条目，
+     * 再交给状态机判断（首次失败 arm 计时，已有计时只更新快照）。
+     * retry 钩子与 `session.execution.failed` 走同一条路，
+     * 保证宿主没触发 retry 钩子时限额失败同样计入 60 秒窗口。
+     */
+    const triggerQuotaFallback = async (
+      sessionID: string,
+      error: unknown,
+      model?: unknown,
+      attempt?: number,
+    ): Promise<{ switched: boolean; to?: ModelRef }> => {
+      const rootID = await findRoot(ctx, sessionID)
+      // 总开关按 root 生效：本 root 停用时不计时、不切模型。
+      if (!(await readRootCollabEnabled(ctx, rootID))) return { switched: false }
+      // 保护中的子会话不参与限额备用切换：不计时、不切模型、不强制重试。
+      const keptForFallback = await readKeptSubagentsSafe(ctx, sessionID, rootID, { sessionID })
+      if (keptForFallback?.has(sessionID)) {
+        log({
+          event: "fallback-kept-model",
+          decision: "allow",
+          root: rootID,
+          sessionID,
+          note: "受保护子会话：限额失败不计时、不切模型、不强制重试",
+        })
+        return { switched: false }
+      }
+      const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+      return quotaFallback.onFailure({
+        sessionID,
+        rootID,
+        isRoot: sessionID === rootID,
+        error,
+        model,
+        entries,
+        attempt,
+      })
+    }
+
+    // 限额重试：core 在每次重试决策前触发 retry 钩子。首次限额失败只开始计时，
+    // 不当场切模型；窗口到期仍未恢复才切（此时没有决策可翻，只有同步到期路径会翻）。
+    // 钩子里的异常一律吞掉。
     const retry = await ctx.session.hook("retry", async (event: any) => {
       try {
         if (!isQuotaFailure(event?.error)) return
         const sessionID = typeof event?.sessionID === "string" ? event.sessionID : undefined
         if (!sessionID) return
-        const rootID = await findRoot(ctx, sessionID)
-        // 总开关按 root 生效：本 root 停用时不计失败、不切模型。
-        if (!(await readRootCollabEnabled(ctx, rootID))) return
-        // 保护中的子会话不参与限额备用切换：不计失败、不切模型、不强制重试。
-        const keptForFallback = await readKeptSubagentsSafe(ctx, sessionID, rootID, { sessionID })
-        if (keptForFallback?.has(sessionID)) {
-          log({
-            event: "fallback-kept-model",
-            decision: "allow",
-            root: rootID,
-            sessionID,
-            note: "受保护子会话：限额失败不计失败、不切模型、不强制重试",
-          })
-          return
-        }
-        const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
-        const outcome = await quotaFallback.onFailure({
+        const outcome = await triggerQuotaFallback(
           sessionID,
-          rootID,
-          isRoot: sessionID === rootID,
-          error: event.error,
-          model: event.model,
-          entries,
-          attempt: typeof event?.attempt === "number" ? event.attempt : undefined,
-        })
+          event.error,
+          event.model,
+          typeof event?.attempt === "number" ? event.attempt : undefined,
+        )
         forceRetryAfterSwitch(event, outcome.switched)
       } catch (cause) {
         log({
@@ -1687,6 +1729,7 @@ export default {
             "session.shell.started",
             "session.shell.ended",
             "session.model.selected",
+            "session.deleted",
           ],
           signal: resetAbort.signal,
         })) {
@@ -1719,36 +1762,75 @@ export default {
             }
             continue
           }
-          // 状态回传：子会话结束与 shell 起止只驱动看护项，不参与限额计数清零。
+          // 状态回传：子会话结束与 shell 起止只驱动看护项，不参与限额计时。
+          const watchedID = eventSessionID(event)
           if (
-            event?.type === "session.execution.succeeded" ||
-            event?.type === "session.execution.failed" ||
-            event?.type === "session.execution.interrupted" ||
-            event?.type === "session.shell.started" ||
-            event?.type === "session.shell.ended"
+            watchedID &&
+            (event?.type === "session.execution.succeeded" ||
+              event?.type === "session.execution.failed" ||
+              event?.type === "session.execution.interrupted" ||
+              event?.type === "session.shell.started" ||
+              event?.type === "session.shell.ended")
           ) {
-            const watchedID = eventSessionID(event)
-            if (watchedID) {
-              if (event.type === "session.shell.ended") {
-                watcher.settle(watchedID, { delayMs: SHELL_SETTLE_DELAY_MS })
-              } else if (event.type === "session.shell.started") {
-                watcher.settle(watchedID)
-              } else {
-                const state: CompletionState =
-                  event.type === "session.execution.failed"
-                    ? "error"
-                    : event.type === "session.execution.interrupted"
-                      ? "cancelled"
-                      : "completed"
-                watcher.settle(watchedID, { state })
-              }
+            if (event.type === "session.shell.ended") {
+              watcher.settle(watchedID, { delayMs: SHELL_SETTLE_DELAY_MS })
+            } else if (event.type === "session.shell.started") {
+              watcher.settle(watchedID)
+            } else {
+              const state: CompletionState =
+                event.type === "session.execution.failed"
+                  ? "error"
+                  : event.type === "session.execution.interrupted"
+                    ? "cancelled"
+                    : "completed"
+              watcher.settle(watchedID, { state })
             }
-            // 成功事件还要清零限额计数并触发复核，走原有路径。
-            if (event?.type !== "session.execution.succeeded") continue
           }
           const sessionID = eventSessionID(event)
           if (!sessionID) continue
-          quotaFallback.reset(sessionID)
+          // 限额备用：成功即取消计时；中断与会话删除放弃计时；
+          // 限额失败保留计时（窗口内没恢复才切）；其他失败同样放弃。
+          if (event?.type === "session.execution.succeeded") {
+            quotaFallback.reset(sessionID)
+          } else if (event?.type === "session.step.ended") {
+            // 只有 error 表示步骤失败：其余取值（stop/length/tool-calls/content-filter/unknown）
+            // 以及缺省都说明模型已返回，即已恢复，取消计时。
+            // 若把非 error 也当失败，限额失败那一步的 step.ended 会把刚起的计时取消掉。
+            const finish = eventData(event)?.finish
+            if (finish !== "error") {
+              quotaFallback.reset(sessionID)
+            }
+          } else if (event?.type === "session.execution.interrupted" || event?.type === "session.deleted") {
+            quotaFallback.cancel(sessionID)
+          } else if (event?.type === "session.execution.failed") {
+            const failure = eventData(event)?.error
+            if (isQuotaFailure(failure)) {
+              // 宿主可能没触发 retry 钩子（例如限额错误被判为不重试）：
+              // 失败事件走同一条路，同样启动 60 秒计时；已有计时只更新快照。
+              let model: unknown
+              try {
+                model = (await ctx.session.get({ sessionID }))?.model
+              } catch {
+                model = undefined
+              }
+              try {
+                await triggerQuotaFallback(sessionID, failure, model)
+              } catch (cause) {
+                log({
+                  event: "fallback-hook-error",
+                  decision: "error",
+                  phase: "execution-failed",
+                  root: null,
+                  count: null,
+                  limit: null,
+                  sessionID,
+                  cause: errorText(cause),
+                })
+              }
+            } else {
+              quotaFallback.cancel(sessionID)
+            }
+          }
           // 复核在内部按该会话所属 root 的开关短路。
           if (event?.type === "session.execution.succeeded") {
             void reviewAfterSuccess(sessionID, event?.id)
@@ -1797,6 +1879,9 @@ export default {
       } catch {}
       try {
         watcher.stop()
+      } catch {}
+      try {
+        quotaFallback.dispose()
       } catch {}
       try {
         await interruptRegistration?.dispose?.()

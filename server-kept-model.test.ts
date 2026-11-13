@@ -158,7 +158,17 @@ afterEach(() => {
   delete process.env.SUPERAGENT_STATE_DIR
   delete process.env.XDG_STATE_HOME
   delete process.env.SUPERAGENT_HOOK_LOG
+  delete process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS
 })
+
+/** 等真实定时器：备用切换由计时器驱动。 */
+async function waitFor(check: () => boolean, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (!check() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  return check()
+}
 
 function hookLog(): any[] {
   try {
@@ -403,8 +413,9 @@ describe("受保护子会话的模型硬约束", () => {
 })
 
 describe("限额备用切换与保护名单", () => {
-  test("kept 子会话限额失败：不切模型、不强制重试、不计失败", async () => {
+  test("kept 子会话限额失败：不计时、不切模型、不强制重试", async () => {
     tempState()
+    process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS = "20"
     const h = await setup({
       sessions: sessions(),
       entries: { ses_root: rootEntries([{ key: "superagent.kept-subagents", value: "ses_child" }]) },
@@ -418,43 +429,46 @@ describe("限额备用切换与保护名单", () => {
     expect(h.switchModelCalls).toHaveLength(0)
     expect(decisions).toEqual([{ retry: false }, { retry: false }, { retry: false }])
     expect(hookLog().some((record) => record.event === "fallback-kept-model")).toBe(true)
+    // 过了计时窗口也不会切：受保护的子会话根本不进入计时。
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(h.switchModelCalls).toHaveLength(0)
     await h.dispose()
     h.events.close()
   })
 
-  test("未保护的子会话限额失败：照常切到备用模型并翻成重试", async () => {
+  test("未保护的子会话限额失败：到点后切到备用模型", async () => {
     tempState()
+    process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS = "20"
     const h = await setup({
       sessions: sessions(),
       entries: { ses_root: rootEntries() },
     })
     const event: any = { sessionID: "ses_child", error: quotaError, model: ROOT_MODEL, decision: { retry: false } }
-    for (let index = 0; index < 3; index += 1) {
-      await h.hooks["session:retry"](event)
-    }
-    expect(h.switchModelCalls).toHaveLength(1)
+    await h.hooks["session:retry"](event)
+    expect(h.switchModelCalls).toHaveLength(0)
+    expect(await waitFor(() => h.switchModelCalls.length === 1)).toBe(true)
     expect(h.switchModelCalls[0].sessionID).toBe("ses_child")
     expect(`${h.switchModelCalls[0].model.providerID}/${h.switchModelCalls[0].model.id}`).toBe("acme/backup")
-    expect(event.decision).toEqual({ retry: true, delay: 1000 })
+    // 计时器切换改不了当次 retry 决策，只有同步到期路径会翻。
+    expect(event.decision).toEqual({ retry: false })
     expect(hookLog().some((record) => record.event === "fallback-kept-model")).toBe(false)
     await h.dispose()
     h.events.close()
   })
 
-  test("保护名单读取失败：限额路径照常切换（fail-open）", async () => {
+  test("保护名单读取失败：限额路径到点后照常切换（fail-open）", async () => {
     tempState()
+    process.env.SUPERAGENT_FALLBACK_TIMEOUT_MS = "20"
     const h = await setup({
       sessions: sessions(),
       entries: { ses_root: rootEntries([{ key: "superagent.kept-subagents", value: "ses_child" }]) },
       failEntriesFor: "ses_child",
     })
     const event: any = { sessionID: "ses_child", error: quotaError, model: ROOT_MODEL, decision: { retry: false } }
-    for (let index = 0; index < 3; index += 1) {
-      await h.hooks["session:retry"](event)
-    }
+    await h.hooks["session:retry"](event)
+    expect(await waitFor(() => h.switchModelCalls.length === 1)).toBe(true)
     expect(hookLog().some((record) => record.event === "kept-read-failed")).toBe(true)
-    expect(h.switchModelCalls).toHaveLength(1)
-    expect(event.decision).toEqual({ retry: true, delay: 1000 })
+    expect(`${h.switchModelCalls[0].model.providerID}/${h.switchModelCalls[0].model.id}`).toBe("acme/backup")
     await h.dispose()
     h.events.close()
   })
