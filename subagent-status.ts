@@ -446,8 +446,29 @@ export function hasParentActivityAfter(messages: unknown, since: number, childID
 }
 
 /**
+ * 这张卡是不是「回合结束但后台任务仍在跑」：core 会把这种卡标成
+ * `metadata.state="completed"`，正文标签却还是 `state="running"`、并写明
+ * `Background work still running`。它不是终态通知——后台任务真正结束后
+ * 还要再发一条，判重不能把它当成「parent 已经知道了」。
+ */
+export function noticeSaysStillRunning(message: unknown, childID: string): boolean {
+  const record = isRecord(message) ? message : undefined
+  if (!record) return false
+  const text = messageText(record)
+  if (!text) return false
+  if (text.includes("Background work still running")) return true
+  const marker = `<subagent sessionID="${childID}"`
+  const index = text.indexOf(marker)
+  if (index < 0) return false
+  const end = text.indexOf(">", index)
+  const tag = end < 0 ? text.slice(index) : text.slice(index, end)
+  return tag.includes('state="running"')
+}
+
+/**
  * 判重：这个子会话是否已经收到过完成通知。
  * 认 metadata 的 source + childID，也认正文里的 `<subagent sessionID="...">`。
+ * metadata 命中后仍要排除「后台仍在跑」的卡，否则真正的完成通知会被它吞掉。
  */
 export function hasNotice(
   messages: unknown,
@@ -464,7 +485,9 @@ export function hasNotice(
       const childID = typeof metadata.childID === "string" ? metadata.childID : undefined
       const state = typeof metadata.state === "string" ? metadata.state : undefined
       if (source && sources.has(source) && childID === options.childID) {
-        if (!states || (state !== undefined && states.includes(state))) return true
+        if (!states || (state !== undefined && states.includes(state))) {
+          if (!noticeSaysStillRunning(record, options.childID)) return true
+        }
       }
     }
     const text = messageText(record)
@@ -523,6 +546,12 @@ export function statusWatchEnabled(entries: unknown): boolean {
 export const NATIVE_NOTICE_WAIT_MS = 1200
 /** shell 结束事件后再等一会儿，等消息状态落盘。 */
 export const SHELL_SETTLE_DELAY_MS = 300
+/**
+ * busy 竞态的快速重试：结束事件可能早于 idle 落库，稍后再看一次；
+ * 有界重试，超限后交给周期对账兜底。
+ */
+export const STATUS_BUSY_RETRY_MS = 800
+export const STATUS_BUSY_RETRY_LIMIT = 2
 /** 看护项上限与存活时长。 */
 const WATCH_LIMIT = 200
 const WATCH_TTL_MS = 6 * 60 * 60 * 1000
@@ -571,6 +600,10 @@ export type StatusWatch = {
   /** 首次发现子代理停掉的时间：只 arm，提醒要等下一个对账周期。 */
   reminderArmedAt?: number
   remindedStates: string[]
+  /** busy 竞态已经快速重试过几次；收尾成功或换一轮后归零。 */
+  busyRetries?: number
+  /** 是否已经挂着一个待触发的 busy 快速重试：同一看护项同时只留一个。 */
+  busyRetryPending?: boolean
 }
 
 /** 看护项登记信息。 */
@@ -599,15 +632,29 @@ export type StatusWatcherDeps = {
   write: (record: Record<string, unknown>) => void
   /** 收尾后按上限淘汰超额子代理；失败只记日志，不影响收尾。 */
   evictExcess?: (input: { childID: string; parentID: string; rootID?: string }) => Promise<void>
+  /** busy 竞态的快速重试间隔（毫秒），默认 800。 */
+  settleRetryMs?: number
+  /** 快速重试次数上限，默认 2；超限后交给周期对账。 */
+  settleRetryLimit?: number
   /** 对账周期（毫秒）。 */
   reconcileIntervalMs?: number
 }
+
+/** 一次收尾的请求参数。 */
+export type SettleOptions = {
+  state?: CompletionState
+  delayMs?: number
+  force?: boolean
+}
+
+/** 收尾请求的内部形态：retry 标记本次调用来自 busy 快速重试。 */
+type SettleRequest = SettleOptions & { retry?: boolean }
 
 export type StatusWatcher = {
   /** 派发成功后登记看护项：同一 childID 的 steer 更新而不是重复登记。 */
   register: (input: StatusWatchInput) => Promise<void>
   /** 排队一次收尾：同一 child 串行，永不阻塞事件消费。 */
-  settle: (childID: string, options?: { state?: CompletionState; delayMs?: number; force?: boolean }) => void
+  settle: (childID: string, options?: SettleOptions) => void
   /** 周期对账：兜底检查「子代理停了但没人收到完成确认」。 */
   reconcile: () => Promise<void>
   /** 停表并清空看护项。 */
@@ -630,11 +677,36 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   let reconcileTimer: ReturnType<typeof setInterval> | undefined
   /** dispose 后不再投递迟到通知；旧实例的异步收尾不能打扰新实例。 */
   let stopped = false
+  /** busy 竞态的快速重试定时器：stop() 时统一清掉。 */
+  const busyRetryTimers = new Set<ReturnType<typeof setTimeout>>()
 
   const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
   /** 对账周期：提醒要等 arm 之后至少再过一个周期。 */
   const reconcileIntervalMs = deps.reconcileIntervalMs ?? STATUS_RECONCILE_INTERVAL_MS
+  const settleRetryMs = deps.settleRetryMs ?? STATUS_BUSY_RETRY_MS
+  const settleRetryLimit = deps.settleRetryLimit ?? STATUS_BUSY_RETRY_LIMIT
+
+  /**
+   * 收尾撞上忙碌读时的快速重试：结束事件可能早于 idle 落库，稍后再看一次。
+   * 重试走 settle 的串行链（不是在 settleStatus 里递归 await），同一 child 不会并发收尾；
+   * 同一看护项同时只留一个待重试，次数有上限，超限后交给周期对账兜底。
+   */
+  const scheduleBusyRetry = (childID: string, watch: StatusWatch, options: SettleRequest) => {
+    if (watch.busyRetryPending) return
+    const used = watch.busyRetries ?? 0
+    if (used >= settleRetryLimit) return
+    watch.busyRetries = used + 1
+    watch.busyRetryPending = true
+    const timer = setTimeout(() => {
+      busyRetryTimers.delete(timer)
+      watch.busyRetryPending = false
+      if (stopped) return
+      settle(childID, { ...options, retry: true })
+    }, settleRetryMs)
+    ;(timer as any)?.unref?.()
+    busyRetryTimers.add(timer)
+  }
 
   /** 状态监测开关（root 级）：缺省与非法值一律按启用处理。 */
   const watchEnabledFor = async (rootID: string | undefined, fallbackID: string) => {
@@ -811,10 +883,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         : "子代理已结束，未取到最终输出。"
 
   /** 收尾一次看护项：判断后台任务、决定通知、清理标记。 */
-  const settleStatus = async (
-    childID: string,
-    options: { state?: CompletionState; delayMs?: number; force?: boolean } = {},
-  ) => {
+  const settleStatus = async (childID: string, options: SettleRequest = {}) => {
     if (stopped) return
     const watch = watches.get(childID)
     if (!watch) return
@@ -825,8 +894,13 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     // 还在跑就等下一个事件；前台派发时工具已经返回，回合一定结束了。
     if (isSessionBusy(info) && !options.force) {
       watch.expected = "running"
+      // 结束事件可能早于 idle 落库：稍后重看一次，别把这次收尾丢掉。
+      // 新的一次外部收尾算新一轮（重试预算重置）；重试自身不重置，否则永远试不满。
+      if (!options.retry && !watch.busyRetryPending) watch.busyRetries = 0
+      scheduleBusyRetry(childID, watch, options)
       return
     }
+    watch.busyRetries = 0
     const messages = await deps.readMessages(childID)
     const jobs = collectBackgroundJobs(messages)
     if (jobs.length > 0) {
@@ -911,10 +985,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   }
 
   /** 排队一次收尾：同一 child 串行，永不阻塞事件消费。 */
-  const settle = (
-    childID: string,
-    options: { state?: CompletionState; delayMs?: number; force?: boolean } = {},
-  ) => {
+  const settle = (childID: string, options: SettleRequest = {}) => {
     const previous = settleChains.get(childID) ?? Promise.resolve()
     const next = previous
       .then(() => settleStatus(childID, options))
@@ -949,8 +1020,9 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         watches.delete(childID)
         continue
       }
-      // 只对后台派发兜底；前台派发的工具结果已经回传给模型，不能再补提醒。
-      if (watch.mode !== "background" || watch.expected !== "running") continue
+      // 兜底两类看护项：后台派发（回合结束还要等通知），以及收尾事件撞上
+      // 忙碌读、快速重试也没赶上的前台/steer（expected 仍是 running）。
+      if (watch.expected !== "running") continue
       let info: Record<string, any> | undefined
       try {
         info = sessionInfo(await deps.readSession(childID))
@@ -972,6 +1044,11 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         continue
       }
       const state = completionState(info.outcome) ?? "completed"
+      // 前台/steer 的看护项只是错过了收尾：强制收尾一次，走正常判重与通知链路。
+      if (watch.mode !== "background") {
+        settle(childID, { force: true, state })
+        continue
+      }
       if (watch.remindedStates.includes(state)) continue
       if (reminderTotal >= MAX_REMINDERS) break
       let parentMessages: any[] = []
@@ -1070,6 +1147,8 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   const stop = () => {
     stopped = true
     stopReconcileTimer()
+    for (const timer of busyRetryTimers) clearTimeout(timer)
+    busyRetryTimers.clear()
     watches.clear()
     settleChains.clear()
   }

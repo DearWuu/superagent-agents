@@ -24,8 +24,10 @@ import {
   jobSignature,
   messageText,
   messageTime,
+  noticeSaysStillRunning,
   noticeStates,
   statusWatchEnabled,
+  terminalNoticeSeen,
   type DispatchRecord,
 } from "./subagent-status"
 
@@ -517,5 +519,138 @@ describe("收尾后按上限淘汰", () => {
     } finally {
       watcher.stop()
     }
+  })
+})
+
+/** core 的「回合结束但后台任务仍在跑」卡：metadata 标 completed，正文标 running。 */
+const stillRunningCard = {
+  metadata: { source: "subagent", childID: "ses_child", agent: "General", state: "completed" },
+  text: '<subagent sessionID="ses_child" state="running" description="TUI 验收">\n夹具已重建，TUI 正在启动。等后台完成通知。\n\nBackground work still running:\n- shell (sh_1): npm run dev',
+}
+
+describe("后台仍在跑的卡不算终态", () => {
+  test("metadata 说 completed、正文标明后台仍在跑 → 不算终态", () => {
+    expect(noticeSaysStillRunning(stillRunningCard, "ses_child")).toBe(true)
+    expect(terminalNoticeSeen([stillRunningCard], "ses_child", "completed")).toBe(false)
+  })
+
+  test("标签仍是 running（没有那句英文）→ 也不算终态", () => {
+    const card = {
+      metadata: { source: "subagent", childID: "ses_child", state: "completed" },
+      text: '<subagent sessionID="ses_child" state="running" description="任务">\n还在跑',
+    }
+    expect(noticeSaysStillRunning(card, "ses_child")).toBe(true)
+    expect(terminalNoticeSeen([card], "ses_child", "completed")).toBe(false)
+  })
+
+  test("正常终态卡仍然算终态", () => {
+    const card = {
+      metadata: { source: "subagent", childID: "ses_child", state: "completed" },
+      text: '<subagent sessionID="ses_child" state="completed" description="任务">\n报告正文',
+    }
+    expect(noticeSaysStillRunning(card, "ses_child")).toBe(false)
+    expect(terminalNoticeSeen([card], "ses_child", "completed")).toBe(true)
+  })
+
+  test("只有 metadata、正文普通的旧格式仍算终态", () => {
+    const message = {
+      metadata: { source: "superagent-agents", childID: "ses_child", state: "completed" },
+      text: "子代理已完成。",
+    }
+    expect(noticeSaysStillRunning(message, "ses_child")).toBe(false)
+    expect(terminalNoticeSeen([message], "ses_child", "completed")).toBe(true)
+  })
+
+  test("别的 childID 的 running 卡不影响本 child 判重", () => {
+    const other = {
+      metadata: { source: "subagent", childID: "ses_other", state: "completed" },
+      text: '<subagent sessionID="ses_other" state="running">\nBackground work still running:\n- shell (sh_9)',
+    }
+    expect(terminalNoticeSeen([other], "ses_child", "completed")).toBe(false)
+  })
+})
+
+describe("收尾撞上忙碌读的兜底", () => {
+  /** 前 n 次读返回忙碌，之后返回已完成；用来复现「事件早于 idle 落库」。 */
+  function busyThenIdle(busyReads: number) {
+    let reads = 0
+    return {
+      readSession: async (sessionID: string) => {
+        reads += 1
+        const busy = reads <= busyReads
+        return { id: sessionID, outcome: busy ? undefined : "succeeded", time: busy ? { busy: 10 } : { busy: 10, idle: 20 } }
+      },
+      reads: () => reads,
+    }
+  }
+
+  test("重试后不再忙碌：完成通知照常发出", async () => {
+    const probe = busyThenIdle(2)
+    const { deps, notices } = watcherHarness({
+      settleRetryMs: 5,
+      readSession: probe.readSession,
+    })
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: true,
+      })
+      watcher.settle("ses_child", { state: "completed" })
+      await waitFor(() => notices.length === 1, 5000)
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("重试有上限：一直忙碌时不无限重试，看护项保留给对账兜底", async () => {
+    const probe = busyThenIdle(Number.POSITIVE_INFINITY)
+    const { deps, notices } = watcherHarness({
+      settleRetryMs: 5,
+      settleRetryLimit: 2,
+      readSession: probe.readSession,
+    })
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: true,
+      })
+      watcher.settle("ses_child", { state: "completed" })
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      // 登记探测 1 次 + 收尾 1 次 + 2 次重试；不再继续。
+      expect(probe.reads()).toBe(4)
+      expect(notices).toEqual([])
+      expect(watcher.size()).toBe(1)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("stop() 清掉挂起的重试：之后不再有通知", async () => {
+    const probe = busyThenIdle(2)
+    const { deps, notices } = watcherHarness({ settleRetryMs: 5, readSession: probe.readSession })
+    const watcher = createStatusWatcher(deps)
+    await watcher.register({
+      childID: "ses_child",
+      parentID: "ses_parent",
+      rootID: "ses_root",
+      description: "任务",
+      agent: "worker",
+      background: true,
+    })
+    watcher.settle("ses_child", { state: "completed" })
+    watcher.stop()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(notices).toEqual([])
   })
 })
