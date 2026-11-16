@@ -597,6 +597,8 @@ export type StatusWatcherDeps = {
   markRuntime: (sessionID: string, background: unknown) => Promise<void>
   clearRuntime: (sessionID: string) => Promise<void>
   write: (record: Record<string, unknown>) => void
+  /** 收尾后按上限淘汰超额子代理；失败只记日志，不影响收尾。 */
+  evictExcess?: (input: { childID: string; parentID: string; rootID?: string }) => Promise<void>
   /** 对账周期（毫秒）。 */
   reconcileIntervalMs?: number
 }
@@ -888,6 +890,21 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         childSessionID: childID,
         cause: errorText(cause),
       })
+    }
+    // 收尾即淘汰：子代理一结束就按上限腾位，不必等下一次派发。
+    if (deps.evictExcess) {
+      try {
+        await deps.evictExcess({ childID, parentID: watch.parentID, rootID: watch.rootID })
+      } catch (cause) {
+        write({
+          event: "evict-error",
+          decision: "error",
+          trigger: "completion",
+          root: watch.rootID,
+          childSessionID: childID,
+          cause: errorText(cause),
+        })
+      }
     }
     watches.delete(childID)
     if (watches.size === 0) stopReconcileTimer()

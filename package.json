@@ -41,6 +41,7 @@
     "storage-migration.ts",
     "subagent-limit.ts",
     "subagent-status.ts",
+    "subagent-evict.ts",
     "build.sh",
     "README.md"
   ],

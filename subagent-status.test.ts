@@ -13,6 +13,7 @@ import {
   collectBackgroundJobs,
   completionState,
   createDispatchLedger,
+  createStatusWatcher,
   finalAssistantText,
   formatBackgroundNotice,
   formatCompletionNotice,
@@ -400,5 +401,121 @@ describe("运行状态标记", () => {
   test("键名与取值固定", () => {
     expect(RUNTIME_METADATA_KEY).toBe("superagent.runtime")
     expect(RUNTIME_STATE_BACKGROUND).toBe("idle-background")
+  })
+})
+
+/** 等待条件成立：看护收尾是异步的，测试要等它跑完。 */
+async function waitFor(predicate: () => boolean, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("等待超时")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
+/** 看护器的假依赖：只保留收尾路径要用的能力。 */
+function watcherHarness(overrides: Record<string, unknown> = {}) {
+  const writes: Record<string, any>[] = []
+  const notices: any[] = []
+  const evictCalls: { childID: string; parentID: string; rootID?: string }[] = []
+  const cleared: string[] = []
+  const deps = {
+    readSession: async (sessionID: string) => ({ id: sessionID, outcome: "succeeded" }),
+    readMessages: async (_sessionID: string) => [] as any[],
+    readEntries: async (_sessionID: string) => [] as any[],
+    notifyParent: async (input: any) => {
+      notices.push(input)
+    },
+    markRuntime: async (_sessionID: string, _background: unknown) => {},
+    clearRuntime: async (sessionID: string) => {
+      cleared.push(sessionID)
+    },
+    write: (record: Record<string, unknown>) => {
+      writes.push(record)
+    },
+    evictExcess: async (input: { childID: string; parentID: string; rootID?: string }) => {
+      evictCalls.push(input)
+    },
+    ...overrides,
+  }
+  return { deps, writes, notices, evictCalls, cleared }
+}
+
+describe("收尾后按上限淘汰", () => {
+  test("收尾成功后调用一次淘汰，参数带 childID/parentID/rootID", async () => {
+    const { deps, evictCalls, cleared } = watcherHarness()
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: false,
+      })
+      await waitFor(() => evictCalls.length === 1)
+      expect(evictCalls[0]).toEqual({ childID: "ses_child", parentID: "ses_parent", rootID: "ses_root" })
+      expect(cleared).toEqual(["ses_child"])
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("后台任务仍在跑时不触发淘汰", async () => {
+    const runningShell = {
+      type: "shell",
+      shellID: "sh_1",
+      command: "npm run dev",
+      status: "running",
+      metadata: { background: true },
+    }
+    const { deps, evictCalls, notices } = watcherHarness({
+      readMessages: async () => [runningShell],
+    })
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: true,
+      })
+      await waitFor(() => notices.length === 1)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(evictCalls).toEqual([])
+      expect(watcher.size()).toBe(1)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("淘汰抛错不影响收尾：watch 被清、日志有 evict-error", async () => {
+    const { deps, writes, cleared } = watcherHarness({
+      evictExcess: async () => {
+        throw new Error("boom")
+      },
+    })
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: false,
+      })
+      await waitFor(() => watcher.size() === 0)
+      expect(cleared).toEqual(["ses_child"])
+      const errors = writes.filter((record) => record.event === "evict-error")
+      expect(errors).toHaveLength(1)
+      expect(errors[0]).toMatchObject({ decision: "error", trigger: "completion", root: "ses_root" })
+    } finally {
+      watcher.stop()
+    }
   })
 })

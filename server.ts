@@ -172,6 +172,7 @@ import {
   pruneClaims,
 } from "./server-state"
 import { SUPERAGENT_SKILLS } from "./skills"
+import { createCompletionEvictor } from "./subagent-evict"
 import {
   DISPATCH_LEDGER_LIMIT,
   SHELL_SETTLE_DELAY_MS,
@@ -675,6 +676,28 @@ export default {
     /** 派发台账：回执、告警与中断结果都按 callID 记在这里。 */
     const ledger = createDispatchLedger(DISPATCH_LEDGER_LIMIT)
 
+    /** root → 飞行中（子会话尚未创建）的 subagent 调用数。 */
+    const flying = new Map<string, number>()
+    /** root → 飞行中的旗舰 subagent 调用数（含本次调用自己的槽）。 */
+    const flyingFlagship = new Map<string, number>()
+    /** 正在被 steer 的子会话：淘汰时避开。 */
+    const steered = new Set<string>()
+
+    /** 收尾淘汰器：子代理一结束就按上限腾位，与派发时的淘汰共用同一套判定。 */
+    const completionEvictor = createCompletionEvictor({
+      listChildren: (rootID, now) => listChildren(ctx, rootID, now),
+      readLimit: async (rootID) => (await readLimit(ctx, rootID, rootID)).limit,
+      readKept: (rootID) => readKeptSubagentsSafe(ctx, rootID, rootID, { trigger: "completion" }),
+      remove: async (sessionID) => {
+        await ctx.session.remove({ sessionID })
+      },
+      classify: (rootID, victimID, now) => classifyEvictFailure(ctx, rootID, victimID, now),
+      isSteered: (sessionID) => steered.has(sessionID),
+      inflight: (rootID) => flying.get(rootID) ?? 0,
+      enabled: (rootID) => readRootCollabEnabled(ctx, rootID),
+      log,
+    })
+
     /** 看护器：登记子代理、完成/后台通知与周期对账都在这里。 */
     const watcher = createStatusWatcher({
       readSession: async (sessionID) => ctx.session.get({ sessionID }),
@@ -689,6 +712,17 @@ export default {
       },
       clearRuntime: async (sessionID) => {
         await clearRuntimeState(ctx, sessionID)
+      },
+      evictExcess: async (input) => {
+        let rootID = input.rootID
+        if (!rootID) {
+          try {
+            rootID = await findRoot(ctx, input.parentID)
+          } catch {
+            return
+          }
+        }
+        await completionEvictor.evictExcess(rootID)
       },
       write: log,
       reconcileIntervalMs: reconcileIntervalMs(),
@@ -732,12 +766,6 @@ export default {
         delegatedTitle?: string
       }
     >()
-    /** root → 飞行中（子会话尚未创建）的 subagent 调用数。 */
-    const flying = new Map<string, number>()
-    /** root → 飞行中的旗舰 subagent 调用数（含本次调用自己的槽）。 */
-    const flyingFlagship = new Map<string, number>()
-    /** 正在被 steer 的子会话：淘汰时避开。 */
-    const steered = new Set<string>()
 
     /** 限额备用模型：首次限额失败开始计时，窗口内恢复就取消，每会话只切一次。 */
     const quotaFallback = createQuotaFallback({
