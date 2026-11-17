@@ -8,6 +8,7 @@ export type OversightSource = "default" | "pin"
  * a human" from the free text of a report.
  */
 export type ReportStatus = "progress" | "blocked" | "ready" | "failed"
+export type ReportStyle = "concise" | "detailed"
 
 export const REPORT_STATUS_VALUES = ["progress", "blocked", "ready", "failed"] as const
 
@@ -332,28 +333,50 @@ export function oversightLabel(contract: Pick<OversightContract, "level">) {
   return `L${contract.level}`
 }
 
-/**
- * The report protocol injected into the assignment prompt. It never limits
- * the Subagent's behavior; it only fixes the required report sections and
- * states that the evidence has to be real.
- */
-export function renderReportProtocol(contract: OversightContract) {
-  const acceptance = contract.acceptance ?? acceptanceForLevel(contract.level)
+const PROCESS_SECTION_PREFIXES = ["执行：", "阶段小结：", "阅读："] as const
+
+function reportSections(contract: OversightContract, reportStyle: ReportStyle) {
+  const sections =
+    reportStyle === "detailed"
+      ? [...contract.sections]
+      : contract.sections.filter(
+          (section) => !PROCESS_SECTION_PREFIXES.some((prefix) => section.startsWith(prefix)),
+        )
+  // 简洁只省略过程记录；任何风格、任何等级的失败都必须留下可核查的失败证据。
+  return sections.includes(FAILURE_DETAIL_SECTION) ? sections : [...sections, FAILURE_DETAIL_SECTION]
+}
+
+/** 给 Subagent 的报告要求，不混入 Superagent 的验收动作。 */
+export function renderReportOnlyProtocol(contract: OversightContract, reportStyle: ReportStyle = "concise") {
   return [
-    `[报告协议 ${oversightLabel(contract)} · ${contract.name}]`,
+    `[报告协议 ${oversightLabel(contract)} · ${contract.name} · ${reportStyle === "concise" ? "简洁" : "详细"}]`,
     contract.cadence,
     HEARTBEAT_LINE,
     REPORT_HEADER_INTRO,
     ...REPORT_HEADER_LINES,
-    ...contract.sections.map((section) => `- ${section}`),
+    ...reportSections(contract, reportStyle).map((section) => `- ${section}`),
     "说明：行为不受限制；证据必须真实（真实执行输出、真实文件引用）；Superagent 可随时翻查 session 完整记录核查。",
     BUDGET_LINE,
     CONTEXT_DISCIPLINE_LINE,
-    "",
+  ].join("\n")
+}
+
+/** 给 Superagent 的验收要求，不重复子代理的报告格式与过程纪律。 */
+export function renderAcceptanceOnlyProtocol(contract: OversightContract) {
+  const acceptance = contract.acceptance ?? acceptanceForLevel(contract.level)
+  return [
     `[Superagent 验收动作 ${oversightLabel(contract)} · ${acceptance.name}]`,
     ...acceptance.actions.map((action) => `- ${action}`),
     `复核方式：${
       acceptance.critic === "required" ? "独立 critic 强制复核" : "critic 复核遵循 root 的 critic 开关"
     }`,
   ].join("\n")
+}
+
+/**
+ * 兼容既有调用方的组合协议。新接线应分别把 report-only 给 Subagent、
+ * acceptance-only 给 Superagent。
+ */
+export function renderReportProtocol(contract: OversightContract, reportStyle: ReportStyle = "concise") {
+  return `${renderReportOnlyProtocol(contract, reportStyle)}\n\n${renderAcceptanceOnlyProtocol(contract)}`
 }

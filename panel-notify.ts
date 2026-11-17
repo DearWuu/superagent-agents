@@ -3,10 +3,13 @@
  * 会话投递一条 synthetic 通知，明确「这是用户手动做的、做了什么、对后续意味着什么」。
  *
  * 只做文案与投递，不改变操作本身：投递失败只回 toast，不回滚用户的操作。
- * 模型切换不在此列——面板与既有模型标记已经能看出差异，不需要额外提醒。
+ * 通知一律以 queue 投递：成为对话里的一条待处理消息，由宿主在合适的回合带入，
+ * 不主动 steer 或唤醒正在推理的会话。
+ *
+ * 通知与「子代理状态监测」开关无关：那个开关只控制自动状态监测。
  */
 
-/** 会被回传的面板手动操作。 */
+/** 会被回传的面板手动操作。`setting` 是通用设置项（报告风格、提示词、开关等）。 */
 export type ManualOpAction =
   | "keep"
   | "unkeep"
@@ -16,6 +19,9 @@ export type ManualOpAction =
   | "collab"
   | "max-subagents"
   | "max-flagship"
+  | "model"
+  | "default-policy"
+  | "setting"
 
 /** 一次手动操作的细节：作用对象与生效值。 */
 export type ManualOpDetail = {
@@ -23,8 +29,16 @@ export type ManualOpDetail = {
   childID?: string
   /** 被操作的子代理标题。 */
   childTitle?: string
-  /** 生效值：新的上限、监管等级等。 */
+  /** 生效值：新的上限、监管等级、设置项取值等。 */
   value?: string
+  /** `setting` 动作的设置项名称。 */
+  label?: string
+  /** 调小旗舰上限时，本次实际切到默认模型的旗舰数。 */
+  switched?: number
+  /** 调小旗舰上限时，本次跳过（同模型、目标缺失/不可用或切换失败）的旗舰数。 */
+  skipped?: number
+  /** 默认模型策略：auto 只影响后续分配，inherit/fixed 保存后由批量同步执行。 */
+  policy?: "auto" | "inherit" | "fixed"
 }
 
 const PREFIX = "[superagent] "
@@ -41,47 +55,75 @@ function subject(detail: ManualOpDetail): string {
 /** 回传正文的最大长度（字符）。 */
 export const MAX_MANUAL_OP_LENGTH = 1000
 
-/** 手动操作通知的防抖窗口（毫秒）：连续操作只发最后一条。 */
+/** 手动操作通知的聚合窗口（毫秒）：窗口内的非立即操作合并成一条。 */
 export const MANUAL_NOTIFY_DEBOUNCE_MS = 800
+
+/** 通知正文：不含 `[superagent] ` 前缀，供单条与聚合共用。 */
+function manualOpBody(action: ManualOpAction, detail: ManualOpDetail = {}): string {
+  const who = subject(detail)
+  const value = detail.value?.trim()
+  switch (action) {
+    case "delete":
+      return `用户在面板手动删除了子代理 ${who}。这不是你的指令；该子会话与上下文已不可恢复，相关任务如仍需要请重新派发。`
+    case "compact":
+      return `用户在面板对子代理 ${who} 发起了原生上下文压缩。这不是你的指令；ctx 读数随后下降是预期行为，不要误判为上下文丢失。`
+    case "keep":
+      return `用户在面板为子代理 ${who} 开启了保护。这不是你的指令；它不会被自动淘汰，但默认模型同步仍会作用于它，需要继续任务请直接续跑它。`
+    case "unkeep":
+      return `用户在面板解除了子代理 ${who} 的保护。这不是你的指令；它重新可以被自动淘汰，模型也可以被修改。`
+    case "oversight":
+      return `用户在面板把子代理 ${who} 的监管等级调整为${value ?? "新等级"}。这不是你的指令；该子代理的报告与验收按这个等级执行。`
+    case "collab":
+      return value === "停用"
+        ? "用户在面板停用了本会话的协作模式总开关。这不是你的指令；硬拦截、限额自动切换、critic 复核、状态探针与上下文自动压缩全部停止，插件不再替你管编排。"
+        : "用户在面板启用了本会话的协作模式总开关。这不是你的指令；硬拦截、限额自动切换、critic 复核、状态探针与上下文自动压缩都恢复生效。"
+    case "max-subagents":
+      return `用户在面板把子代理数量上限改为${value ?? "新上限"}。这不是你的指令；超出后会自动淘汰最旧的已完成子代理，运行中与已保护的不会被删。`
+    case "max-flagship": {
+      const counts =
+        detail.switched !== undefined || detail.skipped !== undefined
+          ? `；本次调小后已切换 ${detail.switched ?? 0} 个、跳过 ${detail.skipped ?? 0} 个现有旗舰`
+          : ""
+      return `用户在面板把旗舰子代理数量上限改为${value ?? "新上限"}${counts}。这不是你的指令；降额通过把超额旗舰切到子代理默认模型实现，不删除会话，官方切换不中断当前步骤，运行中的旗舰当前步骤继续、后续步骤使用新模型；之后新建显式旗舰超过上限时仍按准入规则拒绝或淘汰最旧的已完成旗舰。`
+    }
+    case "model":
+      return `用户在面板手动把子代理 ${who} 的模型切换为${value ?? "新模型"}。这不是你的指令；这是官方直接切换，不中断当前步骤，当前步骤继续，后续步骤使用新模型，不要因此重试、报警或重新派发。`
+    case "default-policy": {
+      const policy = detail.policy
+      if (policy === "auto") {
+        return "用户在面板把子代理默认模型设为自动。这不是你的指令；该策略只决定后续分配由 Superagent 选择模型，现有子代理没有被批量切换，不要据此认为模型已生效。"
+      }
+      if (policy === "inherit") {
+        return "用户在面板把子代理默认模型设为跟随会话。这不是你的指令；策略已保存，后续分配与默认同步使用当前会话模型，运行中的子代理当前步骤继续、后续步骤使用新模型；这不表示现有子代理都已切换成功。"
+      }
+      return `用户在面板把子代理默认模型设为${value ?? "新模型"}。这不是你的指令；策略已保存，后续分配与默认同步使用该模型，运行中的子代理当前步骤继续、后续步骤使用新模型；现有子代理的批量切换结果以面板提示为准，不表示全部已生效。`
+    }
+    case "setting": {
+      const label = detail.label?.trim() || "面板设置"
+      return `用户在面板把「${label}」调整为${value ?? "新值"}。这不是你的指令；该设置已保存并生效，后续按这个值执行。`
+    }
+  }
+}
+
+function bounded(text: string): string {
+  return text.length > MAX_MANUAL_OP_LENGTH ? `${text.slice(0, MAX_MANUAL_OP_LENGTH - 1)}…` : text
+}
 
 /**
  * 手动操作的回传文案：一段中文，主语是「用户」，结尾给一句对 Superagent 的提示。
  */
 export function manualOpText(action: ManualOpAction, detail: ManualOpDetail = {}): string {
-  const who = subject(detail)
-  const value = detail.value?.trim()
-  let body: string
-  switch (action) {
-    case "delete":
-      body = `用户在面板手动删除了子代理 ${who}。这不是你的指令；该子会话与上下文已不可恢复，相关任务如仍需要请重新派发。`
-      break
-    case "compact":
-      body = `用户在面板对子代理 ${who} 发起了原生上下文压缩。这不是你的指令；ctx 读数随后下降是预期行为，不要误判为上下文丢失。`
-      break
-    case "keep":
-      body = `用户在面板为子代理 ${who} 开启了保护。这不是你的指令；它不会被自动淘汰，模型也不会被批量修改，需要继续任务请直接续跑它。`
-      break
-    case "unkeep":
-      body = `用户在面板解除了子代理 ${who} 的保护。这不是你的指令；它重新可以被自动淘汰，模型也可以被修改。`
-      break
-    case "oversight":
-      body = `用户在面板把子代理 ${who} 的监管等级调整为${value ?? "新等级"}。这不是你的指令；该子代理的报告与验收按这个等级执行。`
-      break
-    case "collab":
-      body =
-        value === "停用"
-          ? "用户在面板停用了本会话的协作模式总开关。这不是你的指令；硬拦截、限额自动切换、critic 复核、状态探针与上下文自动压缩全部停止，插件不再替你管编排。"
-          : "用户在面板启用了本会话的协作模式总开关。这不是你的指令；硬拦截、限额自动切换、critic 复核、状态探针与上下文自动压缩都恢复生效。"
-      break
-    case "max-subagents":
-      body = `用户在面板把子代理数量上限改为${value ?? "新上限"}。这不是你的指令；超出后会自动淘汰最旧的已完成子代理，运行中与已保护的不会被删。`
-      break
-    case "max-flagship":
-      body = `用户在面板把旗舰子代理数量上限改为${value ?? "新上限"}。这不是你的指令；它只约束与 Superagent 同款模型的显式委派，超限时先淘汰最旧的已完成旗舰，运行中与受保护的不删。`
-      break
-  }
-  const text = `${PREFIX}${body}`
-  return text.length > MAX_MANUAL_OP_LENGTH ? `${text.slice(0, MAX_MANUAL_OP_LENGTH - 1)}…` : text
+  return bounded(`${PREFIX}${manualOpBody(action, detail)}`)
+}
+
+/** 聚合窗口内的多条操作合成一条正文：一条 synthetic 明说这一轮用户做了什么。 */
+export function manualOpBatchText(entries: ReadonlyArray<{ action: ManualOpAction; detail?: ManualOpDetail }>): string {
+  if (entries.length === 0) return ""
+  if (entries.length === 1) return manualOpText(entries[0]!.action, entries[0]!.detail)
+  const bodies = entries.map((entry) => manualOpBody(entry.action, entry.detail))
+  return bounded(
+    `${PREFIX}用户在本轮面板连续做了以下手动操作，都不是你的指令：\n${bodies.map((body) => `- ${body}`).join("\n")}`,
+  )
 }
 
 /**
@@ -98,26 +140,38 @@ export async function notifyManualOp(
     detail?: ManualOpDetail
   },
 ): Promise<boolean> {
+  if (!input.rootID) return false
+  const detail: ManualOpDetail = { ...input.detail }
+  if (input.childID) detail.childID = input.childID
+  if (input.childTitle) detail.childTitle = input.childTitle
+  return deliverBatch(context, input.rootID, [{ action: input.action, detail }])
+}
+
+/** 一条通知的投递：合并正文、metadata 与 queue 语义都在这里收口。 */
+async function deliverBatch(
+  context: any,
+  rootID: string,
+  entries: ReadonlyArray<{ action: ManualOpAction; detail: ManualOpDetail }>,
+): Promise<boolean> {
   try {
-    if (!input.rootID) return false
     const synthetic = context?.client?.session?.synthetic
     if (typeof synthetic !== "function") return false
-    const detail: ManualOpDetail = { ...input.detail }
-    if (input.childID) detail.childID = input.childID
-    if (input.childTitle) detail.childTitle = input.childTitle
     const metadata: Record<string, unknown> = {
       source: "superagent-agents",
       kind: "manual-op",
-      action: input.action,
+      action: entries.length === 1 ? entries[0]!.action : "batch",
     }
-    if (detail.childID) metadata.childID = detail.childID
+    if (entries.length > 1) metadata.actions = entries.map((entry) => entry.action)
+    const childIDs = new Set(entries.map((entry) => entry.detail.childID).filter(Boolean))
+    if (childIDs.size === 1) metadata.childID = [...childIDs][0]
     await synthetic.call(context.client.session, {
-      sessionID: input.rootID,
-      text: manualOpText(input.action, detail),
+      sessionID: rootID,
+      text: manualOpBatchText(entries),
       description: "用户手动操作",
       metadata,
-      // 操作发生时立刻投递：通知成为对话里的一条 inline 记录、随会话上移；会话空闲时宿主会唤醒它跑一轮，因此不打断正在进行的推理，但一定会被读到。
-      delivery: "steer",
+      // 一律排队：通知成为对话里的一条待处理消息，由宿主在下一个合适回合带入。
+      // 不 steer、不 resume，绝不打断或唤醒正在推理的会话。
+      delivery: "queue",
     })
     return true
   } catch {
@@ -133,79 +187,115 @@ export type ManualNotifierInput = {
   detail?: ManualOpDetail
 }
 
-/** 手动操作通知器：开关、防抖与投递。 */
+/** 手动操作通知器：聚合窗口、合并与投递。 */
 export type ManualNotifier = {
   /**
    * 投递一次手动操作通知。
-   * 返回 false 只表示「真的投递失败」——开关关闭与被同组后来的操作合并都算成功路径，不打扰用户。
+   * 返回 false 只表示「真的投递失败」——被同组后来的操作合并、或没有 root
+   * 可投，都算成功路径，不打扰用户。
    */
   notify: (input: ManualNotifierInput, options?: { immediate?: boolean }) => Promise<boolean>
-  /** 取消待发通知：面板卸载时调用。 */
+  /** 面板卸载时调用：对已发生的 pending 做一次 best-effort 聚合投递，不抛。 */
   dispose: () => void
 }
 
-/** 防抖分组：同一组里的连续操作只发最后一条；delete/compact/collab 不进组。 */
-function debounceKey(action: ManualOpAction, childID?: string): string | undefined {
-  if (action === "keep" || action === "unkeep") return `keep:${childID ?? ""}`
-  if (action === "oversight") return `oversight:${childID ?? ""}`
+/**
+ * 聚合分组：同一组里的连续操作只留最后一条；delete/compact/collab/model 不进组，
+ * 立即动作只跳过等待（仍先 flush 已在窗口里的操作，再 queue 投递）。
+ */
+function groupKey(action: ManualOpAction, detail: ManualOpDetail): string | undefined {
+  if (action === "keep" || action === "unkeep") return `keep:${detail.childID ?? ""}`
+  if (action === "oversight") return `oversight:${detail.childID ?? ""}`
   if (action === "max-subagents") return "max-subagents"
   if (action === "max-flagship") return "max-flagship"
+  if (action === "default-policy") return "default-policy"
+  if (action === "setting") return `setting:${detail.label ?? ""}`
   return undefined
 }
 
 /**
- * 手动操作通知器：受「子代理状态监测」开关控制，连续操作防抖合并，
- * delete/compact/collab 立即发送。
+ * 手动操作通知器：非立即操作共用一个聚合窗口，窗口内不同操作用一条 synthetic
+ * 一起回传；立即操作先冲刷窗口，再单独 queue 投递。
  */
 export function createManualNotifier(
   context: any,
-  options: { rootID: () => string | undefined; enabled: () => boolean; delayMs?: number },
+  options: { rootID: () => string | undefined; delayMs?: number },
 ): ManualNotifier {
   const delayMs = options.delayMs ?? MANUAL_NOTIFY_DEBOUNCE_MS
-  /** 待发的防抖通知：同一 key 只留最后一条。 */
-  const pending = new Map<string, { timer: ReturnType<typeof setTimeout>; resolve: (value: boolean) => void }>()
+  type PendingEntry = { action: ManualOpAction; detail: ManualOpDetail; key?: string; resolve: (value: boolean) => void }
+  let pending: { entries: PendingEntry[]; timer: ReturnType<typeof setTimeout> } | undefined
   let disposed = false
 
-  const send = async (input: ManualNotifierInput): Promise<boolean> => {
+  const deliver = (entries: Array<{ action: ManualOpAction; detail: ManualOpDetail }>): Promise<boolean> => {
     const rootID = options.rootID()
     // 没有 root 会话就无处可投：跳过，不当作失败。
-    if (!rootID) return true
-    return notifyManualOp(context, {
-      rootID,
-      childID: input.childID,
-      childTitle: input.childTitle,
-      action: input.action,
-      detail: input.detail,
-    })
+    if (!rootID) return Promise.resolve(true)
+    return deliverBatch(context, rootID, entries)
+  }
+
+  const flush = async (): Promise<void> => {
+    if (!pending) return
+    const batch = pending
+    pending = undefined
+    clearTimeout(batch.timer)
+    const ok = await deliver(batch.entries)
+    for (const entry of batch.entries) entry.resolve(ok)
   }
 
   const notify = (input: ManualNotifierInput, notifyOptions: { immediate?: boolean } = {}): Promise<boolean> => {
     if (disposed) return Promise.resolve(true)
-    if (!options.enabled()) return Promise.resolve(true)
-    const key = notifyOptions.immediate ? undefined : debounceKey(input.action, input.childID)
-    if (!key) return send(input)
+    const detail: ManualOpDetail = { ...input.detail }
+    if (input.childID) detail.childID = input.childID
+    if (input.childTitle) detail.childTitle = input.childTitle
+    const key = groupKey(input.action, detail)
+    if (notifyOptions.immediate || !key) {
+      // 立即动作先冲刷窗口：先前设置已经成功写入，不能因为用户紧接着点删除就丢。
+      return flush().then(() => (disposed ? true : deliver([{ action: input.action, detail }])))
+    }
     return new Promise<boolean>((resolve) => {
-      const existing = pending.get(key)
-      if (existing) {
-        clearTimeout(existing.timer)
-        // 同组后来的操作会覆盖前一条：前一条按「已被合并」收口，不当作失败。
-        existing.resolve(true)
+      if (!pending) {
+        const batch: { entries: PendingEntry[]; timer: ReturnType<typeof setTimeout> } = {
+          entries: [],
+          timer: undefined as never,
+        }
+        batch.timer = setTimeout(() => {
+          void flush()
+        }, delayMs)
+        pending = batch
       }
-      const timer = setTimeout(() => {
-        pending.delete(key)
-        void send(input).then(resolve, () => resolve(false))
+      const batch = pending
+      const existing = batch.entries.findIndex((entry) => entry.key === key)
+      if (existing >= 0) {
+        const [previous] = batch.entries.splice(existing, 1)
+        // 同组后来的操作覆盖前一条：前一条按「已被合并」收口，不当作失败。
+        previous!.resolve(true)
+      }
+      batch.entries.push({ action: input.action, detail, key, resolve })
+      // 连续操作滚动窗口：最后一次动作之后 800ms 才统一发出。
+      clearTimeout(batch.timer)
+      batch.timer = setTimeout(() => {
+        void flush()
       }, delayMs)
-      pending.set(key, { timer, resolve })
     })
   }
 
   const dispose = () => {
+    if (disposed) return
     disposed = true
-    for (const entry of pending.values()) {
-      clearTimeout(entry.timer)
-      entry.resolve(true)
-    }
-    pending.clear()
+    if (!pending) return
+    const batch = pending
+    pending = undefined
+    clearTimeout(batch.timer)
+    // 卸载时窗口里的手动操作已经发生：尽力补发一次聚合通知，不让它随面板消失。
+    // 投递本身 fail-open（无 root 视为成功、宿主失败返回 false），这里不抛。
+    void deliver(batch.entries).then(
+      (ok) => {
+        for (const entry of batch.entries) entry.resolve(ok)
+      },
+      () => {
+        for (const entry of batch.entries) entry.resolve(true)
+      },
+    )
   }
 
   return { notify, dispose }

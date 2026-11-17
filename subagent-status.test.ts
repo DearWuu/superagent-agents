@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test"
 
 import {
   DISPATCH_LEDGER_LIMIT,
+  MAX_NOTICE_TEXT_LENGTH,
   MAX_RECEIPT_LENGTH,
   RUNTIME_METADATA_KEY,
   RUNTIME_STATE_BACKGROUND,
@@ -274,10 +275,20 @@ describe("通知与提醒文案", () => {
     expect(text).toBe('<subagent sessionID="ses_x" state="completed">\n干完了\n</subagent>')
   })
 
-  test("完成通知正文截断到 4000 字", () => {
-    const text = formatCompletionNotice({ childID: "ses_x", state: "error", text: "y".repeat(5000) })
-    expect(text).toContain("y".repeat(4000))
-    expect(text).not.toContain("y".repeat(4001))
+  test("完成通知整卡含标签截断到 4000 字且保持闭合", () => {
+    const text = formatCompletionNotice({
+      childID: "ses_x",
+      description: "任务",
+      state: "error",
+      text: "y".repeat(5000),
+    })
+    const opening = '<subagent sessionID="ses_x" state="error" description="任务">\n'
+    const closing = "\n</subagent>"
+    expect(MAX_NOTICE_TEXT_LENGTH).toBe(4000)
+    expect(text.length).toBe(MAX_NOTICE_TEXT_LENGTH)
+    expect(text.startsWith(opening)).toBe(true)
+    expect(text.endsWith(closing)).toBe(true)
+    expect(text.slice(opening.length, -closing.length)).toBe("y".repeat(MAX_NOTICE_TEXT_LENGTH - opening.length - closing.length))
   })
 
   test("提醒文案写清子会话与状态", () => {
@@ -584,9 +595,10 @@ describe("收尾撞上忙碌读的兜底", () => {
     }
   }
 
-  test("重试后不再忙碌：完成通知照常发出", async () => {
+  test("重试后不再忙碌：无原生时等待 reconcile 补完整完成卡", async () => {
     const probe = busyThenIdle(2)
-    const { deps, notices } = watcherHarness({
+    const { deps, notices, writes } = watcherHarness({
+      nativeNoticeWaitMs: 5,
       settleRetryMs: 5,
       readSession: probe.readSession,
     })
@@ -601,8 +613,21 @@ describe("收尾撞上忙碌读的兜底", () => {
         background: true,
       })
       watcher.settle("ses_child", { state: "completed" })
-      await waitFor(() => notices.length === 1, 5000)
+      await waitFor(() => writes.some((record) => record.event === "status-completion-pending"), 5000)
+      expect(notices).toEqual([])
+      expect(watcher.size()).toBe(1)
+
+      await watcher.reconcile()
+      expect(notices).toHaveLength(1)
+      expect(notices[0].metadata).toEqual({ source: "superagent-agents", childID: "ses_child", state: "completed" })
+      expect(notices[0].text).toContain('<subagent sessionID="ses_child" state="completed" description="任务">')
+      expect(notices[0].text).toContain("子代理已结束，未取到最终输出。")
+      expect(notices[0].text.endsWith("\n</subagent>")).toBe(true)
+      expect(notices[0].text).not.toContain("如已知晓可忽略")
+      expect(writes.some((record) => record.event === "status-completion-fallback")).toBe(true)
       expect(watcher.size()).toBe(0)
+      await watcher.reconcile()
+      expect(notices).toHaveLength(1)
     } finally {
       watcher.stop()
     }

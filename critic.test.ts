@@ -4,9 +4,13 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import {
   CRITIC_TITLE_PREFIX,
+  buildCriticPrompt,
   criticReview,
   isCriticSession,
+  lastAssistantText,
+  messageText,
   parseCriticVerdict,
+  summarizeSessionRecord,
   type CriticClient,
   type CriticSessionInfo,
 } from "./critic"
@@ -90,6 +94,150 @@ describe("critic verdict parsing", () => {
   test("collects the differences", () => {
     const parsed = parseCriticVerdict("verdict: 部分不一致\ndifferences:\n- 记录里没有写操作")
     expect(parsed.differences).toEqual(["记录里没有写操作"])
+  })
+})
+
+describe("critic message text", () => {
+  test("uses only the formal text when reasoning and tool parts precede the report", () => {
+    const report = "verdict: 一致\ndifferences:\n- 无"
+    const message = {
+      type: "assistant",
+      content: [
+        { type: "reasoning", text: "verdict: 严重不一致\ndifferences:\n- 推理草稿" },
+        { type: "tool", text: "verdict: 证据不足", state: { output: "工具正文" } },
+        { type: "text", text: report },
+      ],
+    }
+
+    expect(messageText(message)).toBe(report)
+    expect(lastAssistantText([message])).toBe(report)
+  })
+
+  test("keeps direct message text and text parts compatible", () => {
+    const message = {
+      role: "assistant",
+      text: "verdict: 部分不一致",
+      parts: [{ type: "reasoning", text: "内部推理" }, { type: "text", text: "differences:\n- 真实差异" }],
+    }
+
+    expect(messageText(message)).toBe("verdict: 部分不一致\ndifferences:\n- 真实差异")
+    expect(lastAssistantText([message])).toBe("verdict: 部分不一致\ndifferences:\n- 真实差异")
+  })
+})
+
+describe("critic session record", () => {
+  test("summarizes shell and tool input, status, exit code, error and output", () => {
+    const record = summarizeSessionRecord([
+      { command: "bun test critic.test.ts", exit: 0 },
+      {
+        content: [
+          {
+            type: "tool",
+            name: "shell",
+            state: {
+              status: "completed",
+              input: { command: "bun test critic.test.ts" },
+              output: "10 pass",
+              metadata: { exitCode: 0 },
+            },
+          },
+        ],
+      },
+      {
+        parts: [
+          {
+            type: "tool",
+            tool: "read",
+            input: { filePath: "src/a.ts" },
+            status: "error",
+            error: { message: "permission denied" },
+            output: "partial output",
+          },
+          {
+            type: "tool",
+            name: "legacy-shell",
+            state: {
+              status: "completed",
+              input: { command: "legacy" },
+              content: [
+                { type: "reasoning", text: "not tool output" },
+                { type: "text", text: "content output" },
+              ],
+              metadata: { exit: 1 },
+            },
+          },
+        ],
+      },
+    ])
+    const lines = record.split("\n")
+
+    expect(lines[0]).toBe("[shell] bun test critic.test.ts exit=0")
+    expect(lines[1]).toContain("command=bun test critic.test.ts")
+    expect(lines[1]).toContain("status=completed")
+    expect(lines[1]).toContain("exit=0")
+    expect(lines[1]).toContain("output=10 pass")
+    expect(lines[1]).not.toContain("error=")
+    expect(lines[2]).toContain("[tool:read] filePath=src/a.ts")
+    expect(lines[2]).toContain("status=error")
+    expect(lines[2]).toContain("error=permission denied")
+    expect(lines[2]).toContain("output=partial output")
+    expect(lines[3]).toContain("output=content output")
+    expect(lines[3]).toContain("exit=1")
+    expect(lines[3]).not.toContain("not tool output")
+  })
+
+  test("does not invent execution fields that are absent", () => {
+    const record = summarizeSessionRecord([
+      { parts: [{ type: "tool", name: "read", state: { input: { filePath: "src/a.ts" } } }] },
+    ])
+
+    expect(record).toBe("[tool:read] filePath=src/a.ts")
+    expect(record).not.toContain("undefined")
+    expect(record).not.toContain("status=")
+    expect(record).not.toContain("exit=")
+    expect(record).not.toContain("error=")
+    expect(record).not.toContain("output=")
+  })
+
+  test("bounds each output and the complete record", () => {
+    const output = summarizeSessionRecord([
+      { parts: [{ type: "tool", name: "shell", state: { output: "x".repeat(2000) } }] },
+    ])
+    const summary = /output=(.*)$/.exec(output)?.[1]
+
+    expect(summary).toHaveLength(600)
+    expect(summary?.endsWith("…[截断]")).toBe(true)
+
+    const many = summarizeSessionRecord(
+      Array.from({ length: 220 }, (_, index) => ({
+        parts: [{ type: "tool", name: `tool-${index}`, state: { output: "y".repeat(2000) } }],
+      })),
+    )
+    expect(many.length).toBeLessThanOrEqual(60_000)
+    expect(many.split("\n").length).toBeLessThanOrEqual(200)
+    expect(many).toContain("…[截断]")
+
+    const linesOnly = summarizeSessionRecord(
+      Array.from({ length: 220 }, (_, index) => ({ command: `command-${index}`, exit: 0 })),
+    )
+    expect(linesOnly.split("\n")).toHaveLength(200)
+    expect(linesOnly).toContain("后续工具记录已截断")
+  })
+})
+
+describe("critic prompt evidence rules", () => {
+  test("empty records cannot imply non-execution, while real conflicts still count", () => {
+    const prompt = buildCriticPrompt({ reportText: "测试通过", record: "", files: [] })
+
+    expect(prompt).toContain("未从宿主消息提取到工具记录，不代表命令未执行")
+    expect(prompt).toContain("相关事项只能判为证据不足")
+    expect(prompt).toContain("不得据此断言命令未执行、文件未读取或报告虚假")
+    expect(prompt).toContain("有真实记录与报告直接矛盾时")
+    expect(prompt).toContain("部分不一致或严重不一致")
+
+    const conflict = parseCriticVerdict("verdict: 部分不一致\ndifferences:\n- 记录 exit=1，与报告测试通过矛盾")
+    expect(conflict.verdict).toBe("部分不一致")
+    expect(conflict.differences).toEqual(["记录 exit=1，与报告测试通过矛盾"])
   })
 })
 

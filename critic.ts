@@ -198,7 +198,7 @@ function partsOf(message: unknown): readonly unknown[] {
   return []
 }
 
-/** The text of one message, whichever shape the client returned. */
+/** The text of one message, excluding reasoning and tool output. */
 export function messageText(message: unknown): string {
   const record = asRecord(message)
   if (!record) return ""
@@ -206,7 +206,9 @@ export function messageText(message: unknown): string {
   const direct = readString(record, "text")
   if (direct) chunks.push(direct)
   for (const part of partsOf(message)) {
-    const text = readString(asRecord(part), "text")
+    const partRecord = asRecord(part)
+    if (partRecord?.type !== "text") continue
+    const text = readString(partRecord, "text")
     if (text) chunks.push(text)
   }
   return chunks.join("\n").trim()
@@ -225,6 +227,10 @@ export function lastAssistantText(messages: readonly unknown[]): string {
 }
 
 const INPUT_KEYS = ["filePath", "path", "file", "command", "pattern", "query", "description", "url"] as const
+const RECORD_MAX_LINES = 200
+const RECORD_MAX_CHARS = 60_000
+const EVIDENCE_MAX_CHARS = 600
+const TRUNCATION_MARKER = "…[截断]"
 
 /** One line per tool call or shell command, so the critic sees what ran. */
 export function summarizeSessionRecord(messages: readonly unknown[]): string {
@@ -234,20 +240,106 @@ export function summarizeSessionRecord(messages: readonly unknown[]): string {
     if (!record) continue
     const command = readString(record, "command")
     if (command) {
-      const exit = typeof record.exit === "number" ? ` exit=${record.exit}` : ""
-      lines.push(`[shell] ${command}${exit}`)
+      lines.push(`[shell] ${command} ${describeExecution(evidenceContainers(record)).join(" ")}`.trimEnd())
       continue
     }
     for (const part of partsOf(message)) {
       const partRecord = asRecord(part)
       if (!partRecord || partRecord.type !== "tool") continue
-      const name = readString(partRecord, "name") ?? "tool"
+      const name = readString(partRecord, "name") ?? readString(partRecord, "tool") ?? "tool"
       const state = asRecord(partRecord.state)
       const input = asRecord(state?.input) ?? asRecord(partRecord.input)
-      lines.push(`[tool:${name}] ${describeInput(input)}`)
+      const details = [describeInput(input), ...describeExecution(evidenceContainers(partRecord, state))].filter(Boolean)
+      lines.push(`[tool:${name}]${details.length > 0 ? ` ${details.join(" ")}` : ""}`)
     }
   }
-  return lines.slice(0, 200).join("\n")
+  const selected = lines.slice(0, RECORD_MAX_LINES)
+  if (lines.length > RECORD_MAX_LINES && selected.length > 0) {
+    selected[selected.length - 1] += " …[后续工具记录已截断]"
+  }
+  return clipText(selected.join("\n"), RECORD_MAX_CHARS)
+}
+
+function evidenceContainers(
+  part: Record<string, unknown>,
+  state?: Record<string, unknown>,
+): Record<string, unknown>[] {
+  return [state, part, asRecord(state?.metadata), asRecord(part.metadata)].filter(
+    (value): value is Record<string, unknown> => value !== undefined,
+  )
+}
+
+function describeExecution(containers: readonly Record<string, unknown>[]): string[] {
+  const details: string[] = []
+  const status = firstString(containers, "status")
+  if (status) details.push(`status=${oneLine(status)}`)
+  const exit = firstExitCode(containers)
+  if (exit !== undefined) details.push(`exit=${exit}`)
+  const error = firstError(containers)
+  if (error) details.push(`error=${summarizeEvidence(error)}`)
+  const output = firstOutput(containers)
+  if (output) details.push(`output=${summarizeEvidence(output)}`)
+  return details
+}
+
+function firstString(containers: readonly Record<string, unknown>[], key: string): string | undefined {
+  for (const container of containers) {
+    const value = readString(container, key)
+    if (value) return value
+  }
+  return undefined
+}
+
+function firstExitCode(containers: readonly Record<string, unknown>[]): number | undefined {
+  for (const container of containers) {
+    for (const key of ["exitCode", "exit_code", "exit"]) {
+      const value = container[key]
+      if (typeof value === "number" && Number.isFinite(value)) return value
+    }
+  }
+  return undefined
+}
+
+function firstError(containers: readonly Record<string, unknown>[]): string | undefined {
+  for (const container of containers) {
+    const value = container.error
+    if (typeof value === "string" && value.trim()) return value
+    const message = readString(asRecord(value), "message")
+    if (message?.trim()) return message
+  }
+  return undefined
+}
+
+function firstOutput(containers: readonly Record<string, unknown>[]): string | undefined {
+  for (const container of containers) {
+    const output = readString(container, "output")
+    if (output?.trim()) return output
+    const content = container.content
+    if (typeof content === "string" && content.trim()) return content
+    if (!Array.isArray(content)) continue
+    const chunks: string[] = []
+    for (const item of content) {
+      const itemRecord = asRecord(item)
+      if (itemRecord?.type !== "text") continue
+      const text = readString(itemRecord, "text")
+      if (text) chunks.push(text)
+    }
+    if (chunks.length > 0) return chunks.join("\n")
+  }
+  return undefined
+}
+
+function summarizeEvidence(text: string): string {
+  return clipText(oneLine(text.trim()), EVIDENCE_MAX_CHARS)
+}
+
+function oneLine(text: string): string {
+  return text.replace(/\r/g, "\\r").replace(/\n/g, "\\n")
+}
+
+function clipText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  return `${text.slice(0, maxChars - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`
 }
 
 /** The files the session touched, from the tool inputs. */
@@ -275,7 +367,7 @@ function describeInput(input: Record<string, unknown> | undefined): string {
   for (const key of INPUT_KEYS) {
     const value = input[key]
     if (typeof value !== "string" || value.length === 0) continue
-    parts.push(`${key}=${value.length > 120 ? `${value.slice(0, 120)}…` : value}`)
+    parts.push(`${key}=${clipText(oneLine(value), 120)}`)
   }
   return parts.join(" ")
 }
@@ -294,7 +386,7 @@ export function buildCriticPrompt(input: {
     input.reportText.trim() || "（子代理没有产出报告正文）",
     "",
     "## 2. 该子会话的真实记录摘要（工具调用与命令）",
-    input.record.trim() || "（该子会话没有可用的工具记录）",
+    input.record.trim() || "（未从宿主消息提取到工具记录，不代表命令未执行）",
     "",
     "## 3. 涉及的文件",
     input.files.length > 0 ? input.files.join("\n") : "（记录里没有出现文件路径）",
@@ -305,6 +397,8 @@ export function buildCriticPrompt(input: {
     "- 报告声称执行的测试：命令是否真的执行过，输出与结论是否一致。",
     "- 报告声称读过的文件：是否确有读取记录。",
     "- 报告是否遗漏了实际存在但未报告的风险、失败或未完成项。",
+    "- 工具记录缺失或为空时，相关事项只能判为证据不足；不得据此断言命令未执行、文件未读取或报告虚假。",
+    "- 有真实记录与报告直接矛盾时，仍须按差异程度判为部分不一致或严重不一致，不得因记录不完整而忽略已确认的矛盾。",
     "",
     "## 5. 输出格式（严格遵守）",
     "先输出一行 `verdict: <结论>`，结论只能是下面四个之一，不得改写：",

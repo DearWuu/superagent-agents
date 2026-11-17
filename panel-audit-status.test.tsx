@@ -73,6 +73,8 @@ function harness(options?: {
   active?: string[]
   /** 会话 id → 消息列表。 */
   messages?: Record<string, Message[]>
+  /** 模型目录里的上下文窗口：给了就按真实窗口收紧 ctx 警示阈值。 */
+  modelLimit?: number
 }) {
   const root: Session = { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } }
   const children = options?.children ?? [
@@ -162,7 +164,15 @@ function harness(options?: {
         status: (id: string) => store.active[id] ?? "idle",
         message: { list: (id: string) => store.messages[id] ?? [], sync: async () => {} },
       },
-      location: { model: { list: () => models }, provider: { list: () => [] } },
+      location: {
+        model: {
+          list: () =>
+            options?.modelLimit
+              ? models.map((model) => ({ ...model, limit: { context: options.modelLimit } }))
+              : models,
+        },
+        provider: { list: () => [] },
+      },
     },
     client: {
       experimental: {
@@ -513,6 +523,37 @@ test("失败重试行随消息刷新", async () => {
     await h.app.flush()
     const failedFrame = await h.app.waitForFrame((value) => value.includes("失败 · 重试 #2"))
     expect(failedFrame).toContain("上次失败：上游 503")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("ctx 警示阈值用模型目录的真实窗口：128K 按 80% 收紧", async () => {
+  const tokens = (input: number) => ({ input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
+  const h = await render({
+    modelLimit: 128_000,
+    messages: { child: [{ id: "m1", type: "assistant", status: "completed", tokens: tokens(103_000) }] },
+  })
+  try {
+    await h.app.flush()
+    const frame = await h.app.waitForFrame((value) => value.includes("ctx 103k"))
+    // 103k > 128K * 0.8 = 102.4k，按目录窗口应警示。
+    expect(frame).toContain("ctx 103k ⚠")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("模型目录没有窗口数据时 ctx 仍按 300K 阈值", async () => {
+  const tokens = (input: number) => ({ input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
+  const h = await render({
+    messages: { child: [{ id: "m1", type: "assistant", status: "completed", tokens: tokens(103_000) }] },
+  })
+  try {
+    await h.app.flush()
+    const frame = await h.app.waitForFrame((value) => value.includes("ctx 103k"))
+    expect(frame).toContain("ctx 103k")
+    expect(frame).not.toContain("⚠")
   } finally {
     h.app.renderer.destroy()
   }

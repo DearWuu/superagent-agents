@@ -209,6 +209,8 @@ function call(id: string, input: Record<string, unknown> = {}) {
 
 const rootEntries = (extra: Entry[] = []): Entry[] => [
   { key: "superagent.max-subagents", value: 5 },
+  // 本文件只测保护名单；显式同模型 steer 会按旗舰准入计数，给足显式额度避免默认 0 干扰。
+  { key: "superagent.max-flagship-subagents", value: 2 },
   { key: "superagent.fallback-threshold", value: 3 },
   { key: "superagent.fallback-model", value: "acme/backup" },
   { key: "superagent.subagent-fallback-model", value: "acme/backup" },

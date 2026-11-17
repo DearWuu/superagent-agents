@@ -67,12 +67,14 @@ describe("状态轮次隔离", () => {
     expect(terminalNoticeSeen([{ ...oldCard, time: { created: 11_000 } }], CHILD, "completed", 11_000)).toBe(true)
   })
 
-  test("同一 child 连续两轮各自收到完成通知，不被旧卡判重", async () => {
-    const { deps, notices, parentMessages } = harness()
+  test("同一 child 连续两轮各自收到兜底完成通知，不被旧卡判重", async () => {
+    const { deps, notices, parentMessages, writes } = harness({ nativeNoticeWaitMs: 5 })
     const watcher = createStatusWatcher(deps)
     try {
       await watcher.register(registration())
       watcher.settle(CHILD, { state: "completed" })
+      await waitFor(() => writes.some((record) => record.event === "status-completion-pending"))
+      await watcher.reconcile()
       await waitFor(() => notices.length === 1)
       await waitFor(() => watcher.size() === 0)
 
@@ -80,6 +82,8 @@ describe("状态轮次隔离", () => {
       parentMessages[0].time.created = Date.now() - 2000
       await watcher.register(registration())
       watcher.settle(CHILD, { state: "completed" })
+      await waitFor(() => writes.filter((record) => record.event === "status-completion-pending").length === 2)
+      await watcher.reconcile()
       await waitFor(() => notices.length === 2)
       expect(notices.map((notice) => notice.metadata.state)).toEqual(["completed", "completed"])
     } finally {
@@ -91,7 +95,8 @@ describe("状态轮次隔离", () => {
     let round = 1
     let secondRoundAt = 0
     let reads = 0
-    const { deps, notices } = harness({
+    const { deps, notices, writes } = harness({
+      nativeNoticeWaitMs: 5,
       settleRetryMs: 100,
       settleRetryLimit: 1,
       readSession: async (sessionID: string) => {
@@ -115,6 +120,8 @@ describe("状态轮次隔离", () => {
       await watcher.register(registration())
       // 新轮自己的 execution 终态事件：应升级旧初探，而不是被旧预算吞掉。
       watcher.settle(CHILD, { state: "completed" })
+      await waitFor(() => writes.some((record) => record.event === "status-completion-pending"))
+      await watcher.reconcile()
       await waitFor(() => notices.length === 1)
       expect(notices[0].metadata.state).toBe("completed")
     } finally {
@@ -122,8 +129,9 @@ describe("状态轮次隔离", () => {
     }
   })
 
-  test("本轮已落盘 idle 的后台派发仍立即补发完成通知", async () => {
-    const { deps, notices } = harness({
+  test("本轮已落盘 idle 的后台派发进入终态兜底，对账时补发完成通知", async () => {
+    const { deps, notices, writes } = harness({
+      nativeNoticeWaitMs: 5,
       readSession: async (sessionID: string) => ({
         id: sessionID,
         outcome: "succeeded",
@@ -133,6 +141,9 @@ describe("状态轮次隔离", () => {
     const watcher = createStatusWatcher(deps)
     try {
       await watcher.register(registration())
+      await waitFor(() => writes.some((record) => record.event === "status-completion-pending"))
+      expect(notices).toEqual([])
+      await watcher.reconcile()
       await waitFor(() => notices.length === 1)
       expect(notices[0].metadata.state).toBe("completed")
       expect(watcher.size()).toBe(0)
@@ -211,7 +222,8 @@ describe("状态轮次隔离", () => {
   test("无 outcome 且无 busy/idle 的 shell 收尾不默认成 completed", async () => {
     let current: any = { id: CHILD, outcome: null, time: { busy: 10 } }
     let reads = 0
-    const { deps, notices } = harness({
+    const { deps, notices, writes } = harness({
+      nativeNoticeWaitMs: 5,
       settleRetryLimit: 0,
       readSession: async () => {
         reads += 1
@@ -240,6 +252,8 @@ describe("状态轮次隔离", () => {
 
       current = { id: CHILD, outcome: "succeeded", time: { busy: 10, idle: 20 } }
       watcher.settle(CHILD, { state: "completed" })
+      await waitFor(() => writes.some((record) => record.event === "status-completion-pending"))
+      await watcher.reconcile()
       await waitFor(() => notices.length === 1)
       expect(notices[0].metadata.state).toBe("completed")
     } finally {

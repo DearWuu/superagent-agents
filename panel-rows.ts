@@ -8,6 +8,7 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import type { FlatNode } from "./agent-tree"
 import { modelLabel } from "./agent-tree"
+import type { ModelInfo } from "./panel-types"
 import { contextUsageView } from "./panel-context"
 import { failureRetryView, formatFailureRetryStatus } from "./panel-retry"
 import {
@@ -27,6 +28,7 @@ export function createRowHelpers(deps: {
   theme: Plugin.Context["theme"]
   root: () => RootSettings
   autoModels: () => Array<{ providerID: string; id: string; variant?: string }>
+  models: () => ModelInfo[]
   now: () => number
   panelWidth: () => number
   oversightFor: (sessionID?: string) => OversightContract
@@ -39,6 +41,7 @@ export function createRowHelpers(deps: {
     theme,
     root,
     autoModels,
+    models,
     now,
     panelWidth,
     oversightFor,
@@ -81,14 +84,21 @@ export function createRowHelpers(deps: {
     return `L${contract.level}`
   }
 
-  /** 子代理的上下文读数：最近一次 assistant 调用的输入规模，无数据时整段不显示。 */
-  const rowUsage = (row: FlatNode) =>
-    row.node.kind === "subagent" && row.node.sessionID
-      ? contextUsageView(
-          context.data.session.message.list(row.node.sessionID),
-          row.node.model?.actual,
-        )
+  /**
+   * 子代理的上下文读数：最近一次 assistant 调用的输入规模，无数据时整段不显示。
+   * 阈值用模型目录里的真实窗口（variant 不改变窗口）；目录查不到才退回 300K。
+   */
+  const rowUsage = (row: FlatNode) => {
+    if (row.node.kind !== "subagent" || !row.node.sessionID) return undefined
+    const actual = row.node.model?.actual
+    const catalog = actual
+      ? models().find((item) => item.providerID === actual.providerID && item.id === actual.id)
       : undefined
+    return contextUsageView(
+      context.data.session.message.list(row.node.sessionID),
+      catalog ?? actual,
+    )
+  }
 
   /**
    * 第二行：状态 · 模型全名 · token 用量 · 徽标。

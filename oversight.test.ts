@@ -4,6 +4,8 @@ import {
   acceptanceForLevel,
   OVERSIGHT_ACCEPTANCE,
   oversightLevelForPin,
+  renderAcceptanceOnlyProtocol,
+  renderReportOnlyProtocol,
   renderReportProtocol,
   resolveOversight,
 } from "./oversight"
@@ -50,5 +52,76 @@ describe("oversight acceptance", () => {
     expect(text).toContain("真实输出指针")
     expect(text).toContain("真实截图")
     expect(text).toContain("复核方式：critic 复核遵循 root 的 critic 开关")
+  })
+})
+
+describe("report and acceptance protocol separation", () => {
+  test("report-only contains child reporting requirements but no Superagent acceptance block", () => {
+    const text = renderReportOnlyProtocol(resolveOversight({}), "concise")
+    expect(text).toContain("报告头部固定三行")
+    expect(text).toContain("状态：progress | blocked | ready | failed")
+    expect(text).toContain("改动：文件清单")
+    expect(text).toContain("预算（内联+指针）")
+    expect(text).toContain("上下文纪律（工作过程）")
+    expect(text).toContain("证据必须真实")
+    expect(text).not.toContain("Superagent 验收动作")
+    expect(text).not.toContain("复核方式：")
+    expect(text).not.toContain("真实截图")
+  })
+
+  test("acceptance-only contains acceptance actions and critic semantics but no child report protocol", () => {
+    const text = renderAcceptanceOnlyProtocol(pinned(4))
+    expect(text).toContain("[Superagent 验收动作 L4 · 审计验收]")
+    expect(text).toContain("独立 critic 强制复核")
+    expect(text).toContain("复核方式：独立 critic 强制复核")
+    expect(text).not.toContain("[报告协议")
+    expect(text).not.toContain("报告头部固定三行")
+    expect(text).not.toContain("状态：progress")
+    expect(text).not.toContain("改动：文件清单")
+    expect(text).not.toContain("预算（内联+指针）")
+    expect(text).not.toContain("上下文纪律")
+  })
+
+  test("concise removes process sections while detailed retains them", () => {
+    const contract = resolveOversight({})
+    const concise = renderReportOnlyProtocol(contract, "concise")
+    const detailed = renderReportOnlyProtocol(contract, "detailed")
+    expect(concise).not.toBe(detailed)
+    expect(concise.length).toBeLessThan(detailed.length)
+    for (const section of ["执行：命令清单 + exit code", "阶段小结：每阶段一段", "阅读：读过的文件 path:行号 + 目的"]) {
+      expect(concise).not.toContain(section)
+      expect(detailed).toContain(section)
+    }
+    for (const text of [concise, detailed]) {
+      expect(text).toContain("测试：命令 + 结果明细")
+      expect(text).toContain("失败详情：失败命令的关键输出")
+      expect(text).toContain("证据必须真实")
+    }
+  })
+
+  test("concise never downgrades L0-L4 evidence sections and every style requires failure details", () => {
+    const processPrefixes = ["执行：", "阶段小结：", "阅读："]
+    for (const level of [0, 1, 2, 3, 4] as const) {
+      const contract = pinned(level)
+      const concise = renderReportOnlyProtocol(contract, "concise")
+      const detailed = renderReportOnlyProtocol(contract, "detailed")
+      for (const section of contract.sections) {
+        expect(detailed).toContain(section)
+        if (processPrefixes.some((prefix) => section.startsWith(prefix))) continue
+        expect(concise).toContain(section)
+      }
+      for (const text of [concise, detailed]) {
+        expect(text).toContain("失败详情：失败命令的关键输出")
+        expect(text).toContain("预算（内联+指针）")
+        expect(text).toContain("上下文纪律（工作过程）")
+      }
+    }
+  })
+
+  test("legacy combined renderer remains available and forwards report style", () => {
+    const contract = resolveOversight({})
+    expect(renderReportProtocol(contract, "detailed")).toBe(
+      `${renderReportOnlyProtocol(contract, "detailed")}\n\n${renderAcceptanceOnlyProtocol(contract)}`,
+    )
   })
 })

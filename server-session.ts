@@ -261,7 +261,11 @@ export async function readLimit(
   const seen = new Set<string>([callerID])
   for (;;) {
     const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: current }))
-    if (entries.some((entry) => typeof entry?.key === "string" && entry.key.startsWith("superagent."))) {
+    if (
+      entries.some(
+        (entry) => typeof entry?.key === "string" && entry.key.startsWith("superagent."),
+      )
+    ) {
       const raw = entries.find((entry) => entry?.key === MAX_SUBAGENTS_KEY)?.value
       const parsed = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN
       return {

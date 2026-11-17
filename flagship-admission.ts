@@ -55,7 +55,7 @@ function entryValue(entries: unknown, key: string): unknown {
 
 /**
  * Reads the flagship cap through the shared normalizer: missing, empty or
- * non-integer → 2; integer values are clamped to 0..20. This keeps the panel
+ * non-integer → 0; integer values are clamped to 0..20. This keeps the panel
  * and the server on exactly the same reading.
  */
 export function readMaxFlagshipSubagents(entries: unknown): number {

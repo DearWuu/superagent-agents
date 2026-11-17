@@ -9,6 +9,7 @@
   "files": [
     "index.tsx",
     "server.ts",
+    "server-events.ts",
     "model-picker.tsx",
     "panel-view.tsx",
     "panel-types.ts",

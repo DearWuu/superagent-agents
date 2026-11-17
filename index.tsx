@@ -13,7 +13,8 @@ import {
   OVERSIGHT_LEVEL_NAMES,
   oversightLabel,
   oversightLevelForPin,
-  renderReportProtocol,
+  renderAcceptanceOnlyProtocol,
+  renderReportOnlyProtocol,
   resolveOversight,
   type OversightContract,
   type OversightLevel,
@@ -278,11 +279,25 @@ export function SidebarAgents(props: {
       mutation(scopedRootDraft(draft, rootSessionID(), migrationOwner.current))
     })
   /** Changes the global part of the document. */
-  const updateGlobal = (mutation: (draft: Record<string, any>) => void) =>
-    updateSettings((draft: Record<string, any>) => {
+  const updateGlobal = async (mutation: (draft: Record<string, any>) => void) => {
+    const before = autoModels().map((model) => modelKey(model))
+    await updateSettings((draft: Record<string, any>) => {
       scopedRootDraft(draft, rootSessionID(), migrationOwner.current)
       mutation(draft)
     })
+    const after = (Array.isArray(settings.autoModels) ? settings.autoModels : []).map((model: ModelRef) =>
+      modelKey(model),
+    )
+    const added = after.filter((key: string) => !before.includes(key))
+    const removed = before.filter((key: string) => !after.includes(key))
+    // 只有写入真的改变了全局自动模型才回传；读取失败/无变化不记录。
+    if (added.length > 0 || removed.length > 0) await notifyAutoModelsChange(added, removed)
+  }
+  /**
+   * 全局自动模型变化的回传：设置写入成功后才调用；模型名的解析等到通知时再做。
+   * 由下方 notifyManual 接线，setup 期间不会被触发。
+   */
+  let notifyAutoModelsChange: (added: string[], removed: string[]) => Promise<void> = async () => {}
 
   const models = createMemo(() =>
     ((props.context.data.location.model.list(session()?.location) ?? []) as ModelInfo[]).filter(
@@ -459,7 +474,9 @@ export function SidebarAgents(props: {
   const rootOversight = createMemo(() => oversightFor(rootSessionID()))
 
   /** The report protocol of this root, injected into the assignment prompt. */
-  const reportProtocol = createMemo(() => renderReportProtocol(rootOversight()))
+  const reportProtocol = createMemo(() =>
+    renderReportOnlyProtocol(rootOversight(), policy().reportStyle),
+  )
   const assignmentPromptEntry = createMemo(
     () => `${reportProtocol()}\n\n${root().assignmentPrompt || SUPERAGENT_DEFAULTS.assignmentPrompt}`,
   )
@@ -467,7 +484,8 @@ export function SidebarAgents(props: {
   async function writeOversightInstruction(contract: OversightContract) {
     const id = rootSessionID()
     if (!id) return
-    const text = renderReportProtocol(contract)
+    // Superagent 自己的条目只写验收动作，不重复子代理的报告格式。
+    const text = renderAcceptanceOnlyProtocol(contract)
     const level = String(contract.level)
     const textChanged = instructionText(INSTRUCTION_KEYS.oversight) !== text
     const levelChanged = instructionText(INSTRUCTION_KEYS.oversightLevel) !== level
@@ -562,6 +580,7 @@ export function SidebarAgents(props: {
     if (!rootID) return
     const family = new Set(props.context.data.session.family(rootID))
     const assignmentBase = root().assignmentPrompt || SUPERAGENT_DEFAULTS.assignmentPrompt
+    const reportStyle = policy().reportStyle
     const pins = root().oversight.pins
     const desired = sessions()
       .filter((item) => item.id !== rootID && family.has(item.id))
@@ -571,7 +590,7 @@ export function SidebarAgents(props: {
           sessionID: item.id,
           level: contract.level,
           pinned: pins.sessions?.[item.id] !== undefined,
-          assignment: `${renderReportProtocol(contract)}\n\n${assignmentBase}`,
+          assignment: `${renderReportOnlyProtocol(contract, reportStyle)}\n\n${assignmentBase}`,
         }
       })
     if (desired.length === 0) return
@@ -627,14 +646,36 @@ export function SidebarAgents(props: {
   /** 旗舰数量只用于淘汰，面板不展示。 */
 
   /**
-   * 默认模型批量同步：fixed 变更与 inherit 跟随都把当前 root 下未保护子代理
-   * 切到目标模型；auto 没有唯一模型，只影响后续分配。运行中的子代理走
-   * 中断→等待停止→切换→续跑，串行处理并逐项报告失败。
+   * 默认模型批量同步：fixed 变更与 inherit 跟随都把当前 root 下所有普通非归档
+   * 直属子代理切到目标模型（kept 只防淘汰，per-child 策略只管后续分配）；
+   * 唯一业务豁免是显式 input.model 委派，critic 始终排除。auto 没有唯一模型，
+   * 只影响后续分配。运行中的子代理直接走官方 switchModel：当前步骤继续，
+   * 后续步骤使用新模型，不中断也不续跑；串行处理并逐项报告失败。
+   *
+   * 状态按 root 隔离：A→B→A 回到 A 时目标未变，不把切 root 当成用户改默认模型。
+   * 同步中又收到新目标时只记最新 pending，本轮结束后接着跑最新目标。
    */
-  let lastTargetKey: string | undefined
-  let appliedTargetKey: string | undefined
-  let mountPassDone = false
-  let syncingDefaultModels = false
+  type DefaultSyncState = {
+    mountDone: boolean
+    lastKey?: string
+    appliedKey?: string
+    running: boolean
+    pending?: ModelRef
+  }
+  const defaultSyncStates = new Map<string, DefaultSyncState>()
+  /**
+   * 面板打开时刻：用于区分「打开前就存在的默认模型」与「打开期间用户刚改的」。
+   * 树或指令还没加载完时用户就改了默认模型，仍要按用户变更批量同步。
+   */
+  const panelMountedAt = Date.now()
+  const defaultSyncState = (rootID: string) => {
+    let state = defaultSyncStates.get(rootID)
+    if (!state) {
+      state = { mountDone: false, running: false }
+      defaultSyncStates.set(rootID, state)
+    }
+    return state
+  }
   createEffect(() => {
     if (!ready()) return
     const current = session()
@@ -651,18 +692,25 @@ export function SidebarAgents(props: {
           ? rootModelRef
           : undefined
     if (!target) return
-    const key = `${current.id}|${scoped.defaultPolicy}|${modelKey(target)}`
-    if (key === lastTargetKey) return
-    lastTargetKey = key
-    if (!mountPassDone) {
+    const key = `${scoped.defaultPolicy}|${modelKey(target)}`
+    const state = defaultSyncState(current.id)
+    if (key === state.lastKey) return
+    state.lastKey = key
+    if (!state.mountDone) {
+      state.mountDone = true
       // Opening the panel never re-models existing subagents; only subagents
-      // created after the default was set pick that default up.
-      mountPassDone = true
-      if (scoped.defaultPolicy === "fixed") void applyDefaultToNewChildren(current.id, target)
-      return
+      // created after the default was set pick that default up. A target the
+      // user changed after the panel opened is a real change, even when the
+      // tree finished loading later.
+      const changedWhileOpen =
+        scoped.defaultPolicy === "fixed" && (scoped.defaultSetAt ?? 0) > panelMountedAt
+      if (!changedWhileOpen) {
+        if (scoped.defaultPolicy === "fixed") void applyDefaultToNewChildren(current.id, target)
+        return
+      }
     }
-    if (key === appliedTargetKey) return
-    appliedTargetKey = key
+    if (key === state.appliedKey) return
+    state.appliedKey = key
     void syncDefaultModels(current.id, target).catch(() => {})
   })
 
@@ -671,19 +719,14 @@ export function SidebarAgents(props: {
     const since = root().defaultSetAt
     if (since === undefined) return
     const family = new Set(props.context.data.session.family(rootID))
-    const kept = root().keptSubagents ?? {}
     const failures: string[] = []
     for (const item of sessions()) {
       if (item.id === rootID || !family.has(item.id)) continue
       if ((item.time?.created ?? 0) <= since) continue
-      const policy = root().policies[item.id]
-      // A per-child policy is an explicit choice; the root default never
-      // treats it as unset.
-      if (policy) continue
-      // A protected Subagent keeps its own model; the default never reaches it.
-      if (kept[item.id]) continue
-      // Explicit `input.model` delegation outranks the default; the marker is
-      // valid only while the child still runs that exact model.
+      // 复核会话不是子代理：新建也不套默认模型。
+      if (isCriticSession(item)) continue
+      // 显式 `input.model` 委派优先于默认；marker 只在 child 仍运行该模型时有效，
+      // stale 标记不保护，照常覆盖。
       if (isExplicitModelDelegation(item)) continue
       if (item.model && sameModel(item.model, model)) continue
       try {
@@ -702,49 +745,58 @@ export function SidebarAgents(props: {
   }
 
   async function syncDefaultModels(rootID: string, target: ModelRef) {
-    if (syncingDefaultModels) return
-    syncingDefaultModels = true
+    const state = defaultSyncState(rootID)
+    if (state.running) {
+      // 同一 root 正在批量切换：只记最新目标，本轮结束后接续，不并发交错。
+      state.pending = target
+      return
+    }
+    state.running = true
     try {
-      const family = new Set(props.context.data.session.family(rootID))
-      const kept = root().keptSubagents ?? {}
-      const policies = root().policies
-      // Explicit per-child fixed is a manual choice and keeps its model; inherit
-      // still follows the root target and auto still manages itself. Explicit
-      // `input.model` delegation outranks the default; a stale marker (current
-      // model differs from the marked one) does not protect.
-      const targets = sessions().filter(
-        (item) =>
-          item.id !== rootID &&
-          family.has(item.id) &&
-          // 复核会话不是子代理：不在批量改模型的目标里（它随时会被删）。
-          !isCriticSession(item) &&
-          !kept[item.id] &&
-          policies[item.id] !== "auto" &&
-          policies[item.id] !== "fixed" &&
-          !isExplicitModelDelegation(item),
-      )
-      if (targets.length === 0) return
-      const label = names().get(modelKey(target)) ?? target.id
-      // 默认模型批量同步不是显式旗舰委派：目标与 root 同模型也不做旗舰预检、
-      // 不占旗舰名额（旗舰身份只认显式委派的 marker）。
-      let switched = 0
-      const failures: string[] = []
-      for (const item of targets) {
-        if (item.model && sameModel(item.model, target)) continue
-        const outcome = await switchModelCore(item.id, target)
-        if (outcome.error) failures.push(`${subagentTitle(item)}：${outcome.error}`)
-        else if (outcome.warn) failures.push(`${subagentTitle(item)}：${outcome.warn}`)
-        else switched++
-      }
-      if (failures.length > 0) {
-        props.context.ui.toast.show({
-          message: `默认模型批量切换：${switched} 个成功，${failures.length} 个失败（${failures.join("；")}）。`,
-        })
-      } else if (switched > 0) {
-        props.context.ui.toast.show({ message: `已将 ${switched} 个未保护子代理切到 ${label}。` })
+      let job: ModelRef | undefined = target
+      while (job) {
+        state.pending = undefined
+        await runDefaultBatch(rootID, job)
+        job = state.pending
       }
     } finally {
-      syncingDefaultModels = false
+      state.running = false
+    }
+  }
+
+  async function runDefaultBatch(rootID: string, target: ModelRef) {
+    // 目标、候选与模型名在批次开始时一次取齐：同步过程中用户继续操作也不会
+    // 让本轮的失败提示错位。
+    const family = new Set(props.context.data.session.family(rootID))
+    // 默认模型落到所有普通非归档子代理：kept 只防自动淘汰，per-child 策略
+    // 只管后续分配，都不阻止本次同步；显式 `input.model` 委派（marker 与当前
+    // 模型一致）是唯一业务豁免；critic 不是子代理。
+    const targets = sessions().filter(
+      (item) =>
+        item.id !== rootID &&
+        family.has(item.id) &&
+        !isCriticSession(item) &&
+        !isExplicitModelDelegation(item),
+    )
+    const label = names().get(modelKey(target)) ?? target.id
+    if (targets.length === 0) return
+    // 默认模型批量同步不是显式旗舰委派：目标与 root 同模型也不做旗舰预检、
+    // 不占旗舰名额（旗舰身份只认显式委派的 marker）。
+    let switched = 0
+    const failures: string[] = []
+    for (const item of targets) {
+      if (item.model && sameModel(item.model, target)) continue
+      const outcome = await switchModelCore(item.id, target)
+      if (outcome.error) failures.push(`${subagentTitle(item)}：${outcome.error}`)
+      else switched++
+    }
+    if (failures.length > 0) {
+      // 策略本身已经保存，切换失败只报告当前未切，不声称回滚策略。
+      props.context.ui.toast.show({
+        message: `默认模型策略已保存；本轮 ${switched} 个已切换，${failures.length} 个当前模型未切换（${failures.join("；")}）。`,
+      })
+    } else if (switched > 0) {
+      props.context.ui.toast.show({ message: `已将 ${switched} 个普通子代理切到 ${label}。` })
     }
   }
 
@@ -782,33 +834,50 @@ export function SidebarAgents(props: {
   const clock = setInterval(() => setNow(Date.now()), 60_000)
   onCleanup(() => clearInterval(clock))
 
-  /**
-   * 面板手动操作回传：告诉 root 会话「这是用户手动做的」。
-   * 受「子代理状态监测」开关控制，连续操作防抖合并；投递失败只提示，不影响操作本身。
-   */
   const manualNotifier = createManualNotifier(props.context, {
     rootID: () => rootSessionID(),
-    enabled: () => statusWatch(),
   })
   onCleanup(() => manualNotifier.dispose())
 
-  async function notifyManual(input: {
+  /**
+   * 面板手动操作回传：告诉 root 会话「这是用户手动做的」。
+   * 与「子代理状态监测」开关无关；非立即操作共用一个聚合窗口，
+   * 投递失败只提示，不影响操作本身。调用方不等投递完成，否则窗口永远
+   * 聚不到同一次设置操作里的后续动作。
+   */
+  function notifyManual(input: {
     action: ManualOpAction
     childID?: string
     childTitle?: string
     detail?: ManualOpDetail
     immediate?: boolean
   }) {
-    const sent = await manualNotifier.notify(
-      {
-        action: input.action,
-        childID: input.childID,
-        childTitle: input.childTitle,
-        detail: input.detail,
-      },
-      { immediate: input.immediate },
-    )
-    if (!sent) props.context.ui.toast.show({ message: "已完成，但未能通知 Superagent。" })
+    void manualNotifier
+      .notify(
+        {
+          action: input.action,
+          childID: input.childID,
+          childTitle: input.childTitle,
+          detail: input.detail,
+        },
+        { immediate: input.immediate },
+      )
+      .then((sent) => {
+        if (!sent) props.context.ui.toast.show({ message: "已完成，但未能通知 Superagent。" })
+      })
+  }
+
+  /** 通用设置项回传：写入成功后才调用，值写明实际生效内容。 */
+  function notifySetting(label: string, value: string) {
+    notifyManual({ action: "setting", detail: { label, value } })
+  }
+
+  notifyAutoModelsChange = async (added, removed) => {
+    const labelOf = (key: string) => names().get(key) ?? key
+    const parts: string[] = []
+    if (added.length > 0) parts.push(`加入 ${added.map(labelOf).join("、")}`)
+    if (removed.length > 0) parts.push(`移除 ${removed.map(labelOf).join("、")}`)
+    await notifySetting("全局自动模型", parts.join("；"))
   }
 
   /** 协作模式总开关：只写当前 root 的 `superagent.collab-enabled` 条目。 */
@@ -840,6 +909,7 @@ export function SidebarAgents(props: {
     theme,
     root,
     autoModels,
+    models,
     now,
     panelWidth,
     oversightFor,
@@ -848,7 +918,7 @@ export function SidebarAgents(props: {
     warningColor,
   })
 
-  const { configureAutoModels, openDefaults, openModel, pickModel, switchModelCore } = createModelActions({
+  const { configureAutoModels, openDefaults, openModel, pickModel, switchModelCore, convergeFlagships } = createModelActions({
     context: props.context,
     preferencePath,
     preferences,
@@ -869,6 +939,12 @@ export function SidebarAgents(props: {
     pickerFavorites,
     pickerKey,
     putInstruction,
+    notifyModelChange: async ({ childID, childTitle, value }) => {
+      await notifyManual({ action: "model", childID, childTitle, detail: { value } })
+    },
+    notifyDefaultPolicy: async ({ policy, value }) => {
+      await notifyManual({ action: "default-policy", detail: { policy, value } })
+    },
   })
 
   /** 默认模型的读法：模型名，或"跟随会话"、"自动"。 */
@@ -906,6 +982,7 @@ export function SidebarAgents(props: {
     if (selected === undefined) return
     await putInstruction(INSTRUCTION_KEYS.reportStyle, selected)
     props.context.ui.toast.show({ message: `报告风格已设为${reportStyleLabel(selected)}。` })
+    await notifySetting("报告风格", reportStyleLabel(selected))
   }
 
   async function editSessionPrompt() {
@@ -918,6 +995,7 @@ export function SidebarAgents(props: {
     if (value === undefined) return
     await saveInstructionText(INSTRUCTION_KEYS.sessionPrompt, value)
     props.context.ui.toast.show({ message: value.trim() ? "会话补充提示词已保存。" : "会话补充提示词已清除。" })
+    await notifySetting("会话补充提示词", value.trim() ? summarize(value.trim()) : "已清除")
   }
 
   async function editTaskPrompt() {
@@ -930,6 +1008,7 @@ export function SidebarAgents(props: {
     if (value === undefined) return
     await saveInstructionText(INSTRUCTION_KEYS.taskPrompt, value)
     props.context.ui.toast.show({ message: value.trim() ? "当前任务补充提示词已保存。" : "当前任务补充提示词已清除。" })
+    await notifySetting("当前任务补充提示词", value.trim() ? summarize(value.trim()) : "已清除")
   }
 
   async function editMaxSubagents() {
@@ -967,6 +1046,32 @@ export function SidebarAgents(props: {
     await notifyManual({ action: "max-subagents", detail: { value: String(parsed) } })
   }
 
+  /**
+   * 调小旗舰上限后的收敛结果：一句话说明切换/跳过；无唯一目标时明确未切换。
+   * 失败原因只带首个，避免 toast 过长。
+   */
+  function convergeSummary(
+    result?: {
+      target?: ModelRef
+      reason?: "auto" | "missing-target" | "unavailable-target"
+      switched: number
+      skipped: number
+      failures: string[]
+    },
+  ) {
+    if (!result) return ""
+    if (result.reason === "auto") return `当前默认模型为「自动」，没有唯一目标，${result.skipped} 个超额旗舰未自动切换。`
+    if (result.reason === "missing-target") return `未找到子代理默认模型，${result.skipped} 个超额旗舰未切换。`
+    if (result.reason === "unavailable-target") return `子代理默认模型不可用，${result.skipped} 个超额旗舰未切换。`
+    if (result.switched === 0 && result.skipped === 0) return "现有旗舰未超出新上限。"
+    const label = result.target ? (names().get(modelKey(result.target)) ?? result.target.id) : "默认模型"
+    const skipped =
+      result.skipped > 0
+        ? `，跳过 ${result.skipped} 个${result.failures[0] ? `（${summarize(result.failures[0])}）` : ""}`
+        : ""
+    return `已把 ${result.switched} 个超额旗舰切到 ${label}${skipped}。`
+  }
+
   async function editMaxFlagshipSubagents() {
     const value = await props.context.ui.dialog.prompt({
       title: "旗舰子代理数量",
@@ -978,11 +1083,20 @@ export function SidebarAgents(props: {
     if (value === undefined) return
     const text = value.trim()
     if (!text) {
+      const nextLimit = effectiveFlagshipLimit(SUPERAGENT_DEFAULTS.maxFlagshipSubagents, subagentLimit())
+      // 先收敛再写条目：新上限生效前把超额旗舰切走，避免既有淘汰逻辑删会话。
+      const converged = nextLimit < flagshipLimit() ? await convergeFlagships(nextLimit) : undefined
       await removeInstruction(INSTRUCTION_KEYS.maxFlagshipSubagents)
-      props.context.ui.toast.show({ message: "旗舰子代理数量已清除。" })
+      const summary = convergeSummary(converged)
+      props.context.ui.toast.show({
+        message: summary ? `旗舰子代理数量已清除（默认 ${nextLimit}），${summary}` : "旗舰子代理数量已清除。",
+      })
       await notifyManual({
         action: "max-flagship",
-        detail: { value: String(DEFAULT_MAX_FLAGSHIP_SUBAGENTS) },
+        detail: {
+          value: String(nextLimit),
+          ...(converged ? { switched: converged.switched, skipped: converged.skipped } : {}),
+        },
       })
       return
     }
@@ -991,9 +1105,22 @@ export function SidebarAgents(props: {
       props.context.ui.toast.show({ message: "旗舰子代理数量必须是 0–20 的整数。" })
       return
     }
+    const nextLimit = effectiveFlagshipLimit(parsed, subagentLimit())
+    const converged = nextLimit < flagshipLimit() ? await convergeFlagships(nextLimit) : undefined
     await putInstruction(INSTRUCTION_KEYS.maxFlagshipSubagents, parsed)
-    props.context.ui.toast.show({ message: `旗舰子代理数量已设为 ${parsed}。` })
-    await notifyManual({ action: "max-flagship", detail: { value: String(parsed) } })
+    const summary = convergeSummary(converged)
+    props.context.ui.toast.show({
+      message: summary
+        ? `旗舰子代理数量已设为 ${parsed}，${summary}`
+        : `旗舰子代理数量已设为 ${parsed}。`,
+    })
+    await notifyManual({
+      action: "max-flagship",
+      detail: {
+        value: String(parsed),
+        ...(converged ? { switched: converged.switched, skipped: converged.skipped } : {}),
+      },
+    })
   }
 
   async function editAssignmentPrompt() {
@@ -1009,6 +1136,7 @@ export function SidebarAgents(props: {
       draft.assignmentPrompt = text
     })
     props.context.ui.toast.show({ message: text ? "任务分配微调提示词已保存。" : "任务分配微调提示词已清除。" })
+    await notifySetting("任务分配微调提示词", text ? summarize(text) : "已清除")
   }
 
   /** Picks a fallback model; the choice only writes the entry, never a session. */
@@ -1022,7 +1150,9 @@ export function SidebarAgents(props: {
     const picked = await pickModel(title, current)
     if (!picked) return
     await putInstruction(entryKey, `${picked.providerID}/${picked.id}`)
-    props.context.ui.toast.show({ message: `${title}已设为 ${picked.model.name || picked.model.id}。` })
+    const label = picked.model.name || picked.model.id
+    props.context.ui.toast.show({ message: `${title}已设为 ${label}。` })
+    await notifySetting(title, label)
   }
 
   async function editFallbackEnabled() {
@@ -1036,9 +1166,11 @@ export function SidebarAgents(props: {
     })
     if (!selected) return
     await putInstruction(INSTRUCTION_KEYS.fallbackEnabled, selected.kind === "on" ? "true" : "false")
+    const value = selected.kind === "on" ? "启用" : "停用"
     props.context.ui.toast.show({
       message: selected.kind === "on" ? "已启用限额自动切换备用模型。" : "已停用限额自动切换备用模型。",
     })
+    await notifySetting("限额自动切换备用模型", value)
   }
 
   async function editCriticEnabled() {
@@ -1052,9 +1184,11 @@ export function SidebarAgents(props: {
     })
     if (!selected) return
     await putInstruction(INSTRUCTION_KEYS.criticEnabled, selected.kind === "on" ? "true" : "false")
+    const value = selected.kind === "on" ? "启用" : "停用"
     props.context.ui.toast.show({
       message: selected.kind === "on" ? "已启用 critic 他监督复核。" : "已停用 critic 他监督复核。",
     })
+    await notifySetting("critic 他监督复核", value)
   }
 
   async function editStatusWatch() {
@@ -1068,9 +1202,12 @@ export function SidebarAgents(props: {
     })
     if (!selected) return
     await putInstruction(INSTRUCTION_KEYS.statusWatch, selected.kind === "on" ? "true" : "false")
+    const value = selected.kind === "on" ? "启用" : "停用"
     props.context.ui.toast.show({
       message: selected.kind === "on" ? "已启用子代理状态监测。" : "已停用子代理状态监测。",
     })
+    // 关闭监测本身也要回传：手动操作记录不依赖这个开关。
+    await notifySetting("子代理状态监测", value)
   }
 
   async function openPolicyEditor() {
@@ -1135,6 +1272,7 @@ export function SidebarAgents(props: {
         next: null,
       }).catch(() => {})
       props.context.ui.toast.show({ message: "监管力度已恢复默认 L2。" })
+      await notifySetting("主会话监管力度", "L2（默认）")
       return
     }
     await updateRoot((draft) => {
@@ -1150,6 +1288,7 @@ export function SidebarAgents(props: {
       next: selected.level,
     }).catch(() => {})
     props.context.ui.toast.show({ message: `监管力度已固定为 L${selected.level}。` })
+    await notifySetting("主会话监管力度", `L${selected.level}`)
   }
 
   /** The report protocol of one Subagent, independent of its siblings and the root. */
@@ -1313,7 +1452,11 @@ export function SidebarAgents(props: {
     if (selected.kind === "maxFlagshipSubagents") return editMaxFlagshipSubagents()
     if (selected.kind === "assignmentPrompt") return editAssignmentPrompt()
     if (selected.kind === "taskPrompt") return editTaskPrompt()
-    if (selected.kind === "restore") return restoreDefaults()
+    if (selected.kind === "restore") {
+      await restoreDefaults()
+      await notifySetting("恢复默认编排策略", "默认值")
+      return
+    }
     if (selected.kind === "defaults") return openDefaults()
     if (selected.kind === "fallbackModel") return editFallbackModel("superagent")
     if (selected.kind === "subagentFallbackModel") return editFallbackModel("subagent")
@@ -1334,7 +1477,12 @@ export function SidebarAgents(props: {
       label: { confirm: "删除 Subagent", cancel: "取消" },
     })
     if (!confirmed) return
-    await props.context.client.session.remove({ sessionID })
+    try {
+      await props.context.client.session.remove({ sessionID })
+    } catch (error) {
+      props.context.ui.toast.show({ message: `删除 ${node.title} 失败：${errorText(error)}` })
+      return
+    }
     props.context.ui.toast.show({ message: `${node.title} 已删除。` })
     await notifyManual({ action: "delete", childID: sessionID, childTitle: title, immediate: true })
   }
@@ -1343,12 +1491,17 @@ export function SidebarAgents(props: {
     if (!node.sessionID) return
     const sessionID = node.sessionID
     const title = node.title
-    await props.context.client.session.compact({ sessionID })
+    try {
+      await props.context.client.session.compact({ sessionID })
+    } catch (error) {
+      props.context.ui.toast.show({ message: `压缩 ${node.title} 失败：${errorText(error)}` })
+      return
+    }
     props.context.ui.toast.show({ message: `已发起 ${node.title} 的原生上下文压缩。` })
     await notifyManual({ action: "compact", childID: sessionID, childTitle: title, immediate: true })
   }
 
-  /** Protects a Subagent from automatic eviction and from model changes. */
+  /** Protects a Subagent from automatic eviction and blocks manual model edits; default sync still applies. */
   async function toggleKeep(node: AgentNode) {
     const sessionID = node.sessionID
     if (!sessionID) return
@@ -1364,7 +1517,7 @@ export function SidebarAgents(props: {
     props.context.ui.toast.show({
       message: kept
         ? `${node.title} 已取消保护，可被自动淘汰，模型也可以被修改。`
-        : `${node.title} 已保护，不会被自动淘汰，模型也不会被修改；取消保护后才可改。`,
+        : `${node.title} 已保护，不会被自动淘汰；手动改模型需先取消保护，默认模型同步仍会生效。`,
     })
     await notifyManual({
       action: kept ? "unkeep" : "keep",
@@ -1420,7 +1573,7 @@ export function SidebarAgents(props: {
           title: kept ? "取消保护" : "保护此子代理",
           description: kept
             ? "允许自动淘汰这个子代理，模型也可以被修改"
-            : "不会被自动淘汰，模型也不会被修改；取消保护后才可改",
+            : "不会被自动淘汰；手动改模型需先取消保护，默认模型同步仍会生效",
         },
         { value: { kind: "delete" }, title: "删除 Subagent", description: "删除该子会话及其上下文，不可恢复" },
       ],

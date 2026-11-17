@@ -460,8 +460,9 @@ describe("后台任务状态回传", () => {
     h.events.close()
   })
 
-  test("后台派发结束且没有原生通知：补发完成通知", async () => {
+  test("后台派发结束且没有原生通知：对账时补发完整完成通知", async () => {
     tempState()
+    process.env.SUPERAGENT_STATUS_RECONCILE_MS = "60"
     const h = await setup({
       sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
       result: { output: "done", metadata: { sessionID: "ses_child", status: "running" } },
@@ -477,6 +478,8 @@ describe("后台任务状态回传", () => {
     const notice = h.synthetics[0]
     expect(notice.metadata).toEqual({ source: "superagent-agents", childID: "ses_child", state: "completed" })
     expect(String(notice.text)).toContain('<subagent sessionID="ses_child" state="completed"')
+    expect(String(notice.text)).toContain("子代理已结束")
+    expect(hookLog().some((record) => record.event === "status-completion-fallback")).toBe(true)
     await h.dispose()
     h.events.close()
   })

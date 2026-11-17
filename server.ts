@@ -122,6 +122,7 @@ import {
   createCtxProbeScanner,
   startProbeTimer,
 } from "./server-scanners"
+import { startServerEventSubscription } from "./server-events"
 import {
   createQuotaFallback,
   denyMessage,
@@ -166,7 +167,6 @@ import {
   claimCriticReview,
   collabEnabledFromEntries,
   errorText,
-  eventSessionID,
   isObject,
   log,
   pruneClaims,
@@ -175,13 +175,11 @@ import { SUPERAGENT_SKILLS } from "./skills"
 import { createCompletionEvictor } from "./subagent-evict"
 import {
   DISPATCH_LEDGER_LIMIT,
-  SHELL_SETTLE_DELAY_MS,
   STATUS_RECONCILE_INTERVAL_MS,
   attachDispatchReceipt,
   createDispatchLedger,
   createStatusWatcher,
   formatDispatchReceipt,
-  type CompletionState,
   type DispatchLedger,
   type DispatchPatch,
 } from "./subagent-status"
@@ -1807,134 +1805,20 @@ export default {
       }
     })
 
-    // 成功即清零：step 成功（单次 LLM 调用成功）或整个执行成功都算。
-    // 同一事件流顺带触发子会话复核：复核本身在后台跑，不阻塞消费循环。
+    // 九类事件在同一后台循环里串行消费；断流按指数退避重连，dispose 统一 abort。
     const resetAbort = new AbortController()
-    const resetSubscription = (async () => {
-      try {
-        for await (const event of ctx.event.subscribe({
-          types: [
-            "session.created",
-            "session.step.ended",
-            "session.execution.succeeded",
-            "session.execution.failed",
-            "session.execution.interrupted",
-            "session.shell.started",
-            "session.shell.ended",
-            "session.model.selected",
-            "session.deleted",
-          ],
-          signal: resetAbort.signal,
-        })) {
-          if (event?.type === "session.created") {
-            try {
-              await markDelegationOnSessionCreated(event)
-            } catch (cause) {
-              log({
-                event: "model-delegation-mark-failed",
-                decision: "error",
-                phase: "created",
-                type: event.type,
-                childSessionID: eventSessionID(event),
-                cause: errorText(cause),
-              })
-            }
-            continue
-          }
-          if (event?.type === "session.model.selected") {
-            try {
-              await handleSessionModelSelected(ctx, event)
-            } catch (cause) {
-              log({
-                event: "flagship-marker-failed",
-                decision: "error",
-                type: event.type,
-                childSessionID: eventSessionID(event),
-                cause: errorText(cause),
-              })
-            }
-            continue
-          }
-          // 状态回传：子会话结束与 shell 起止只驱动看护项，不参与限额计时。
-          const watchedID = eventSessionID(event)
-          if (
-            watchedID &&
-            (event?.type === "session.execution.succeeded" ||
-              event?.type === "session.execution.failed" ||
-              event?.type === "session.execution.interrupted" ||
-              event?.type === "session.shell.started" ||
-              event?.type === "session.shell.ended")
-          ) {
-            if (event.type === "session.shell.ended") {
-              watcher.settle(watchedID, { delayMs: SHELL_SETTLE_DELAY_MS })
-            } else if (event.type === "session.shell.started") {
-              watcher.settle(watchedID)
-            } else {
-              const state: CompletionState =
-                event.type === "session.execution.failed"
-                  ? "error"
-                  : event.type === "session.execution.interrupted"
-                    ? "cancelled"
-                    : "completed"
-              watcher.settle(watchedID, { state })
-            }
-          }
-          const sessionID = eventSessionID(event)
-          if (!sessionID) continue
-          // 限额备用：成功即取消计时；中断与会话删除放弃计时；
-          // 限额失败保留计时（窗口内没恢复才切）；其他失败同样放弃。
-          if (event?.type === "session.execution.succeeded") {
-            quotaFallback.reset(sessionID)
-          } else if (event?.type === "session.step.ended") {
-            // 只有 error 表示步骤失败：其余取值（stop/length/tool-calls/content-filter/unknown）
-            // 以及缺省都说明模型已返回，即已恢复，取消计时。
-            // 若把非 error 也当失败，限额失败那一步的 step.ended 会把刚起的计时取消掉。
-            const finish = eventData(event)?.finish
-            if (finish !== "error") {
-              quotaFallback.reset(sessionID)
-            }
-          } else if (event?.type === "session.execution.interrupted") {
-            quotaFallback.cancel(sessionID)
-          } else if (event?.type === "session.deleted") {
-            quotaFallback.forget(sessionID)
-          } else if (event?.type === "session.execution.failed") {
-            const failure = eventData(event)?.error
-            if (isQuotaFailure(failure)) {
-              // 宿主可能没触发 retry 钩子（例如限额错误被判为不重试）：
-              // 失败事件走同一条路，同样启动 60 秒计时；已有计时只更新快照。
-              let model: unknown
-              try {
-                model = (await ctx.session.get({ sessionID }))?.model
-              } catch {
-                model = undefined
-              }
-              try {
-                await triggerQuotaFallback(sessionID, failure, model)
-              } catch (cause) {
-                log({
-                  event: "fallback-hook-error",
-                  decision: "error",
-                  phase: "execution-failed",
-                  root: null,
-                  count: null,
-                  limit: null,
-                  sessionID,
-                  cause: errorText(cause),
-                })
-              }
-            } else {
-              quotaFallback.cancel(sessionID)
-            }
-          }
-          // 复核在内部按该会话所属 root 的开关短路。
-          if (event?.type === "session.execution.succeeded") {
-            void reviewAfterSuccess(sessionID, event?.id)
-          }
-        }
-      } catch {
-        // 事件流断开只是不再清零计数，不影响拦截与切换。
-      }
-    })()
+    const resetSubscription = startServerEventSubscription({
+      signal: resetAbort.signal,
+      subscribe: (options) => ctx.event.subscribe(options),
+      watcher,
+      quotaFallback,
+      markDelegationOnSessionCreated,
+      handleSessionModelSelected: (event) => handleSessionModelSelected(ctx, event),
+      reviewAfterSuccess,
+      triggerQuotaFallback,
+      readSessionModel: async (sessionID) => (await ctx.session.get({ sessionID }))?.model,
+      log,
+    })
     void resetSubscription
 
     // 超时状态探针：只探带 superagent 配置且当前 root 启用协作的家族里的子会话。

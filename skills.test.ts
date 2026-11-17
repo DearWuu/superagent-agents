@@ -41,7 +41,7 @@ describe("superagent skills", () => {
       expect(content).toContain(field)
     expect(content).toContain("并行拆分与耦合合并")
     expect(content).toContain("能力升级与限额切换分离")
-    expect(content).toContain("旗舰子代理默认上限 2")
+    expect(content).toContain("旗舰子代理默认上限 0")
     expect(content).toContain("总子代理上限")
     expect(content).toContain("Flash 反复返工或验收失败后")
     expect(content).toContain("也可以由 Superagent 升级为旗舰子代理")
@@ -52,20 +52,15 @@ describe("superagent skills", () => {
     expect(content).toContain("不得通过换工具")
   })
 
-  test("orchestration pins the dispatch hard constraints before the workflow", () => {
+  test("orchestration keeps the workflow and defers dispatch hard constraints to the resident prompt", () => {
     const content = SUPERAGENT_ORCHESTRATION_SKILL.content
-    const section = content.indexOf("## 0. 派工状态的硬约束")
-    expect(section).toBeGreaterThanOrEqual(0)
-    expect(section).toBeLessThan(content.indexOf("## 1. 先判断是否适合 Flash"))
-    expect(content).toContain("实现、修改、调试、测试默认派工")
-    expect(content).toContain("小改动也派工")
-    expect(content).toContain("派工成功只认 subagent 工具成功回执")
-    expect(content).toContain("没收到回执不得称已派出、并行中或运行中")
-    expect(content).toContain("触到上限如实报告")
-    expect(content).toContain("最多做一次有界只读核实")
-    expect(content).toContain("禁止连续轮询")
-    // 硬约束只留规则，不重复技能后面的长段。
-    expect(content.length).toBeLessThan(2400)
+    expect(content).toContain("派工状态的三条硬约束以常驻 sessionPrompt 为准")
+    expect(content).toContain("## 1. 先判断是否适合 Flash")
+    expect(content).not.toContain("## 0. 派工状态的硬约束")
+    expect(content).not.toContain("派工成功只认 subagent 工具成功回执")
+    expect(content.length).toBeLessThan(2200)
+    expect(SUPERAGENT_DEFAULTS.sessionPrompt).toContain("派工成功只认 subagent 工具成功回执")
+    expect(SUPERAGENT_DEFAULTS.sessionPrompt).toContain("最多做一次有界只读核实")
   })
 
   test("orchestration and user docs share the parallel, resume and interrupt contract", () => {
@@ -89,9 +84,8 @@ describe("superagent skills", () => {
     }
   })
 
-  test("orchestration, user docs and the resident prompt share the dispatch hard constraints", () => {
+  test("the resident prompt and user docs share the dispatch hard constraints", () => {
     const docs = [
-      SUPERAGENT_ORCHESTRATION_SKILL.content,
       SUPERAGENT_DEFAULTS.sessionPrompt,
       readFileSync(path.join(import.meta.dir, "README.md"), "utf8"),
       readFileSync(path.join(import.meta.dir, "AGENTS.md"), "utf8"),

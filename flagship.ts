@@ -7,7 +7,8 @@
  * definition.
  */
 
-export const DEFAULT_MAX_FLAGSHIP_SUBAGENTS = 2
+/** A fresh root starts with no flagship budget; users may raise it (0..20). */
+export const DEFAULT_MAX_FLAGSHIP_SUBAGENTS = 0
 export const MIN_MAX_FLAGSHIP_SUBAGENTS = 0
 export const MAX_MAX_FLAGSHIP_SUBAGENTS = 20
 /** Session metadata marker written by the server and preserved across model changes. */
@@ -121,4 +122,28 @@ export function isFlagshipSession(candidate: FlagshipSessionRef | undefined, _ro
 
 export function countFlagshipSubagents(candidates: readonly FlagshipSessionRef[], _root?: unknown): number {
   return candidates.filter((candidate) => isFlagshipSession(candidate)).length
+}
+
+export type FlagshipOverflowCandidate = FlagshipSessionRef & {
+  id: string
+  created?: number
+}
+
+/**
+ * When the user lowers the flagship cap, the newest `keep` current flagships
+ * stay; the rest (oldest first, stable on equal creation times) are returned
+ * for a model switch. Only sessions whose marker is still valid count; callers
+ * pass the root's direct, non-archived children.
+ */
+export function pickFlagshipOverflow<T extends FlagshipOverflowCandidate>(
+  candidates: readonly T[],
+  keep: number,
+): T[] {
+  const limit = Number.isFinite(keep) ? Math.max(0, Math.floor(keep)) : 0
+  const flagships = candidates
+    .map((candidate, index) => ({ candidate, index, created: candidate.created ?? 0 }))
+    .filter((item) => isFlagshipSession(item.candidate))
+    .sort((a, b) => a.created - b.created || a.index - b.index)
+  const overflow = Math.max(0, flagships.length - limit)
+  return flagships.slice(0, overflow).map((item) => item.candidate)
 }

@@ -22,7 +22,7 @@ const ROOT = { providerID: "acme", id: "flagship", variant: "high" }
 const FLASH = "acme/flash"
 
 describe("readMaxFlagshipSubagents", () => {
-  test("缺省 2，0 是合法值", () => {
+  test("缺省 0，0 是合法值", () => {
     expect(readMaxFlagshipSubagents([])).toBe(DEFAULT_MAX_FLAGSHIP_SUBAGENTS)
     expect(readMaxFlagshipSubagents([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 0 }])).toBe(0)
   })
@@ -33,9 +33,9 @@ describe("readMaxFlagshipSubagents", () => {
     }
   })
 
-  test("非整数与空值回退 2；越界整数按共享规则 clamp", () => {
+  test("非整数与空值回退 0；越界整数按共享规则 clamp", () => {
     for (const value of ["abc", "", 3.5, null, undefined, {}, true]) {
-      expect(readMaxFlagshipSubagents([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value }])).toBe(2)
+      expect(readMaxFlagshipSubagents([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value }])).toBe(0)
     }
     expect(readMaxFlagshipSubagents([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: -1 }])).toBe(0)
     expect(readMaxFlagshipSubagents([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 21 }])).toBe(20)

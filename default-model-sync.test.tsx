@@ -72,10 +72,16 @@ function harness(options?: {
   keptSubagents?: Record<string, boolean>
   selections?: unknown[]
   failSwitchFor?: string
+  /** Session id → milliseconds the model switch should take. */
+  switchDelayFor?: Record<string, number>
+  /** Extra roots besides `root`; each gets its own settings entry and collab switch. */
+  rootIDs?: string[]
 }) {
-  const sessions: Session[] =
-    options?.sessions ??
-    [
+  const rootIDs = ["root", ...(options?.rootIDs ?? [])]
+  // 每个夹具复制一份会话：switchModel 会改写会话模型，共享数组会让后续用例
+  // 从「已经切到目标模型」的状态起步。
+  const sessions: Session[] = (
+    options?.sessions ?? [
       { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
       {
         id: "worker",
@@ -86,6 +92,7 @@ function harness(options?: {
         time: { created: 2, updated: 400 },
       },
     ]
+  ).map((item) => structuredClone(item))
   const byId = new Map(sessions.map((item) => [item.id, item]))
   const rootOf = (sessionID: string) => {
     let current = byId.get(sessionID)
@@ -97,29 +104,31 @@ function harness(options?: {
     return current?.id ?? sessionID
   }
   const family = (id: string) => sessions.filter((item) => rootOf(item.id) === id).map((item) => item.id)
-  const entryState: Record<string, Record<string, unknown>> = {
-    root: {
-      "superagent.collab-enabled": "true",
-      ...(options?.instructions ?? {}),
-    },
-  }
+  const entryState: Record<string, Record<string, unknown>> = Object.fromEntries(
+    rootIDs.map((id) => [
+      id,
+      {
+        "superagent.collab-enabled": "true",
+        ...(id === "root" ? (options?.instructions ?? {}) : {}),
+      },
+    ]),
+  )
+  const rootSettings = (id: string) => ({
+    policies: id === "root" ? (options?.policies ?? {}) : {},
+    defaultPolicy: options?.defaultPolicy ?? "inherit",
+    defaultModel: options?.defaultModel,
+    defaultSetAt: options?.defaultSetAt,
+    maxSubagents: options?.maxSubagents ?? 5,
+    expanded: {},
+    initialized: { [id]: true },
+    keptSubagents: id === "root" ? (options?.keptSubagents ?? {}) : {},
+    assignmentPrompt: "",
+    oversight: { pins: { models: {}, sessions: {} }, capabilityOverrides: {}, history: {}, lastResolved: {} },
+  })
   const [settings, updateSettings] = createStore<any>({
     version: 2,
     autoModels: [],
-    roots: {
-      root: {
-        policies: options?.policies ?? {},
-        defaultPolicy: options?.defaultPolicy ?? "inherit",
-        defaultModel: options?.defaultModel,
-        defaultSetAt: options?.defaultSetAt,
-        maxSubagents: options?.maxSubagents ?? 5,
-        expanded: {},
-        initialized: { root: true },
-        keptSubagents: options?.keptSubagents ?? {},
-        assignmentPrompt: "",
-        oversight: { pins: { models: {}, sessions: {} }, capabilityOverrides: {}, history: {}, lastResolved: {} },
-      },
-    },
+    roots: Object.fromEntries(rootIDs.map((id) => [id, rootSettings(id)])),
   })
   const puts: Array<{ sessionID: string; key: string; value: unknown }> = []
   const removes: string[] = []
@@ -177,8 +186,13 @@ function harness(options?: {
       session: {
         switchModel: async (input: { sessionID: string; model: any }) => {
           calls.push(`switch:${input.sessionID}`)
+          const delay = options?.switchDelayFor?.[input.sessionID]
+          if (delay) await new Promise((resolve) => setTimeout(resolve, delay))
           if (options?.failSwitchFor === input.sessionID) throw new Error("模型不可用")
           switched.push(input)
+          // 真实宿主切换后会话模型跟着变，后续批次据此判断是否已是目标。
+          const item = byId.get(input.sessionID)
+          if (item) item.model = input.model
         },
         compact: async () => {},
         create: async (input: any) => {
@@ -232,14 +246,15 @@ function harness(options?: {
   const setRootModel = (model: { providerID: string; id: string; variant?: string }) =>
     setSelected({ providerID: model.providerID, modelID: model.id, variant: model.variant })
   /** The user changes the root-scoped default model. */
-  const setDefaultModel = (model: { providerID: string; id: string; variant?: string }) =>
+  const setDefaultModel = (model: { providerID: string; id: string; variant?: string }, rootID = "root") =>
     updateSettings(
       produce((draft: any) => {
-        draft.roots.root.defaultPolicy = "fixed"
-        draft.roots.root.defaultModel = model
-        draft.roots.root.defaultSetAt = Date.now()
+        draft.roots[rootID].defaultPolicy = "fixed"
+        draft.roots[rootID].defaultModel = model
+        draft.roots[rootID].defaultSetAt = Date.now()
       }),
     )
+  const [currentSession, setSession] = createSignal("root")
   return {
     context,
     entryState,
@@ -255,6 +270,8 @@ function harness(options?: {
     confirms,
     setRootModel,
     setDefaultModel,
+    currentSession,
+    setSession,
   }
 }
 
@@ -265,7 +282,7 @@ async function render(options?: Parameters<typeof harness>[0]) {
     () => (
       <SidebarAgents
         context={h.context as never}
-        sessionID="root"
+        sessionID={h.currentSession()}
         preferencePath={preferencePath}
         criticDir={path.join(tmpdir(), "default-model-critic-empty")}
       />
@@ -317,7 +334,7 @@ test("fixed 默认在首次挂载时不批量改旧会话", async () => {
   }
 })
 
-test("inherit 在 root 后续变更时同步所有未保护子代理", async () => {
+test("inherit 在 root 后续变更时同步所有普通子代理", async () => {
   const h = await render({ sessions: threeChildren, defaultPolicy: "inherit" })
   try {
     await h.app.flush()
@@ -331,7 +348,7 @@ test("inherit 在 root 后续变更时同步所有未保护子代理", async () 
   }
 })
 
-test("auto 子代理不被批量修改", async () => {
+test("auto 策略子代理也随默认批量切换", async () => {
   const h = await render({
     sessions: [
       { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
@@ -344,8 +361,8 @@ test("auto 子代理不被批量修改", async () => {
   try {
     await h.app.flush()
     h.setRootModel(nextModel)
-    await h.app.waitFor(() => h.switched.length >= 1)
-    expect(h.switched.map((item) => item.sessionID)).toEqual(["free"])
+    await h.app.waitFor(() => h.switched.length >= 2)
+    expect(h.switched.map((item) => item.sessionID).sort()).toEqual(["auto", "free"])
   } finally {
     h.app.renderer.destroy()
   }
@@ -390,7 +407,7 @@ test("批量切换保留 variant", async () => {
   }
 })
 
-test("受保护子代理跳过默认同步", async () => {
+test("受保护子代理也随默认同步切换（保护只防淘汰）", async () => {
   const h = await render({
     sessions: threeChildren,
     defaultPolicy: "fixed",
@@ -401,8 +418,8 @@ test("受保护子代理跳过默认同步", async () => {
   try {
     await h.app.flush()
     h.setDefaultModel(nextModel)
-    await h.app.waitFor(() => h.switched.length >= 1)
-    expect(h.switched.map((item) => item.sessionID)).toEqual(["b"])
+    await h.app.waitFor(() => h.switched.length >= 2)
+    expect(h.switched.map((item) => item.sessionID).sort()).toEqual(["a", "b"])
   } finally {
     h.app.renderer.destroy()
   }
@@ -565,7 +582,7 @@ test("无标记或标记模型已不匹配时 fixed 默认照常覆盖", async (
   }
 })
 
-test("子代理手动 fixed 策略优先于 root 默认模型", async () => {
+test("per-child fixed 策略不阻止默认模型批量落地", async () => {
   const h = await render({
     sessions: [
       { id: "root", title: "root", agent: "build", model: kimiHigh, time: { created: 1, updated: 500 } },
@@ -593,15 +610,61 @@ test("子代理手动 fixed 策略优先于 root 默认模型", async () => {
   })
   try {
     await h.app.flush()
-    await h.app.waitFor(() => h.switched.length >= 1)
-    // 手动 fixed 是显式选择：挂载默认只覆盖未指定策略的普通子代理。
-    expect(h.switched.map((item) => item.sessionID)).toEqual(["plain"])
+    // 挂载默认落到 defaultSetAt 之后新建的普通子代理：per-child fixed 不豁免。
+    await h.app.waitFor(() => h.switched.length >= 2)
+    expect(h.switched.map((item) => item.sessionID).sort()).toEqual(["manual", "plain"])
     expect(h.switched[0]!.model).toEqual(qoder)
     h.setDefaultModel(qoderNext)
-    await h.app.waitFor(() => h.switched.length >= 2)
-    expect(h.switched.map((item) => item.sessionID)).toEqual(["plain", "plain"])
+    await h.app.waitFor(() => h.switched.length >= 4)
+    expect(h.switched.slice(2).map((item) => item.sessionID).sort()).toEqual(["manual", "plain"])
     expect(h.switched.at(-1)!.model).toEqual(qoderNext)
-    expect(h.switched.some((item) => item.sessionID === "manual")).toBe(false)
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("critic 会话不参与默认模型批量同步", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: kimiHigh, time: { created: 1, updated: 500 } },
+      {
+        id: "critic",
+        parentID: "root",
+        title: "Critic: 复核 甲",
+        agent: "explore",
+        model: kimi,
+        metadata: { "superagent.critic": true },
+        time: { created: 2000, updated: 400 },
+      },
+      {
+        id: "plain",
+        parentID: "root",
+        title: "普通",
+        agent: "executor",
+        model: kimi,
+        time: { created: 3000, updated: 300 },
+      },
+    ],
+    defaultPolicy: "fixed",
+    defaultModel: qoder,
+    defaultSetAt: 1000,
+  })
+  try {
+    await h.app.flush()
+    await h.app.waitFor(() => h.switched.length >= 1)
+    expect(h.switched.map((item) => item.sessionID)).toEqual(["plain"])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("auto 默认策略没有唯一目标，不做批量切换", async () => {
+  const h = await render({ sessions: threeChildren, defaultPolicy: "auto" })
+  try {
+    await h.app.flush()
+    h.setRootModel(nextModel)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(h.switched).toEqual([])
   } finally {
     h.app.renderer.destroy()
   }
@@ -625,7 +688,7 @@ test("受保护子代理拒绝手动改模型", async () => {
   }
 })
 
-test("运行中的子代理先中断再切换并 steer 续跑", async () => {
+test("运行中的子代理直接切换模型，不中断也不续跑", async () => {
   const h = await render({
     sessions: [
       { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
@@ -642,10 +705,12 @@ test("运行中的子代理先中断再切换并 steer 续跑", async () => {
   })
   try {
     await h.app.flush()
+    const putsBefore = h.puts.length
     h.setRootModel(nextModel)
-    await h.app.waitFor(() => h.sentPrompts.length > 0, 8000)
-    expect(h.calls).toEqual(["interrupt:busy", "switch:busy", "prompt:busy"])
-    expect(h.sentPrompts[0]!.delivery).toBe("steer")
+    await h.app.waitFor(() => h.switched.length > 0, 8000)
+    expect(h.calls).toEqual(["switch:busy"])
+    expect(h.sentPrompts).toEqual([])
+    expect(h.puts.slice(putsBefore)).toEqual([])
   } finally {
     h.app.renderer.destroy()
   }
@@ -666,6 +731,77 @@ test("失败的切换逐项明示", async () => {
     await h.app.waitFor(() => h.toasts.some((message) => message.includes("失败")))
     expect(h.switched.length).toBe(0)
     expect(h.toasts.at(-1)).toContain("模型不可用")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("A→B→A：切 root 不算用户修改默认模型，不重新批量", async () => {
+  const h = await render({
+    rootIDs: ["other"],
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      { id: "a", parentID: "root", title: "甲", agent: "executor", model: flash, time: { created: 2, updated: 400 } },
+      { id: "other", title: "other", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      {
+        id: "other-child",
+        parentID: "other",
+        title: "别家子代理",
+        agent: "executor",
+        model: flash,
+        time: { created: 5, updated: 300 },
+      },
+    ],
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    defaultSetAt: 1000,
+  })
+  try {
+    await h.app.flush()
+    h.setDefaultModel(nextModel)
+    await h.app.waitFor(() => h.switched.length >= 1)
+    // 用户切到 B：B 首次挂载只应用新建子代理，不批量切旧会话。
+    h.setSession("other")
+    await h.app.flush()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(h.switched.map((item) => item.sessionID)).toEqual(["a"])
+    h.setDefaultModel(qoderNext, "other")
+    await h.app.waitFor(() => h.switched.some((item) => item.sessionID === "other-child"))
+    // 回到 A 之前，A 的子代理被改回别的模型（不是通过默认模型策略）。
+    const child = h.context.data.session.get("a")!
+    child.model = flash
+    const before = h.switched.length
+    h.setSession("root")
+    await h.app.flush()
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    // A 的目标没变：切回来不应触发批量，子代理保持现状。
+    expect(h.switched.length).toBe(before)
+    expect(h.context.data.session.get("a")!.model).toEqual(flash)
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("同一 root 同步中来了新目标：本轮结束后接续最新", async () => {
+  const h = await render({
+    sessions: threeChildren,
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    defaultSetAt: 1000,
+    switchDelayFor: { a: 60, b: 60 },
+  })
+  try {
+    await h.app.flush()
+    h.setDefaultModel(nextModel)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // 第一轮还在逐个切换，用户又把默认模型改到最新目标。
+    h.setDefaultModel(qoderNext)
+    await h.app.waitFor(
+      () => h.switched.filter((item) => item.model.id === "qwen3-8-max").length >= 2,
+      8000,
+    )
+    expect(h.context.data.session.get("a")!.model).toEqual(qoderNext)
+    expect(h.context.data.session.get("b")!.model).toEqual(qoderNext)
   } finally {
     h.app.renderer.destroy()
   }

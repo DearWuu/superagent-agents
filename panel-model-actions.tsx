@@ -9,16 +9,13 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import type { AgentNode } from "./agent-tree"
 import { modelKey, sameModel, type ModelRef } from "./model-policy"
+import { pickFlagshipOverflow } from "./flagship"
 import { ModelPicker } from "./model-picker"
 import { INSTRUCTION_KEYS } from "./panel-defaults"
 import { appendOversightEvent } from "./panel-critic"
 import { favoriteModels, updateModelPreference, type ModelPreference } from "./panel-preferences"
 import type { DefaultAction, ModelChoice, ModelInfo } from "./panel-types"
-import {
-  errorText,
-  isSessionRunning,
-  waitForSessionIdle,
-} from "./panel-utils"
+import { errorText, isSessionRunning } from "./panel-utils"
 import type { RootSettings } from "./session-scope"
 
 export function createModelActions(deps: {
@@ -42,6 +39,8 @@ export function createModelActions(deps: {
   pickerFavorites: () => Set<string>
   pickerKey: (model: { providerID: string; id: string }) => string
   putInstruction: (key: string, value: string | number) => Promise<unknown>
+  notifyModelChange: (input: { childID?: string; childTitle?: string; value: string }) => Promise<void>
+  notifyDefaultPolicy: (input: { policy: "auto" | "inherit" | "fixed"; value?: string }) => Promise<void>
 }) {
   const {
     context,
@@ -64,6 +63,8 @@ export function createModelActions(deps: {
     pickerFavorites,
     pickerKey,
     putInstruction,
+    notifyModelChange,
+    notifyDefaultPolicy,
   } = deps
 
   const policyChoice = (node: AgentNode): ModelChoice | undefined => {
@@ -174,9 +175,11 @@ export function createModelActions(deps: {
     })
     await putInstruction(INSTRUCTION_KEYS.defaultModel, `${model.providerID}/${model.id}`)
     await rememberRecent(model)
+    const label = model.name || model.id
     context.ui.toast.show({
-      message: `子代理默认模型已设为 ${model.name || model.id}，正在应用到未保护子代理。`,
+      message: `子代理默认模型已设为 ${label}，正在应用到普通子代理（显式委派除外）。`,
     })
+    await notifyDefaultPolicy({ policy: "fixed", value: label })
   }
 
   async function openDefaults() {
@@ -203,12 +206,12 @@ export function createModelActions(deps: {
         {
           value: { kind: "inherit" },
           title: "跟随会话",
-          description: "所有未保护子代理跟随当前会话的模型（Superagent 主模型）",
+          description: "所有普通子代理跟随当前会话的模型（Superagent 主模型）",
         },
         {
           value: { kind: "choose" },
           title: "选择模型…",
-          description: "打开原生 /models 选择器；应用到所有未保护子代理",
+          description: "打开原生 /models 选择器；应用到所有普通子代理（显式委派除外）",
         },
         { value: { kind: "configure" }, title: "配置全局自动模型…", description: "所有 Session 共用这份列表" },
       ],
@@ -223,6 +226,8 @@ export function createModelActions(deps: {
         draft.defaultSetAt = undefined
       })
       context.ui.toast.show({ message: "子代理默认模型已设为自动。" })
+      // 自动只影响下次分配，没有唯一目标：不声称现有子代理已切模型。
+      await notifyDefaultPolicy({ policy: "auto" })
       return
     }
     if (selected.kind === "inherit") {
@@ -232,6 +237,8 @@ export function createModelActions(deps: {
         draft.defaultSetAt = undefined
       })
       context.ui.toast.show({ message: "子代理默认模型已设为跟随会话。" })
+      // 策略已保存，后续批量同步由默认模型生效流程执行。
+      await notifyDefaultPolicy({ policy: "inherit" })
       return
     }
     const picked = await pickModel(
@@ -244,33 +251,18 @@ export function createModelActions(deps: {
   /** 正在换模型的会话：同一时间只允许一次切换，避免两次动作交错。 */
   const switchingModels = new Set<string>()
 
-  type SwitchOutcome = { running: boolean; error?: string; warn?: string }
+  type SwitchOutcome = { running: boolean; error?: string }
 
   /**
-   * 切换模型的公共流程：空闲直接换；运行中先中断并等执行真的停下，再切换，
-   * 最后让子代理继续。所有失败以返回值上报，不在这里弹 toast。
+   * 切换模型的公共流程：官方 `session.switchModel` 对运行中的会话也不中断，
+   * 只作用于后续 provider 回合；这里对所有会话直接切换，失败以返回值上报。
    */
   async function switchModelCore(sessionID: string, model: ModelRef): Promise<SwitchOutcome> {
     const running = isSessionRunning(context, sessionID)
     if (switchingModels.has(sessionID)) return { running, error: "正在切换模型" }
     switchingModels.add(sessionID)
     try {
-      if (running) {
-        await context.client.session.interrupt({ sessionID })
-        const stopped = await waitForSessionIdle(context, sessionID)
-        if (!stopped) return { running, error: "中断没有生效" }
-      }
       await context.client.session.switchModel({ sessionID, model })
-      if (!running) return { running }
-      try {
-        await context.client.session.prompt({
-          sessionID,
-          text: `模型已切换为 ${names().get(modelKey(model)) ?? model.id}，继续当前任务`,
-          delivery: "steer",
-        })
-      } catch {
-        return { running, warn: "已切换模型，但未能让子代理继续" }
-      }
       return { running }
     } catch (error) {
       return { running, error: errorText(error) }
@@ -279,28 +271,85 @@ export function createModelActions(deps: {
     }
   }
 
-  async function applyModelSwitch(sessionID: string, model: ModelRef, label: string) {
+  type FlagshipConvergeResult = {
+    target?: ModelRef
+    reason?: "auto" | "missing-target" | "unavailable-target"
+    switched: number
+    skipped: number
+    failures: string[]
+  }
+
+  /**
+   * 用户把旗舰上限调小时收敛当前 root 的超额旗舰：保留较新的 N 个，最旧的
+   * 先直接切换到子代理默认模型（官方切换不中断运行中的回合）。目标只解析一次：
+   * fixed 用默认模型，inherit 用当前 root 模型，auto 没有唯一目标就不猜。
+   * 单项失败继续其余；身份标记由 server 在 model.selected 时清理。
+   */
+  async function convergeFlagships(keep: number): Promise<FlagshipConvergeResult> {
+    const scoped = root()
+    const policy = scoped.defaultPolicy ?? "inherit"
+    const target =
+      policy === "fixed" ? scoped.defaultModel : policy === "inherit" ? tree()?.model?.actual : undefined
+    const candidates = (tree()?.children ?? []).flatMap((node) => {
+      if (!node.sessionID) return []
+      const stored = context.data.session.get(node.sessionID)
+      return [
+        {
+          id: node.sessionID,
+          title: node.title,
+          model: node.model?.actual ?? stored?.model,
+          metadata: stored?.metadata,
+          created: node.created ?? stored?.time?.created,
+        },
+      ]
+    })
+    const overflow = pickFlagshipOverflow(candidates, keep)
+    if (overflow.length === 0) return { target, switched: 0, skipped: 0, failures: [] }
+    if (!target) {
+      return {
+        reason: policy === "auto" ? "auto" : "missing-target",
+        switched: 0,
+        skipped: overflow.length,
+        failures: [],
+      }
+    }
+    if (!models().some((item) => sameModel(item, target))) {
+      return { target, reason: "unavailable-target", switched: 0, skipped: overflow.length, failures: [] }
+    }
+    let switched = 0
+    const failures: string[] = []
+    for (const candidate of overflow) {
+      if (candidate.model && sameModel(candidate.model, target)) {
+        failures.push(`${candidate.title ?? candidate.id}：已是目标模型`)
+        continue
+      }
+      const outcome = await switchModelCore(candidate.id, {
+        providerID: target.providerID,
+        id: target.id,
+        ...(target.variant ? { variant: target.variant } : {}),
+      })
+      if (outcome.error) failures.push(`${candidate.title ?? candidate.id}：${outcome.error}`)
+      else switched++
+    }
+    return { target, switched, skipped: failures.length, failures }
+  }
+
+  /** 面板单子代理切换：直接切换并把失败以 toast 上报；返回结果供通知判定。 */
+  async function applyModelSwitch(sessionID: string, model: ModelRef, label: string): Promise<SwitchOutcome> {
     const running = isSessionRunning(context, sessionID)
     const outcome = await switchModelCore(sessionID, model)
     if (outcome.error === "正在切换模型") {
       context.ui.toast.show({ message: "正在切换模型，请稍候。" })
-      return
-    }
-    if (outcome.error === "中断没有生效") {
-      context.ui.toast.show({ message: "中断没有生效，模型未切换。" })
-      return
+      return outcome
     }
     if (outcome.error) {
       context.ui.toast.show({ message: `切换模型失败：${outcome.error}` })
-      return
-    }
-    if (outcome.warn) {
-      context.ui.toast.show({ message: `模型已切换为 ${label}，请手动让该子代理继续。` })
-      return
+      return outcome
     }
     context.ui.toast.show({
-      message: running ? `已中断当前步骤，切换模型 ${label} 并继续` : `已切换模型 ${label}`,
+      message: running ? `已切换模型 ${label}，当前步骤继续，后续步骤使用新模型` : `已切换模型 ${label}`,
     })
+    return outcome
   }
 
   async function openModel(node: AgentNode) {
@@ -308,7 +357,7 @@ export function createModelActions(deps: {
     // Protected Subagents keep their own model; changing it needs the protection off first.
     if (node.sessionID && root().keptSubagents?.[node.sessionID]) {
       context.ui.toast.show({
-        message: `${node.title} 已受保护，模型不会被修改；请先取消保护。`,
+        message: `${node.title} 已受保护，不能手动改模型；请先取消保护（默认模型同步仍会生效）。`,
       })
       return
     }
@@ -339,6 +388,8 @@ export function createModelActions(deps: {
         draft.policies = { ...draft.policies, [node.sessionID!]: "auto" }
       })
       context.ui.toast.show({ message: `${node.title} 已设为自动；下次分配时由 Superagent 重新选择。` })
+      // 自动只表示后续分配策略，不声称模型已生效。
+      await notifyDefaultPolicy({ policy: "auto" })
       return
     }
     if (selected.kind === "inherit") {
@@ -348,7 +399,8 @@ export function createModelActions(deps: {
         draft.policies = { ...draft.policies, [node.sessionID!]: "inherit" }
       })
       const parent = tree()?.model?.actual
-      if (parent && node.sessionID)
+      const label = parent ? (names().get(modelKey(parent)) ?? parent.id) : "跟随会话"
+      if (parent && node.sessionID) {
         await applyModelSwitch(
           node.sessionID,
           {
@@ -356,8 +408,11 @@ export function createModelActions(deps: {
             id: parent.id,
             ...(parent.variant ? { variant: parent.variant } : {}),
           },
-          names().get(modelKey(parent)) ?? parent.id,
+          label,
         )
+      }
+      // 策略已保存；单个子代理的切换结果由 toast 呈现，通知只说明策略。
+      await notifyDefaultPolicy({ policy: "inherit" })
       return
     }
     const picked = await pickModel(`设置 ${node.title} 的模型`, node.model?.actual)
@@ -371,7 +426,10 @@ export function createModelActions(deps: {
     await updateRoot((draft) => {
       draft.policies = { ...draft.policies, [node.sessionID!]: "fixed" }
     })
-    await applyModelSwitch(node.sessionID!, modelRef, picked.model.name || picked.model.id)
+    const label = picked.model.name || picked.model.id
+    const outcome = await applyModelSwitch(node.sessionID!, modelRef, label)
+    // 只有模型真的切成功才通知；失败不通知。
+    if (!outcome.error) await notifyModelChange({ childID: node.sessionID, childTitle: node.title, value: label })
     await rememberRecent(picked.model)
     void appendOversightEvent("model.changed", {
       rootSessionID: rootSessionID(),
@@ -386,5 +444,6 @@ export function createModelActions(deps: {
     openModel,
     pickModel,
     switchModelCore,
+    convergeFlagships,
   }
 }

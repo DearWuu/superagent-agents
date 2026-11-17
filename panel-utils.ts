@@ -76,16 +76,6 @@ export function isSessionRunning(context: Plugin.Context, sessionID: string) {
   return raw === "running" || String(raw) === "busy"
 }
 
-/** 等待会话的执行真正停下来；超时返回 false。 */
-export async function waitForSessionIdle(context: Plugin.Context, sessionID: string, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (!isSessionRunning(context, sessionID)) return true
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  return !isSessionRunning(context, sessionID)
-}
-
 /** 面向用户的错误说明。 */
 export function errorText(error: unknown) {
   if (error instanceof Error) return error.message

@@ -80,6 +80,9 @@ const prompted: unknown[] = []
 const synthetics: any[] = []
 /** toast 文案：用来确认动作本身真的执行了。 */
 const toasts: string[] = []
+/** 故障注入：删除/压缩失败时面板必须 toast 且不投递手动操作通知。 */
+let failRemove = false
+let failCompact = false
 /** The action the row menu returns; unset means the user just opened the menu. */
 let nextSelection: unknown
 /** 连续多个弹窗的返回值：行菜单 + 后续弹窗按顺序取。 */
@@ -117,7 +120,9 @@ const context = {
     },
     session: {
       switchModel: async () => {},
-      compact: async () => {},
+      compact: async () => {
+        if (failCompact) throw new Error("compact failed")
+      },
       create: async (input: unknown) => {
         created.push(input)
         return { id: "x" }
@@ -127,6 +132,7 @@ const context = {
       },
       interrupt: async () => {},
       remove: async ({ sessionID }: { sessionID: string }) => {
+        if (failRemove) throw new Error("remove failed")
         removed.push(sessionID)
         const index = sessions.findIndex((item) => item.id === sessionID)
         if (index >= 0) sessions.splice(index, 1)
@@ -228,7 +234,7 @@ test("the row action menu offers the delete action and the protection note", asy
   })
   expect(shot.charFrame).toContain("删除 Subagent")
   expect(shot.charFrame).toContain("删除该子会话及其上下文，不可恢复")
-  expect(shot.charFrame).toContain("不会被自动淘汰，模型也不会被修改；取消保护后才可改")
+  expect(shot.charFrame).toContain("不会被自动淘汰；手动改模型需先取消保护，默认模型同步仍会生效")
   save("delete-menu", shot)
 })
 
@@ -300,8 +306,8 @@ test("deleting a subagent tells the Superagent that the user did it", async () =
   expect(synthetics).toHaveLength(1)
   expect(synthetics[0].sessionID).toBe("root")
   expect(synthetics[0].description).toBe("用户手动操作")
-  // 手动操作立即投递成对话里的 inline 记录，随会话上移。
-  expect(synthetics[0].delivery).toBe("steer")
+  // 手动操作通知一律 queue：成为待处理消息，不打断也不唤醒正在推理的会话。
+  expect(synthetics[0].delivery).toBe("queue")
   expect(String(synthetics[0].text)).toContain("用户")
   expect(String(synthetics[0].text)).toContain("删除")
   expect(synthetics[0].metadata).toEqual({
@@ -344,7 +350,7 @@ test("releasing the protection tells the Superagent that the user did it", async
   expect(synthetics[0].metadata.action).toBe("unkeep")
 })
 
-test("switching a model does not notify the Superagent", async () => {
+test("changing a child's model policy tells the Superagent without claiming the model switched", async () => {
   addSession("modeler", "换模型的子代理")
   synthetics.length = 0
   toasts.length = 0
@@ -352,9 +358,60 @@ test("switching a model does not notify the Superagent", async () => {
   await capture("换模型的子代理", async (app) => {
     const title = app.renderer.root.findDescendantById("sidebar.agents.title.modeler")!
     await app.mockMouse.click(title.x, title.y)
-    await app.waitFor(() => toasts.some((item) => item.includes("已设为自动")), 8000)
+    // 策略通知有防抖窗口，不走渲染帧，用真实定时器等。
+    await waitUntil(() => synthetics.length === 1)
   })
-  // 模型切换照常执行，但不额外打扰 Superagent。
   expect(toasts.some((item) => item.includes("已设为自动"))).toBe(true)
-  expect(synthetics).toEqual([])
+  expect(synthetics).toHaveLength(1)
+  expect(synthetics[0].sessionID).toBe("root")
+  expect(synthetics[0].delivery).toBe("queue")
+  // 自动只是后续分配策略，不声称现有子代理已切模型。
+  expect(String(synthetics[0].text)).toContain("自动")
+  expect(String(synthetics[0].text)).toContain("现有子代理没有被批量切换")
+  expect(synthetics[0].metadata).toEqual({
+    source: "superagent-agents",
+    kind: "manual-op",
+    action: "default-policy",
+  })
+})
+
+test("删除失败：toast 失败原因，不投递手动操作通知", async () => {
+  addSession("del-fail", "删除失败子代理")
+  synthetics.length = 0
+  toasts.length = 0
+  selectionQueue.push({ kind: "delete" })
+  failRemove = true
+  try {
+    await capture("删除失败子代理", async (app) => {
+      const title = app.renderer.root.findDescendantById("sidebar.agents.title.del-fail")!
+      await app.mockMouse.click(title.x, title.y)
+      await waitUntil(() => toasts.some((item) => item.includes("删除失败子代理 失败")))
+    })
+    expect(removed).not.toContain("del-fail")
+    expect(toasts.at(-1)).toContain("删除失败子代理 失败")
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    expect(synthetics).toEqual([])
+  } finally {
+    failRemove = false
+  }
+})
+
+test("压缩失败：toast 失败原因，不投递手动操作通知", async () => {
+  addSession("compact-fail", "压缩失败子代理")
+  synthetics.length = 0
+  toasts.length = 0
+  selectionQueue.push({ kind: "compact" })
+  failCompact = true
+  try {
+    await capture("压缩失败子代理", async (app) => {
+      const title = app.renderer.root.findDescendantById("sidebar.agents.title.compact-fail")!
+      await app.mockMouse.click(title.x, title.y)
+      await waitUntil(() => toasts.some((item) => item.includes("压缩失败子代理 失败")))
+    })
+    expect(toasts.at(-1)).toContain("压缩失败子代理 失败")
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    expect(synthetics).toEqual([])
+  } finally {
+    failCompact = false
+  }
 })

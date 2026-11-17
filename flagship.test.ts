@@ -9,6 +9,7 @@ import {
   isFlagshipSession,
   normalizeFlagshipModel,
   normalizeMaxFlagshipSubagents,
+  pickFlagshipOverflow,
   sameFlagshipModel,
 } from "./flagship"
 
@@ -195,18 +196,54 @@ describe("旗舰身份：标记与当前模型", () => {
 })
 
 describe("flagship limit", () => {
-  test("默认 2，合法范围 0..20", () => {
-    expect(DEFAULT_MAX_FLAGSHIP_SUBAGENTS).toBe(2)
-    expect(normalizeMaxFlagshipSubagents(undefined)).toBe(2)
+  test("默认 0，合法范围 0..20", () => {
+    expect(DEFAULT_MAX_FLAGSHIP_SUBAGENTS).toBe(0)
+    expect(normalizeMaxFlagshipSubagents(undefined)).toBe(0)
     expect(normalizeMaxFlagshipSubagents(-1)).toBe(0)
     expect(normalizeMaxFlagshipSubagents(21)).toBe(20)
     expect(normalizeMaxFlagshipSubagents("3")).toBe(3)
-    expect(normalizeMaxFlagshipSubagents("x")).toBe(2)
+    expect(normalizeMaxFlagshipSubagents("x")).toBe(0)
   })
 
   test("旗舰上限受子代理总上限约束", () => {
     expect(effectiveFlagshipLimit(5, 3)).toBe(3)
     expect(effectiveFlagshipLimit(2, 5)).toBe(2)
     expect(effectiveFlagshipLimit(0, 5)).toBe(0)
+  })
+})
+describe("pickFlagshipOverflow", () => {
+  const rootModel = { providerID: "acme", id: "root" }
+  const marker = { model: rootModel, at: 1, source: FLAGSHIP_MARKER_SOURCE }
+  const candidate = (id: string, created: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    created,
+    model: rootModel,
+    metadata: { [FLAGSHIP_METADATA_KEY]: marker },
+    ...extra,
+  })
+
+  test("保留较新的 N 个，超额按 created 从旧到新返回", () => {
+    const list = [candidate("c", 30), candidate("a", 10), candidate("b", 20)]
+    expect(pickFlagshipOverflow(list, 1).map((item) => item.id)).toEqual(["a", "b"])
+  })
+
+  test("0 表示全部超额；created 相同时保持输入顺序", () => {
+    const list = [candidate("first", 10), candidate("second", 10), candidate("third", 10)]
+    expect(pickFlagshipOverflow(list, 0).map((item) => item.id)).toEqual(["first", "second", "third"])
+  })
+
+  test("上限不小于旗舰数时没有超额", () => {
+    expect(pickFlagshipOverflow([candidate("a", 1)], 1)).toEqual([])
+    expect(pickFlagshipOverflow([candidate("a", 1)], 5)).toEqual([])
+  })
+
+  test("无效或过期的 marker 不计入旗舰", () => {
+    const list = [
+      candidate("plain", 1, { metadata: {} }),
+      candidate("legacy", 2, { metadata: { [FLAGSHIP_METADATA_KEY]: true } }),
+      candidate("stale", 3, { model: { providerID: "acme", id: "flash" } }),
+      candidate("valid", 4),
+    ]
+    expect(pickFlagshipOverflow(list, 0).map((item) => item.id)).toEqual(["valid"])
   })
 })

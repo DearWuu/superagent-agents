@@ -134,26 +134,30 @@ describe("OVERSIGHT_LEVEL_DESCRIPTIONS", () => {
     }
   })
 })
-describe("SUPERAGENT_DEFAULTS.sessionPrompt", () => {
-  test("保留硬约束并引用编排、验收、上下文技能", () => {
+describe("SUPERAGENT_DEFAULTS 提示词", () => {
+  test("sessionPrompt 只保留主代理职责、三条硬约束与三个技能入口", () => {
     const prompt = tui.SUPERAGENT_DEFAULTS.sessionPrompt
+    expect(prompt).toContain("负责重要判断")
     expect(prompt).toContain("主代理不做具体实现")
     expect(prompt).toContain("只读分析")
-    expect(prompt).toContain("亲眼看实际渲染结果")
+    expect(prompt).toContain("实现、修改、调试、测试默认派工")
+    expect(prompt).toContain("派工成功只认 subagent 工具成功回执")
+    expect(prompt).toContain("最多做一次有界只读核实")
     expect(prompt).toContain("superagent-orchestration")
     expect(prompt).toContain("superagent-acceptance")
     expect(prompt).toContain("superagent-context")
-    expect(prompt).toContain("先判断任务是否适合 Flash")
-    expect(prompt).toContain("默认上限 2")
-    expect(prompt).toContain("限额切换不等于能力升级")
     expect(prompt).not.toContain("七字段")
-    expect(prompt.length).toBeLessThan(1800)
+    expect(prompt).not.toContain("先判断任务是否适合 Flash")
+    expect(prompt).not.toContain("默认上限")
+    expect(prompt).not.toContain("亲眼看实际渲染结果")
+    expect(prompt.length).toBeLessThan(700)
   })
 
-  test("taskPrompt 精简并引用任务契约与升级触发", () => {
-    const prompt = tui.SUPERAGENT_DEFAULTS.taskPrompt
-    expect(prompt).toContain("任务契约")
-    expect(prompt).toContain("能力升级")
-    expect(prompt.length).toBeLessThan(200)
+  test("assignment 合并范围、歧义与升级规则，task 默认不再重复", () => {
+    const assignment = tui.SUPERAGENT_DEFAULTS.assignmentPrompt
+    expect(assignment).toContain("按任务书执行，不扩大范围")
+    expect(assignment).toContain("需求不清先提问")
+    expect(assignment).toContain("遇到能力升级先报告")
+    expect(tui.SUPERAGENT_DEFAULTS.taskPrompt).toBe("")
   })
 })

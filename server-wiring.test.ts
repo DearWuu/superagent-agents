@@ -77,11 +77,35 @@ function harness(options: HarnessOptions) {
   const created: Array<{ parentID?: string; agent?: string; title?: string }> = []
   const updated: Array<{ sessionID: string; metadata?: Record<string, unknown> }> = []
   const removed: string[] = []
+  const synthetics: any[] = []
+  const hooks: Record<string, any> = {}
+  const reads: string[] = []
+  const contextReads: string[] = []
+  const tool = {
+    id: "subagent",
+    name: "subagent",
+    input: { type: "object", properties: { prompt: { type: "string" } } },
+    execute: async (input: any) => ({
+      output: "done",
+      metadata: { sessionID: "ses_child", status: input.background ? "running" : "completed" },
+    }),
+  }
+  const toolEditor = {
+    get: (id: string) => id === "subagent" ? tool : undefined,
+    update: (_id: string, update: (value: any) => void) => update(tool),
+  }
   const events = eventQueue()
 
   const ctx = {
     tool: {
-      hook: async () => ({ dispose() {} }),
+      hook: async (name: string, handler: any) => {
+        hooks[`tool:${name}`] = handler
+        return { dispose() {} }
+      },
+      transform: async (callback: any) => {
+        callback(toolEditor)
+        return { dispose() {} }
+      },
     },
     event: {
       subscribe: () => events.iterable,
@@ -89,6 +113,7 @@ function harness(options: HarnessOptions) {
     session: {
       hook: async () => ({ dispose() {} }),
       async get({ sessionID }: { sessionID: string }) {
+        reads.push(sessionID)
         const found = sessions.get(sessionID)
         if (!found) throw new Error(`no session ${sessionID}`)
         return { ...found, time: { ...(found.time ?? {}) } }
@@ -119,8 +144,13 @@ function harness(options: HarnessOptions) {
         return { id: `msg_${prompts.length}` }
       },
       async context({ sessionID }: { sessionID: string }) {
+        contextReads.push(sessionID)
         const text = sessionID === "ses_critic" ? (options.criticAnswer ?? "verdict: 一致\ndifferences:\n- 无") : (options.childReport ?? "我改了 src/a.ts")
         return [{ id: "msg_1", type: "assistant", content: [{ type: "text", text }] }]
+      },
+      async synthetic(input: any) {
+        synthetics.push(structuredClone(input))
+        return { id: `msg_syn_${synthetics.length}` }
       },
       async remove({ sessionID }: { sessionID: string }) {
         removed.push(sessionID)
@@ -139,7 +169,7 @@ function harness(options: HarnessOptions) {
     },
   }
 
-  return { ctx, sessions, prompts, created, updated, removed, events }
+  return { ctx, tool, hooks, synthetics, reads, contextReads, sessions, prompts, created, updated, removed, events }
 }
 
 const cleanups: string[] = []
@@ -158,6 +188,7 @@ afterEach(() => {
   delete process.env.SUPERAGENT_STATE_DIR
   delete process.env.XDG_STATE_HOME
   delete process.env.SUPERAGENT_HOOK_LOG
+  delete process.env.SUPERAGENT_STATUS_RECONCILE_MS
 })
 
 async function waitFor(check: () => boolean, timeoutMs = 2000) {
@@ -406,6 +437,123 @@ describe("dispose 清理探针定时器", () => {
     } finally {
       globalThis.setInterval = realSet
       globalThis.clearInterval = realClear
+      h.events.close()
+    }
+  })
+})
+
+describe("server 事件订阅接线", () => {
+  test("setup 订阅十类事件，dispose abort 同一个 signal", async () => {
+    tempState()
+    const h = harness({ sessions: [{ id: "ses_root" }] })
+    let subscription: any
+    const subscribe = h.ctx.event.subscribe
+    h.ctx.event.subscribe = (options: any) => {
+      subscription = options
+      return subscribe()
+    }
+    const dispose = await (plugin as any).setup(h.ctx)
+    expect(subscription.types).toEqual([
+      "session.created",
+      "session.step.ended",
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.execution.interrupted",
+      "session.shell.started",
+      "session.shell.ended",
+      "session.model.selected",
+      "session.deleted",
+      "session.inbox.enqueued",
+    ])
+    expect(subscription.signal.aborted).toBe(false)
+    await dispose()
+    expect(subscription.signal.aborted).toBe(true)
+    h.events.close()
+  })
+
+  test("durable inbox 在 execution 后到达：pending context 不可见也不补双卡", async () => {
+    tempState()
+    process.env.SUPERAGENT_STATUS_RECONCILE_MS = "1600"
+    const h = harness({
+      sessions: [
+        { id: "ses_root", title: "root" },
+        {
+          id: "ses_child",
+          parentID: "ses_root",
+          title: "后台任务",
+          outcome: null,
+          time: { created: 1, busy: 1 },
+          metadata: { "superagent.runtime": { state: "idle-background" } },
+        },
+      ],
+    })
+    const dispose = await (plugin as any).setup(h.ctx)
+    try {
+      const input = { agent: "worker", description: "任务", prompt: "go", background: true }
+      const callID = "call-native"
+      await h.hooks["tool:execute.before"]({
+        tool: "subagent",
+        sessionID: "ses_root",
+        id: callID,
+        agent: "superagent",
+        input,
+      })
+      await h.tool.execute(input, {
+        id: callID,
+        sessionID: "ses_root",
+        signal: new AbortController().signal,
+      })
+      await h.hooks["tool:execute.after"]({ tool: "subagent", id: callID })
+      expect(await waitFor(() => h.reads.includes("ses_child"))).toBe(true)
+
+      const child = h.sessions.get("ses_child")!
+      child.outcome = "succeeded"
+      child.time = { ...child.time, idle: Date.now() }
+      h.events.push({
+        id: "evt_execution_before_native",
+        type: "session.execution.succeeded",
+        data: { sessionID: "ses_child" },
+      })
+      expect(await waitFor(() => readJsonl(process.env.SUPERAGENT_HOOK_LOG!).some(
+        (record) => record.event === "status-completion-pending",
+      ))).toBe(true)
+      expect(h.synthetics).toEqual([])
+
+      const created = Date.now()
+      h.events.push({
+        id: "evt_durable_native",
+        type: "session.inbox.enqueued",
+        created,
+        data: {
+          sessionID: "ses_root",
+          inboxID: "msg_native",
+          item: {
+            type: "synthetic",
+            delivery: "queue",
+            payload: {
+              text: '<subagent sessionID="ses_child" state="completed">原生完成</subagent>',
+              metadata: { source: "subagent", childID: "ses_child", state: "completed" },
+            },
+          },
+        },
+      })
+      expect(await waitFor(() => h.updated.some((item) =>
+        item.sessionID === "ses_child" && item.metadata && !("superagent.runtime" in item.metadata),
+      ))).toBe(true)
+
+      const logs = readJsonl(process.env.SUPERAGENT_HOOK_LOG!)
+      expect(logs.filter((record) => record.event === "status-completion-pending")).toHaveLength(1)
+      expect(logs.find((record) => record.event === "status-native-notice")).toMatchObject({
+        childSessionID: "ses_child",
+        parentID: "ses_root",
+        state: "completed",
+        enqueuedAt: created,
+      })
+      expect(logs.some((record) => record.event === "status-completion-fallback")).toBe(false)
+      expect(logs.some((record) => record.event === "status-completed")).toBe(false)
+      expect(h.synthetics).toEqual([])
+    } finally {
+      await dispose()
       h.events.close()
     }
   })

@@ -6,7 +6,13 @@
  */
 import { describe, expect, test } from "bun:test"
 
-import { INSTRUCTION_KEYS, LEGACY_SESSION_PROMPTS, SUPERAGENT_DEFAULTS } from "./panel-defaults"
+import {
+  INSTRUCTION_KEYS,
+  LEGACY_ASSIGNMENT_PROMPTS,
+  LEGACY_SESSION_PROMPTS,
+  LEGACY_TASK_PROMPTS,
+  SUPERAGENT_DEFAULTS,
+} from "./panel-defaults"
 import { createInstructionActions } from "./panel-instructions"
 import { defaultRootSettings } from "./session-scope"
 import { SUPERAGENT_ACCEPTANCE_SKILL, SUPERAGENT_ORCHESTRATION_SKILL } from "./skills"
@@ -74,7 +80,7 @@ function harness(initial: Record<string, unknown> = {}) {
   })
   const instructionValueOf = (key: string) =>
     instructions.rootID === ROOT ? instructions.values[key] : undefined
-  return { actions, store, writes }
+  return { actions, store, writes, root }
 }
 
 describe("常驻 sessionPrompt 的派工硬约束", () => {
@@ -125,17 +131,16 @@ describe("编排技能与常驻提示词同口径", () => {
     "禁止连续轮询",
   ]
 
-  test("技能与默认提示词共享同一套硬约束措辞", () => {
-    for (const phrase of shared) {
-      expect(SUPERAGENT_ORCHESTRATION_SKILL.content).toContain(phrase)
-      expect(SUPERAGENT_DEFAULTS.sessionPrompt).toContain(phrase)
-    }
+  test("硬约束以常驻提示词为准，编排技能不逐字重复", () => {
+    for (const phrase of shared) expect(SUPERAGENT_DEFAULTS.sessionPrompt).toContain(phrase)
+    expect(SUPERAGENT_ORCHESTRATION_SKILL.content).toContain("以常驻 sessionPrompt 为准")
+    expect(SUPERAGENT_ORCHESTRATION_SKILL.content).not.toContain("派工成功只认 subagent 工具成功回执")
   })
 })
 
 describe("默认 sessionPrompt 的升级机制", () => {
   test("旧默认都留在 legacy 名单里，且与新默认不同", () => {
-    expect(LEGACY_SESSION_PROMPTS.length).toBeGreaterThanOrEqual(3)
+    expect(LEGACY_SESSION_PROMPTS.length).toBeGreaterThanOrEqual(4)
     expect(new Set(LEGACY_SESSION_PROMPTS).size).toBe(LEGACY_SESSION_PROMPTS.length)
     for (const legacy of LEGACY_SESSION_PROMPTS) {
       expect(legacy).not.toBe(SUPERAGENT_DEFAULTS.sessionPrompt)
@@ -144,6 +149,14 @@ describe("默认 sessionPrompt 的升级机制", () => {
     expect(
       LEGACY_SESSION_PROMPTS.some((text) =>
         text.includes("上下文：需要继续同一任务时优先 steer 续跑或 compact"),
+      ),
+    ).toBe(true)
+    // 831dd95 的完整默认带有三条派工硬约束，也必须精确命中迁移。
+    expect(
+      LEGACY_SESSION_PROMPTS.some(
+        (text) =>
+          text.startsWith("硬约束：实现、修改、调试、测试默认派工") &&
+          text.includes("默认上限 2 且仍受子代理总上限约束"),
       ),
     ).toBe(true)
   })
@@ -168,5 +181,52 @@ describe("默认 sessionPrompt 的升级机制", () => {
     await h.actions.initializeInstructions()
     expect(h.store.get(INSTRUCTION_KEYS.sessionPrompt)).toBe(custom)
     expect(h.writes.some((write) => write.key === INSTRUCTION_KEYS.sessionPrompt)).toBe(false)
+  })
+})
+
+describe("assignment 与 task 默认提示词迁移", () => {
+  test("缺失条目写入新默认，task 默认留空", async () => {
+    const h = harness()
+    await h.actions.initializeInstructions()
+    expect(h.root.assignmentPrompt).toBe(SUPERAGENT_DEFAULTS.assignmentPrompt)
+    expect(h.store.get(INSTRUCTION_KEYS.taskPrompt)).toBe("")
+    expect(SUPERAGENT_DEFAULTS.taskPrompt).toBe("")
+  })
+
+  test("831dd95 的 assignment 默认精确升级", async () => {
+    expect(LEGACY_ASSIGNMENT_PROMPTS).toHaveLength(1)
+    const h = harness()
+    h.root.assignmentPrompt = LEGACY_ASSIGNMENT_PROMPTS[0]
+    await h.actions.initializeInstructions()
+    expect(h.root.assignmentPrompt).toBe(SUPERAGENT_DEFAULTS.assignmentPrompt)
+    expect(h.root.assignmentPrompt).toContain("遇到能力升级先报告")
+  })
+
+  test("831dd95 的 task 默认与更老的空默认都升级为空白补充", async () => {
+    expect(LEGACY_TASK_PROMPTS.some((text) => text.includes("按任务契约执行"))).toBe(true)
+    for (const legacy of LEGACY_TASK_PROMPTS) {
+      const h = harness({ [INSTRUCTION_KEYS.taskPrompt]: legacy })
+      await h.actions.initializeInstructions()
+      expect(h.store.get(INSTRUCTION_KEYS.taskPrompt)).toBe("")
+    }
+  })
+
+  test("三项用户自定义（包括测试）都绝不覆盖", async () => {
+    const custom = "测试"
+    const h = harness({
+      [INSTRUCTION_KEYS.sessionPrompt]: custom,
+      [INSTRUCTION_KEYS.taskPrompt]: custom,
+    })
+    h.root.assignmentPrompt = custom
+    await h.actions.initializeInstructions()
+    expect(h.store.get(INSTRUCTION_KEYS.sessionPrompt)).toBe(custom)
+    expect(h.store.get(INSTRUCTION_KEYS.taskPrompt)).toBe(custom)
+    expect(h.root.assignmentPrompt).toBe(custom)
+    expect(
+      h.writes.some(
+        (write) =>
+          write.key === INSTRUCTION_KEYS.sessionPrompt || write.key === INSTRUCTION_KEYS.taskPrompt,
+      ),
+    ).toBe(false)
   })
 })

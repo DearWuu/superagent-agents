@@ -220,10 +220,17 @@ async function waitFor(check: () => boolean, timeoutMs = 2000) {
   return check()
 }
 
-const rootEntries = (extra: Entry[] = []): Entry[] => [
-  { key: "superagent.max-subagents", value: 5 },
-  ...extra,
-]
+/**
+ * 既有用例都在显式上限下验证准入/淘汰；缺省 0 的行为由“缺省上限”用例单独覆盖，
+ * 因此这里默认补一条 value=2，显式传入同名 key 时以调用方为准。
+ */
+const rootEntries = (extra: Entry[] = [], flagshipLimit: number | null = 2): Entry[] => {
+  const entries: Entry[] = [{ key: "superagent.max-subagents", value: 5 }]
+  if (flagshipLimit !== null && !extra.some((entry) => entry.key === MAX_FLAGSHIP_SUBAGENTS_KEY)) {
+    entries.push({ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: flagshipLimit })
+  }
+  return [...entries, ...extra]
+}
 
 function baseSessions(children: FakeSession[] = []): FakeSession[] {
   return [{ id: "ses_root", title: "root", agent: "superagent", model: ROOT_MODEL }, ...children]
@@ -297,11 +304,29 @@ async function setup(options: HarnessOptions) {
 }
 
 describe("旗舰上限默认与配置", () => {
-  test("默认 2：两个运行中的旗舰占满后，第三个旗舰被拒绝", async () => {
+  test("缺省 0：没有显式上限时新建旗舰被拒绝", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([runningFlagship("ses_f1", 10)]),
+      entries: { ses_root: rootEntries([], null) },
+    })
+    const error = await denied(h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" })))
+    expect(String(error.message)).toContain("旗舰子代理上限已满")
+    expect(String(error.message)).toContain("上限0")
+    expect(h.removed).toEqual([])
+    const row = hookLog().find((record) => record.event === "subagent-denied")
+    expect(row.reason).toBe("flagship-limit")
+    expect(row.flagshipExist).toBe(1)
+    expect(row.flagshipLimit).toBe(0)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("显式上限 2：两个运行中的旗舰占满后，第三个旗舰被拒绝", async () => {
     tempState()
     const h = await setup({
       sessions: baseSessions([runningFlagship("ses_f1", 10), runningFlagship("ses_f2", 20)]),
-      entries: { ses_root: rootEntries() },
+      entries: { ses_root: rootEntries([], 2) },
     })
     const error = await denied(h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" })))
     expect(String(error.message)).toContain("旗舰子代理上限已满")
@@ -387,16 +412,16 @@ describe("旗舰上限默认与配置", () => {
     h.events.close()
   })
 
-  test("非法值回退默认 2", async () => {
+  test("非法值回退默认 0：已有旗舰时新旗舰被拒绝", async () => {
     tempState()
     const h = await setup({
       sessions: baseSessions([runningFlagship("ses_f1")]),
       entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: "abc" }]) },
     })
-    await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
-    const row = hookLog().find((record) => record.event === "subagent-allowed")
-    expect(row.flagshipLimit).toBe(2)
-    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c1" })
+    const error = await denied(h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" })))
+    expect(String(error.message)).toContain("旗舰子代理上限已满")
+    const row = hookLog().find((record) => record.event === "subagent-denied")
+    expect(row.flagshipLimit).toBe(0)
     await h.dispose()
     h.events.close()
   })
@@ -1506,7 +1531,12 @@ describe("淘汰并发竞态", () => {
     tempState()
     const h = await setup({
       sessions: baseSessions([plainSameModel("ses_old", 1)]),
-      entries: { ses_root: [{ key: "superagent.max-subagents", value: 1 }] },
+      entries: {
+        ses_root: [
+          { key: "superagent.max-subagents", value: 1 },
+          { key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 2 },
+        ],
+      },
     })
     const originalList = h.ctx.session.list
     let listCalls = 0

@@ -9,8 +9,9 @@ import type { Plugin } from "@opencode/plugin/tui"
 import type { Setter } from "solid-js"
 import {
   INSTRUCTION_KEYS,
+  LEGACY_ASSIGNMENT_PROMPTS,
   LEGACY_SESSION_PROMPTS,
-  LEGACY_TASK_PROMPT,
+  LEGACY_TASK_PROMPTS,
   SUPERAGENT_DEFAULTS,
 } from "./panel-defaults"
 import type { ModelInfo } from "./panel-types"
@@ -134,16 +135,23 @@ export function createInstructionActions(deps: {
     }
   }
   /**
-   * Prompt defaults changed: entries that are absent or still exactly the
-   * previous default move to the new text. A user's custom text is untouched.
+   * Prompt defaults changed: assignment, session and task text that is absent
+   * or still exactly a previous default moves to the new text. A user's custom
+   * text is untouched; assignment lives on the root, the other two are entries.
    */
   async function migrateDefaultInstructions() {
     const session = instructionText(INSTRUCTION_KEYS.sessionPrompt)
     if (!instructionPresent(INSTRUCTION_KEYS.sessionPrompt) || LEGACY_SESSION_PROMPTS.includes(session)) {
       await putInstruction(INSTRUCTION_KEYS.sessionPrompt, SUPERAGENT_DEFAULTS.sessionPrompt)
     }
+    const assignment = root().assignmentPrompt
+    if (!assignment.trim() || LEGACY_ASSIGNMENT_PROMPTS.includes(assignment)) {
+      await updateRoot((draft) => {
+        draft.assignmentPrompt = SUPERAGENT_DEFAULTS.assignmentPrompt
+      })
+    }
     const task = instructionText(INSTRUCTION_KEYS.taskPrompt)
-    if (!instructionPresent(INSTRUCTION_KEYS.taskPrompt) || task === LEGACY_TASK_PROMPT) {
+    if (!instructionPresent(INSTRUCTION_KEYS.taskPrompt) || LEGACY_TASK_PROMPTS.includes(task)) {
       await putInstruction(INSTRUCTION_KEYS.taskPrompt, SUPERAGENT_DEFAULTS.taskPrompt)
     }
   }

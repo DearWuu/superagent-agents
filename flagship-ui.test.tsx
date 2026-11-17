@@ -64,6 +64,7 @@ function harness(options?: {
   initialized?: Record<string, boolean>
   selections?: unknown[]
   prompts?: string[]
+  switchFails?: string[]
 }) {
   const sessions: Session[] =
     options?.sessions ??
@@ -122,8 +123,11 @@ function harness(options?: {
   const removes: string[] = []
   const removedSessions: string[] = []
   const createdSessions: any[] = []
-  const sentPrompts: Array<{ sessionID: string; text: string }> = []
+  const sentPrompts: Array<{ sessionID: string; text: string; delivery?: string }> = []
   const switched: Array<{ sessionID: string; model: { providerID: string; id: string; variant?: string } }> = []
+  const interrupts: string[] = []
+  const syntheticCalls: any[] = []
+  const switchFails = new Set(options?.switchFails ?? [])
   const selections = options?.selections ?? []
   const prompts = options?.prompts ?? []
   const toasts: string[] = []
@@ -170,7 +174,14 @@ function harness(options?: {
       },
       session: {
         switchModel: async (input: { sessionID: string; model: any }) => {
+          if (switchFails.has(input.sessionID)) throw new Error("switch failed")
           switched.push(input)
+          // 真实宿主切换后会更新会话模型，并由原生 model.selected 清掉旗舰标记。
+          const session = byId.get(input.sessionID)
+          if (session) {
+            session.model = input.model
+            if (session.metadata) delete session.metadata["superagent.flagship"]
+          }
         },
         compact: async () => {},
         create: async (input: any) => {
@@ -181,7 +192,12 @@ function harness(options?: {
         prompt: async (input: { sessionID: string; text: string }) => {
           sentPrompts.push(input)
         },
-        interrupt: async () => {},
+        interrupt: async ({ sessionID }: { sessionID: string }) => {
+          interrupts.push(sessionID)
+          // 直切流程不应调用 interrupt；这里只为断言「调用次数为 0」留记录。
+          const session = byId.get(sessionID)
+          if (session?.time) delete session.time.busy
+        },
         remove: async ({ sessionID }: { sessionID: string }) => {
           order.push("remove")
           removedSessions.push(sessionID)
@@ -190,7 +206,10 @@ function harness(options?: {
           byId.delete(sessionID)
         },
         /** 面板手动操作回传：真实宿主有这条 API，假客户端也要跟上。 */
-        synthetic: async () => ({ id: "syn_1" }),
+        synthetic: async (input: any) => {
+          syntheticCalls.push(input)
+          return { id: "syn_1" }
+        },
       },
     },
     keymap: { layer: () => {} },
@@ -225,6 +244,8 @@ function harness(options?: {
     createdSessions,
     sentPrompts,
     switched,
+    interrupts,
+    syntheticCalls,
     toasts,
     confirms,
   }
@@ -480,7 +501,7 @@ test("a protected subagent can still be deleted by hand", async () => {
   }
 })
 
-test("a protected subagent keeps its model when the default changes", async () => {
+test("a protected subagent still follows the default model; protection only blocks eviction", async () => {
   const h = await render({
     sessions: [
       { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
@@ -501,7 +522,8 @@ test("a protected subagent keeps its model when the default changes", async () =
   try {
     await h.app.flush()
     await new Promise((resolve) => setTimeout(resolve, 50))
-    expect(h.switched.length).toBe(0)
+    expect(h.switched.map((item) => item.sessionID)).toEqual(["worker"])
+    expect(h.switched[0]!.model).toMatchObject({ providerID: "p", id: "root" })
   } finally {
     h.app.renderer.destroy()
   }
@@ -528,6 +550,398 @@ test("a fixed default switch preserves the variant", async () => {
     await h.app.flush()
     await h.app.waitFor(() => h.switched.length > 0)
     expect(h.switched[0]!.model).toEqual({ providerID: "p", id: "flash", variant: "high" })
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+// —— 用户调小旗舰上限：现有超额旗舰切到子代理默认模型，不删会话 ——
+
+const flagshipMeta = (model = rootModel) => ({
+  "superagent.flagship": { model, at: 1, source: "explicit-subagent-delegation" },
+})
+
+function flagshipSession(id: string, created: number, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    parentID: "root",
+    title: id,
+    agent: "executor",
+    model: rootModel,
+    metadata: flagshipMeta(),
+    time: { created, updated: created },
+    ...extra,
+  }
+}
+
+async function settle(h: any, predicate: () => boolean, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await h.app.flush()
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error("settle timeout")
+}
+
+async function openSettings(h: any) {
+  const settings = h.app.renderer.root.findDescendantById("sidebar.agents.settings")!
+  await h.app.mockMouse.click(settings.x, settings.y)
+  await h.app.flush()
+}
+
+test("lowering the flagship cap switches the oldest overflow to the fixed default", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2),
+      flagshipSession("f2", 3),
+      flagshipSession("f3", 4),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 3 },
+    maxSubagents: 10,
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.switched.length === 2)
+    expect(h.switched.map((item: any) => item.sessionID)).toEqual(["f1", "f2"])
+    expect(h.switched.every((item: any) => item.model.id === "flash")).toBe(true)
+    expect(h.removedSessions).toEqual([])
+    expect(h.context.data.session.get("f1")).toBeDefined()
+    expect(h.puts.at(-1)).toEqual({
+      sessionID: "root",
+      key: "superagent.max-flagship-subagents",
+      value: 1,
+    })
+    expect(h.toasts.at(-1)).toContain("已把 2 个超额旗舰切到 Flash")
+    await settle(h, () => h.syntheticCalls.length === 1)
+    expect(h.syntheticCalls[0]).toMatchObject({ sessionID: "root", delivery: "queue" })
+    expect(h.syntheticCalls[0].metadata.action).toBe("max-flagship")
+    expect(h.syntheticCalls[0].text).toContain("已切换 2 个")
+    expect(h.syntheticCalls[0].text).toContain("跳过 0 个")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("inherit resolves the target from the current root model", async () => {
+  // 两个子代理各自被显式固定到 Flash 并留下旗舰 marker；root 默认策略是跟随会话，
+  // 所以目标就是 root 当前模型。
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2, { model: flash, metadata: flagshipMeta(flash) }),
+      flagshipSession("f2", 3, { model: flash, metadata: flagshipMeta(flash) }),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 2 },
+    maxSubagents: 10,
+    policies: { f1: "fixed", f2: "fixed" },
+    defaultPolicy: "inherit",
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.switched.length === 1)
+    expect(h.switched[0]).toMatchObject({ sessionID: "f1", model: { providerID: "p", id: "root" } })
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("a running overflow flagship switches directly without interrupt or steer", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2, {
+        time: { created: 2, updated: 2, busy: 2 },
+      }),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 2 },
+    maxSubagents: 10,
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["0"],
+  })
+  try {
+    await h.app.flush()
+    const putsBefore = h.puts.length
+    await openSettings(h)
+    await settle(h, () => h.switched.length === 1)
+    expect(h.interrupts).toEqual([])
+    expect(h.sentPrompts).toEqual([])
+    expect(h.puts.slice(putsBefore).filter((item: any) => item.sessionID === "f1")).toEqual([])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("kept flagships are switched too; kept only shields them from eviction", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("kept", 2),
+      flagshipSession("f2", 3),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 2 },
+    maxSubagents: 10,
+    keptSubagents: { kept: true },
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.switched.length === 1)
+    expect(h.switched[0]!.sessionID).toBe("kept")
+    expect(h.removedSessions).toEqual([])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("auto has no unique target: overflow flagships are not switched and the toast says so", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2),
+      flagshipSession("f2", 3),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 2 },
+    maxSubagents: 10,
+    defaultPolicy: "auto",
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.puts.some((item: any) => item.key === "superagent.max-flagship-subagents" && item.value === 1))
+    expect(h.switched).toEqual([])
+    const summary = h.toasts.find((message: string) => message.includes("未自动切换"))
+    expect(summary).toContain("自动")
+    await settle(h, () => h.syntheticCalls.length === 1)
+    expect(h.syntheticCalls[0].text).toContain("跳过 1 个")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("a flagship already on the target is skipped, not faked as switched", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2),
+      flagshipSession("f2", 3),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 2 },
+    maxSubagents: 10,
+    defaultPolicy: "fixed",
+    defaultModel: rootModel,
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.toasts.some((message: string) => message.includes("跳过 1 个")))
+    expect(h.switched).toEqual([])
+    expect(h.toasts.some((message: string) => message.includes("已是目标模型"))).toBe(true)
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("one failed switch does not stop the rest; failures are counted", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2),
+      flagshipSession("f2", 3),
+      flagshipSession("f3", 4),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 3 },
+    maxSubagents: 10,
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    switchFails: ["f1"],
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.switched.length === 1)
+    expect(h.switched[0]!.sessionID).toBe("f2")
+    expect(
+      h.toasts.some((message: string) => message.includes("已把 1 个超额旗舰") && message.includes("跳过 1 个")),
+    ).toBe(true)
+    expect(h.puts.at(-1)).toMatchObject({ key: "superagent.max-flagship-subagents", value: 1 })
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("mounting an over-limit panel never converges existing flagships", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2),
+      flagshipSession("f2", 3),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 1 },
+    maxSubagents: 10,
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+  })
+  try {
+    await h.app.flush()
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(h.switched).toEqual([])
+    expect(h.interrupts).toEqual([])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("archived children, grandchildren and legacy markers never enter the switch plan", async () => {
+  const h = await render({
+    sessions: [
+      { id: "root", title: "root", agent: "build", model: rootModel, time: { created: 1, updated: 500 } },
+      flagshipSession("f1", 2),
+      flagshipSession("f2", 3),
+      flagshipSession("arch", 4, { time: { created: 4, updated: 4, archived: 1 } }),
+      flagshipSession("grand", 5, { parentID: "f1" }),
+      flagshipSession("legacy", 6, { metadata: { "superagent.flagship": true } }),
+    ],
+    instructions: { "superagent.max-flagship-subagents": 2 },
+    maxSubagents: 10,
+    defaultPolicy: "fixed",
+    defaultModel: flash,
+    selections: [{ kind: "maxFlagshipSubagents" }],
+    prompts: ["1"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.switched.length === 1)
+    expect(h.switched.map((item: any) => item.sessionID)).toEqual(["f1"])
+    expect(h.removedSessions).toEqual([])
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+function lastPut(h: any, sessionID: string, key: string) {
+  return h.puts.filter((item: any) => item.sessionID === sessionID && item.key === key).at(-1)
+}
+
+test("root 分配提示只带报告协议，Superagent 条目只带验收动作", async () => {
+  const h = await render()
+  try {
+    await settle(
+      h,
+      () =>
+        Boolean(lastPut(h, "root", "superagent.oversight")) &&
+        Boolean(lastPut(h, "root", "superagent.assignment-prompt")) &&
+        Boolean(lastPut(h, "worker", "superagent.assignment-prompt")),
+    )
+    const rootAssignment = String(lastPut(h, "root", "superagent.assignment-prompt")!.value)
+    const rootOversight = String(lastPut(h, "root", "superagent.oversight")!.value)
+    const childAssignment = String(lastPut(h, "worker", "superagent.assignment-prompt")!.value)
+    expect(rootAssignment).toContain("[报告协议 L2")
+    expect(rootAssignment).not.toContain("[Superagent 验收动作")
+    expect(rootOversight).toContain("[Superagent 验收动作")
+    expect(rootOversight).not.toContain("[报告协议")
+    expect(childAssignment).toContain("[报告协议 L2")
+    expect(childAssignment).not.toContain("[Superagent 验收动作")
+    expect(childAssignment).toContain("按任务书执行，不扩大范围")
+    // 子代理条目同时保留机器可读的监管等级。
+    expect(String(lastPut(h, "worker", "superagent.oversight-level")!.value)).toBe("2")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("报告风格切换实时更新 root 与未 pin 子代理的分配提示", async () => {
+  const h = await render({
+    instructions: { "superagent.report-style": "concise" },
+    selections: [{ kind: "policy" }, { kind: "report" }, "detailed"],
+  })
+  try {
+    await settle(h, () => String(lastPut(h, "root", "superagent.assignment-prompt")?.value).includes("简洁"))
+    await openSettings(h)
+    await settle(
+      h,
+      () =>
+        String(lastPut(h, "root", "superagent.assignment-prompt")?.value).includes("详细") &&
+        String(lastPut(h, "worker", "superagent.assignment-prompt")?.value).includes("详细"),
+    )
+    const rootAssignment = String(lastPut(h, "root", "superagent.assignment-prompt")!.value)
+    const childAssignment = String(lastPut(h, "worker", "superagent.assignment-prompt")!.value)
+    expect(rootAssignment).toContain("[报告协议 L2 · 证据级 · 详细]")
+    expect(childAssignment).toContain("[报告协议 L2 · 证据级 · 详细]")
+    // 报告风格只影响报告协议，不把验收动作混进分配提示。
+    expect(rootAssignment).not.toContain("[Superagent 验收动作")
+    // root 的验收条目也不因为风格变化重复报告格式。
+    expect(String(lastPut(h, "root", "superagent.oversight")!.value)).not.toContain("[报告协议")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("手动操作通知不受状态监测开关影响，设置项写明用户与生效值", async () => {
+  const h = await render({
+    instructions: { "superagent.status-watch": "false", "superagent.report-style": "concise" },
+    selections: [{ kind: "policy" }, { kind: "report" }, "detailed"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.syntheticCalls.length >= 1)
+    expect(h.syntheticCalls).toHaveLength(1)
+    const call = h.syntheticCalls[0]
+    expect(call.sessionID).toBe("root")
+    expect(call.delivery).toBe("queue")
+    expect(call.metadata).toMatchObject({
+      source: "superagent-agents",
+      kind: "manual-op",
+      action: "setting",
+    })
+    expect(String(call.text)).toContain("用户")
+    expect(String(call.text)).toContain("这不是你的指令")
+    expect(String(call.text)).toContain("报告风格")
+    expect(String(call.text)).toContain("详细")
+  } finally {
+    h.app.renderer.destroy()
+  }
+})
+
+test("一轮设置操作合并成一条 queue 通知", async () => {
+  const h = await render({
+    selections: [{ kind: "policy" }, { kind: "report" }, "detailed", { kind: "prompt" }],
+    prompts: ["只改右栏"],
+  })
+  try {
+    await h.app.flush()
+    await openSettings(h)
+    await settle(h, () => h.syntheticCalls.length >= 1)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(h.syntheticCalls).toHaveLength(1)
+    const call = h.syntheticCalls[0]
+    expect(call.metadata.action).toBe("batch")
+    expect(call.metadata.actions).toEqual(["setting", "setting"])
+    expect(String(call.text)).toContain("报告风格")
+    expect(String(call.text)).toContain("会话补充提示词")
+    expect(call.delivery).toBe("queue")
   } finally {
     h.app.renderer.destroy()
   }
