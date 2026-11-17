@@ -276,6 +276,45 @@ describe("critic 自动接线（真实 setup + 假 ctx）", () => {
     await dispose()
     h.events.close()
   })
+
+  test("同一子会话连续完成两次：复核串行执行但不丢弃第二个事件", async () => {
+    tempState()
+    const h = harness({
+      sessions: [
+        { id: "ses_root", title: "root" },
+        { id: "ses_child", parentID: "ses_root", title: "修复登录" },
+      ],
+      entries: { ses_root: [{ key: "superagent.critic-enabled", value: "true" }] },
+    })
+    let firstPromptStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      firstPromptStarted = resolve
+    })
+    let releaseFirst!: () => void
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const originalPrompt = h.ctx.session.prompt
+    let criticPrompts = 0
+    h.ctx.session.prompt = async (input) => {
+      if (input.sessionID === "ses_critic" && ++criticPrompts === 1) {
+        firstPromptStarted()
+        await gate
+      }
+      return originalPrompt(input)
+    }
+
+    const dispose = await (plugin as any).setup(h.ctx)
+    h.events.push({ id: "evt_serial_1", type: "session.execution.succeeded", data: { sessionID: "ses_child" } })
+    await started
+    h.events.push({ id: "evt_serial_2", type: "session.execution.succeeded", data: { sessionID: "ses_child" } })
+    releaseFirst()
+
+    expect(await waitFor(() => h.created.length === 2)).toBe(true)
+    expect(criticPrompts).toBe(2)
+    await dispose()
+    h.events.close()
+  })
 })
 
 describe("超时探针（真实 ctx 接线 + 注入时间）", () => {

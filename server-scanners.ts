@@ -74,6 +74,8 @@ export type ProbeScannerDeps = {
   sendProbe: (sessionID: string, text: string) => Promise<void>
   /** 跨实例去重：返回 false 表示别的实例已经探过这个会话。 */
   claim?: (sessionID: string) => boolean
+  /** 插件卸载后，尚未完成的扫描不得再发探针。 */
+  signal?: AbortSignal
   log: (record: Record<string, unknown>) => void
   now?: () => number
 }
@@ -90,6 +92,7 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
   return {
     probed,
     async scan(): Promise<number> {
+      if (deps.signal?.aborted) return 0
       let candidates: ProbeCandidate[]
       try {
         candidates = await deps.listSessions()
@@ -97,10 +100,12 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
         deps.log({ event: "probe-scan-failed", decision: "error", cause: errorText(cause) })
         return 0
       }
+      if (deps.signal?.aborted) return 0
       /** root → 本轮是否启用；逐 root 判断，停用一个 root 不影响其他 root。 */
       const enabled = new Map<string, boolean>()
       let sent = 0
       for (const candidate of candidates) {
+        if (deps.signal?.aborted) break
         if (!shouldProbe(candidate, now(), probed)) continue
         let rootID: string | undefined
         try {
@@ -133,6 +138,7 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
           configured.set(rootID, managed)
         }
         if (!managed) continue
+        if (deps.signal?.aborted) break
         // 跨实例声明：同一会话只会被一个插件实例发探针。
         if (deps.claim && !deps.claim(candidate.id)) continue
         // 先登记再发：发送失败也不在 5 分钟后重复轰炸同一个会话。
@@ -166,6 +172,7 @@ export function createCtxProbeScanner(
     claim?: (sessionID: string) => boolean
     log?: (record: Record<string, unknown>) => void
     limit?: number
+    signal?: AbortSignal
   } = {},
 ) {
   const write = options.log ?? log
@@ -194,6 +201,7 @@ export function createCtxProbeScanner(
     rootIsEnabled: (rootID) => readRootCollabEnabled(ctx, rootID),
     log: write,
     now: options.now,
+    signal: options.signal,
   })
 }
 
@@ -258,6 +266,8 @@ export type CtxCompactionScannerDeps = {
   compactSession: (childSessionID: string) => Promise<void>
   /** 跨实例去重：返回 false 表示已经压缩过（且长度未下降 ≥30%）。 */
   claim?: (sessionID: string, tokens: number) => boolean
+  /** 插件卸载后，尚未完成的扫描不得再读声明或压缩。 */
+  signal?: AbortSignal
   log: (record: Record<string, unknown>) => void
   now?: () => number
 }
@@ -271,6 +281,7 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
   const configured = new Map<string, boolean>()
   return {
     async scan(): Promise<number> {
+      if (deps.signal?.aborted) return 0
       let candidates: ProbeCandidate[]
       try {
         candidates = await deps.listSessions()
@@ -278,10 +289,12 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
         deps.log({ event: "ctx-scan-failed", decision: "error", cause: errorText(cause) })
         return 0
       }
+      if (deps.signal?.aborted) return 0
       /** root → 本轮是否启用；逐 root 判断，停用一个 root 不影响其他 root。 */
       const enabled = new Map<string, boolean>()
       let compacted = 0
       for (const candidate of candidates) {
+        if (deps.signal?.aborted) break
         if (!shouldCheckContext(candidate)) continue
         let rootID: string | undefined
         try {
@@ -323,6 +336,7 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
           continue
         }
         if (tokens === undefined) continue
+        if (deps.signal?.aborted) break
 
         // 按当前模型上下文窗口收紧阈值；读不到就沿用 300K。
         let threshold = CONTEXT_WARN_TOKENS
@@ -342,6 +356,7 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
           }
         }
 
+        if (deps.signal?.aborted) break
         const claimed = readContextClaim(candidate.id)
         const dropped = contextDropped(claimed, tokens)
         // compact 已生效：清掉声明，允许当前这轮重新压缩。
@@ -432,6 +447,7 @@ export function createCtxContextCompactionScanner(
     claim?: (sessionID: string, tokens: number) => boolean
     log?: (record: Record<string, unknown>) => void
     limit?: number
+    signal?: AbortSignal
   } = {},
 ) {
   const write = options.log ?? log
@@ -483,6 +499,7 @@ export function createCtxContextCompactionScanner(
     rootIsEnabled: (rootID) => readRootCollabEnabled(ctx, rootID),
     log: write,
     now: options.now,
+    signal: options.signal,
   })
 }
 

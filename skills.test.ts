@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs"
 import path from "node:path"
 
 import { OVERSIGHT_ACCEPTANCE } from "./oversight"
+import { SUPERAGENT_DEFAULTS } from "./panel-defaults"
 import {
   SUPERAGENT_ACCEPTANCE_SKILL,
   SUPERAGENT_CONTEXT_SKILL,
@@ -51,6 +52,22 @@ describe("superagent skills", () => {
     expect(content).toContain("不得通过换工具")
   })
 
+  test("orchestration pins the dispatch hard constraints before the workflow", () => {
+    const content = SUPERAGENT_ORCHESTRATION_SKILL.content
+    const section = content.indexOf("## 0. 派工状态的硬约束")
+    expect(section).toBeGreaterThanOrEqual(0)
+    expect(section).toBeLessThan(content.indexOf("## 1. 先判断是否适合 Flash"))
+    expect(content).toContain("实现、修改、调试、测试默认派工")
+    expect(content).toContain("小改动也派工")
+    expect(content).toContain("派工成功只认 subagent 工具成功回执")
+    expect(content).toContain("没收到回执不得称已派出、并行中或运行中")
+    expect(content).toContain("触到上限如实报告")
+    expect(content).toContain("最多做一次有界只读核实")
+    expect(content).toContain("禁止连续轮询")
+    // 硬约束只留规则，不重复技能后面的长段。
+    expect(content.length).toBeLessThan(2400)
+  })
+
   test("orchestration and user docs share the parallel, resume and interrupt contract", () => {
     const docs = [
       SUPERAGENT_ORCHESTRATION_SKILL.content,
@@ -69,6 +86,21 @@ describe("superagent skills", () => {
       expect(content).toContain("interrupt: true")
       expect(content).toContain("interrupt: false")
       expect(content).toContain("与缺省行为相同")
+    }
+  })
+
+  test("orchestration, user docs and the resident prompt share the dispatch hard constraints", () => {
+    const docs = [
+      SUPERAGENT_ORCHESTRATION_SKILL.content,
+      SUPERAGENT_DEFAULTS.sessionPrompt,
+      readFileSync(path.join(import.meta.dir, "README.md"), "utf8"),
+      readFileSync(path.join(import.meta.dir, "AGENTS.md"), "utf8"),
+    ]
+    for (const content of docs) {
+      expect(content).toContain("派工成功只认 subagent 工具成功回执")
+      expect(content).toContain("没收到回执不得称已派出")
+      expect(content).toContain("有界只读核实")
+      expect(content).toContain("禁止连续轮询")
     }
   })
 
@@ -95,6 +127,8 @@ describe("superagent skills", () => {
     expect(content).toContain("遵循 root 的 critic 开关")
     expect(content).toContain("不新增验收等级设置")
     expect(content).toContain("报告详细度与验收深度相关但不是一回事")
+    expect(content).toContain("报告时间取真实工具输出或通知时间")
+    expect(content).toContain("取不到写「未知」")
   })
 
   test("context covers ctx, the 300K threshold and the delete rule", () => {

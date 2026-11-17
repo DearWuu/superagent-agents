@@ -492,7 +492,8 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
       waitedMs: now() - entry.armedAt,
       at: new Date(now()).toISOString(),
     })
-    if (tierDown) {
+    // 已发起的 switchModel 无法撤回，但 dispose 后不得再写 root 配置。
+    if (tierDown && !disposed) {
       await tierDownLimit({ rootID: snapshot.rootID, entries, failures: entry.failures })
     }
     return { switched: true, to: target }
@@ -514,10 +515,16 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
       clearPending(sessionID)
       failures.delete(sessionID)
     },
-    /** 放弃这次计时（中断、非限额失败、会话删除）：不切模型。 */
+    /** 放弃这次计时（中断、非限额失败）：不切模型，但保留「已切过」标记。 */
     cancel(sessionID: string) {
       clearPending(sessionID)
-      failures.set(sessionID, 0)
+      failures.delete(sessionID)
+    },
+    /** 会话已删除：计时、失败计数与「已切过」标记一起遗忘。 */
+    forget(sessionID: string) {
+      clearPending(sessionID)
+      failures.delete(sessionID)
+      switched.delete(sessionID)
     },
     /** 停掉所有计时（插件卸载时调用）：dispose 之后到点的切换也不再执行。 */
     dispose() {

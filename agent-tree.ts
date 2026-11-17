@@ -214,6 +214,10 @@ export type FlattenOptions = {
   collapseCompleted?: boolean
 }
 
+/** 本节点或任一后代仍在执行：进行中的子代理不能藏在收起的 idle 父节点后面。 */
+const subtreeRunning = (node: AgentNode): boolean =>
+  node.status === "running" || node.children.some((child) => subtreeRunning(child))
+
 /**
  * Produces the rows a sidebar renders. Roots and active nodes open by default;
  * finished nodes stay collapsed so the panel remains useful with many
@@ -241,7 +245,8 @@ export function flattenAgentTree(root: AgentNode, options: FlattenOptions = {}):
         ? true
         : node.kind === "root"
           ? true
-          : defaultOpen && !(collapseCompleted && isFinished)
+          : // 活跃后代优先于完成折叠：子树里有在跑的节点就必须可见。
+            subtreeRunning(node) || (defaultOpen && !(collapseCompleted && isFinished))
     const visible = open ? node.children.length : 0
     rows.push({ node, depth, hasChildren, expanded: open, hiddenChildren: node.children.length - visible })
     if (open) for (const child of node.children) visit(child, depth + 1)

@@ -472,13 +472,16 @@ export function noticeSaysStillRunning(message: unknown, childID: string): boole
  */
 export function hasNotice(
   messages: unknown,
-  options: { childID: string; state?: string | string[]; sources: string[] },
+  options: { childID: string; state?: string | string[]; sources: string[]; since?: number },
 ): boolean {
   const states = options.state === undefined ? undefined : Array.isArray(options.state) ? options.state : [options.state]
   const sources = new Set(options.sources)
   for (const message of toArray(messages)) {
     const record = isRecord(message) ? message : undefined
     if (!record) continue
+    // 旧格式消息没有可信时间，保留原判重语义；有时间的卡必须属于当前轮。
+    const createdAt = messageTime(record)
+    if (options.since !== undefined && createdAt > 0 && createdAt < options.since) continue
     const metadata = noticeMetadata(record)
     if (metadata) {
       const source = typeof metadata.source === "string" ? metadata.source : undefined
@@ -509,11 +512,17 @@ export function hasNotice(
 /**
  * 终态通知判重：原生通知、插件自己的通知、前台工具结果正文里的 `<subagent ...>` 都算。
  */
-export function terminalNoticeSeen(messages: unknown, childID: string, state: CompletionState): boolean {
+export function terminalNoticeSeen(
+  messages: unknown,
+  childID: string,
+  state: CompletionState,
+  since?: number,
+): boolean {
   return hasNotice(messages, {
     childID,
     state: noticeStates(state),
     sources: ["subagent", "superagent-agents"],
+    since,
   })
 }
 
@@ -544,6 +553,8 @@ export function statusWatchEnabled(entries: unknown): boolean {
 
 /** 等原生完成通知落地的等待：原生先到就不重复发。 */
 export const NATIVE_NOTICE_WAIT_MS = 1200
+/** 原生通知与 register 的时钟可能存在少量偏差；只放宽本轮开始前 1 秒。 */
+const NOTICE_TIME_SKEW_MS = 1000
 /** shell 结束事件后再等一会儿，等消息状态落盘。 */
 export const SHELL_SETTLE_DELAY_MS = 300
 /**
@@ -570,6 +581,15 @@ export function isSessionBusy(session: unknown): boolean {
   if (busy === undefined) return false
   const idle = typeof time?.idle === "number" ? time.idle : undefined
   return idle === undefined || busy > idle
+}
+
+/** 终态通知至少需要会话侧 outcome 或 idle 证据，不能只信一次事件类型。 */
+function hasSessionTerminalEvidence(session: unknown, since?: number): boolean {
+  const info = isRecord(session) ? session : undefined
+  const time = info && isRecord(info.time) ? info.time : undefined
+  const idle = typeof time?.idle === "number" ? time.idle : undefined
+  if (since !== undefined) return idle !== undefined && idle >= since
+  return completionState(info?.outcome) !== undefined || idle !== undefined
 }
 
 function errorText(cause: unknown) {
@@ -647,8 +667,8 @@ export type SettleOptions = {
   force?: boolean
 }
 
-/** 收尾请求的内部形态：retry 标记本次调用来自 busy 快速重试。 */
-type SettleRequest = SettleOptions & { retry?: boolean }
+/** 收尾请求的内部形态：retry 标记快速重试，watch 固定请求所属轮次。 */
+type SettleRequest = SettleOptions & { retry?: boolean; watch?: StatusWatch }
 
 export type StatusWatcher = {
   /** 派发成功后登记看护项：同一 childID 的 steer 更新而不是重复登记。 */
@@ -677,8 +697,10 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   let reconcileTimer: ReturnType<typeof setInterval> | undefined
   /** dispose 后不再投递迟到通知；旧实例的异步收尾不能打扰新实例。 */
   let stopped = false
-  /** busy 竞态的快速重试定时器：stop() 时统一清掉。 */
-  const busyRetryTimers = new Set<ReturnType<typeof setTimeout>>()
+  /** busy 竞态的快速重试定时器：按 child 替换，stop() 时统一清掉。 */
+  const busyRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** 定时器要重放的收尾请求：后续更强的显式终态可以升级已挂起的初探。 */
+  const busyRetryRequests = new Map<string, SettleRequest>()
 
   const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -687,25 +709,56 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   const settleRetryMs = deps.settleRetryMs ?? STATUS_BUSY_RETRY_MS
   const settleRetryLimit = deps.settleRetryLimit ?? STATUS_BUSY_RETRY_LIMIT
 
+  /** 停止或换轮后，旧异步收尾不得再操作当前 watch。 */
+  const isCurrent = (childID: string, watch: StatusWatch) => !stopped && watches.get(childID) === watch
+
+  const cancelBusyRetry = (childID: string) => {
+    const timer = busyRetryTimers.get(childID)
+    if (timer) clearTimeout(timer)
+    busyRetryTimers.delete(childID)
+    busyRetryRequests.delete(childID)
+    const watch = watches.get(childID)
+    if (watch) watch.busyRetryPending = false
+  }
+
   /**
    * 收尾撞上忙碌读时的快速重试：结束事件可能早于 idle 落库，稍后再看一次。
    * 重试走 settle 的串行链（不是在 settleStatus 里递归 await），同一 child 不会并发收尾；
    * 同一看护项同时只留一个待重试，次数有上限，超限后交给周期对账兜底。
    */
   const scheduleBusyRetry = (childID: string, watch: StatusWatch, options: SettleRequest) => {
-    if (watch.busyRetryPending) return
+    if (!isCurrent(childID, watch)) return
+    if (watch.busyRetryPending) {
+      // 无状态初探先挂起、随后才收到 execution 终态时，重放请求要升级成显式终态，
+      // 否则旧初探会把本轮唯一一次收尾机会消费掉。
+      const previous = busyRetryRequests.get(childID)
+      if (previous) {
+        busyRetryRequests.set(childID, {
+          ...options,
+          state: options.state ?? previous.state,
+          force: options.force || previous.force,
+          retry: true,
+        })
+      }
+      return
+    }
     const used = watch.busyRetries ?? 0
     if (used >= settleRetryLimit) return
     watch.busyRetries = used + 1
     watch.busyRetryPending = true
+    const request: SettleRequest = { ...options, retry: true }
+    busyRetryRequests.set(childID, request)
     const timer = setTimeout(() => {
-      busyRetryTimers.delete(timer)
+      if (busyRetryTimers.get(childID) !== timer) return
+      const replay = busyRetryRequests.get(childID) ?? request
+      busyRetryTimers.delete(childID)
+      busyRetryRequests.delete(childID)
       watch.busyRetryPending = false
-      if (stopped) return
-      settle(childID, { ...options, retry: true })
+      if (!isCurrent(childID, watch)) return
+      settle(childID, { ...replay })
     }, settleRetryMs)
     ;(timer as any)?.unref?.()
-    busyRetryTimers.add(timer)
+    busyRetryTimers.set(childID, timer)
   }
 
   /** 状态监测开关（root 级）：缺省与非法值一律按启用处理。 */
@@ -749,6 +802,29 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     reconcileTimer = undefined
   }
 
+  /** 提醒预算只约束当前批 watch；parent 基线随最后一个对应 watch 回收。 */
+  const cleanupReminderState = () => {
+    if (watches.size === 0) {
+      reminderTotal = 0
+      parentReminderBaseline.clear()
+      stopReconcileTimer()
+      return
+    }
+    for (const parentID of [...parentReminderBaseline.keys()]) {
+      if (![...watches.values()].some((watch) => watch.parentID === parentID)) parentReminderBaseline.delete(parentID)
+    }
+  }
+
+  /** 删除指定轮次；返回 false 表示它已被新轮替换，不能误删新 watch。 */
+  const deleteWatch = (childID: string, expected?: StatusWatch) => {
+    const current = watches.get(childID)
+    if (!current || (expected && current !== expected)) return false
+    cancelBusyRetry(childID)
+    watches.delete(childID)
+    cleanupReminderState()
+    return true
+  }
+
   /** 只有还有 watch 时才走表；watch 清空立即停表。 */
   const ensureReconcileTimer = () => {
     if (watches.size === 0) {
@@ -765,7 +841,8 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   }
 
   /** 只更新运行状态标记：后台任务集合变了但不再重复通知时用。 */
-  const markRuntimeOnly = async (childID: string, jobs: BackgroundJob[]) => {
+  const markRuntimeOnly = async (childID: string, watch: StatusWatch, jobs: BackgroundJob[]) => {
+    if (!isCurrent(childID, watch)) return
     try {
       await deps.markRuntime(childID, jobs)
     } catch (cause) {
@@ -779,8 +856,25 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     }
   }
 
+  /** runtime 清理永不影响淘汰或收尾；reason 标明是普通收尾还是 watch 淘汰。 */
+  const clearRuntimeBestEffort = async (childID: string, reason: "completion" | "watch-ttl" | "watch-limit") => {
+    try {
+      await deps.clearRuntime(childID)
+    } catch (cause) {
+      write({
+        event: "status-notify-failed",
+        decision: "error",
+        phase: "runtime-clear",
+        reason,
+        childSessionID: childID,
+        cause: errorText(cause),
+      })
+    }
+  }
+
   /** 通知 parent：子代理回合已结束但后台任务还在跑。 */
   const notifyBackground = async (childID: string, watch: StatusWatch, jobs: BackgroundJob[]) => {
+    if (!isCurrent(childID, watch)) return false
     const text = formatBackgroundNotice({ childID, description: watch.description, jobs })
     try {
       await deps.notifyParent({
@@ -799,7 +893,9 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       })
       return false
     }
-    await markRuntimeOnly(childID, jobs)
+    if (!isCurrent(childID, watch)) return false
+    await markRuntimeOnly(childID, watch, jobs)
+    if (!isCurrent(childID, watch)) return false
     write({
       event: "status-background",
       decision: "allow",
@@ -817,6 +913,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     state: CompletionState,
     text: string,
   ) => {
+    if (!isCurrent(childID, watch)) return false
     const body = formatCompletionNotice({ childID, description: watch.description, state, text })
     try {
       await deps.notifyParent({
@@ -835,6 +932,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       })
       return false
     }
+    if (!isCurrent(childID, watch)) return false
     write({
       event: "status-completed",
       decision: "allow",
@@ -847,6 +945,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
 
   /** 对账兜底的提醒：子代理停了但一直没收到完成确认。 */
   const notifyReminder = async (childID: string, watch: StatusWatch, state: CompletionState) => {
+    if (!isCurrent(childID, watch)) return false
     const text = formatWatchReminder({ childID, state })
     try {
       await deps.notifyParent({
@@ -865,6 +964,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       })
       return false
     }
+    if (!isCurrent(childID, watch)) return false
     write({
       event: "status-reminder",
       decision: "allow",
@@ -884,13 +984,12 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
 
   /** 收尾一次看护项：判断后台任务、决定通知、清理标记。 */
   const settleStatus = async (childID: string, options: SettleRequest = {}) => {
-    if (stopped) return
-    const watch = watches.get(childID)
-    if (!watch) return
+    const watch = options.watch ?? watches.get(childID)
+    if (!watch || !isCurrent(childID, watch)) return
     if (options.delayMs) await delay(options.delayMs)
-    if (stopped) return
+    if (!isCurrent(childID, watch)) return
     const info = sessionInfo(await deps.readSession(childID))
-    if (!info) return
+    if (!isCurrent(childID, watch) || !info) return
     // 还在跑就等下一个事件；前台派发时工具已经返回，回合一定结束了。
     if (isSessionBusy(info) && !options.force) {
       watch.expected = "running"
@@ -902,6 +1001,16 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     }
     watch.busyRetries = 0
     const messages = await deps.readMessages(childID)
+    if (!isCurrent(childID, watch)) return
+    const outcomeState = completionState(info.outcome)
+    // shell 起止只说明后台任务变化；显式 execution 事件也可能早于终态落库。
+    // 没有 outcome/idle 证据时保留 watch 并有界重试，不能猜 completed。
+    if (watch.mode === "background" && !hasSessionTerminalEvidence(info)) {
+      watch.expected = "running"
+      if (!options.retry && !watch.busyRetryPending) watch.busyRetries = 0
+      scheduleBusyRetry(childID, watch, options)
+      return
+    }
     const jobs = collectBackgroundJobs(messages)
     if (jobs.length > 0) {
       const signature = jobSignature(jobs)
@@ -909,13 +1018,13 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         // 这一代已经提醒过：任务集合变了只更新运行标记（面板计数跟着变），不再重复通知。
         if (watch.backgroundSignature !== signature) {
           watch.backgroundSignature = signature
-          await markRuntimeOnly(childID, jobs)
+          await markRuntimeOnly(childID, watch, jobs)
         }
         return
       }
       if (watch.backgroundSignature !== signature) {
         const sent = await notifyBackground(childID, watch, jobs)
-        if (sent) {
+        if (sent && isCurrent(childID, watch)) {
           watch.backgroundNotified = true
           watch.backgroundSignature = signature
           watch.noticeSeenAt = Date.now()
@@ -923,22 +1032,34 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       }
       return
     }
-    const state = options.state ?? completionState(info.outcome) ?? "completed"
+    // background 首次登记只做探测：旧轮残留的 outcome/idle 不能直接当成新轮完成；
+    // 本轮开始后落盘的 idle 说明派发返回前子代理已经结束，仍要立即补发。
+    if (watch.mode === "background" && options.state === undefined && !watch.backgroundNotified) {
+      if (!hasSessionTerminalEvidence(info, watch.startedAt - NOTICE_TIME_SKEW_MS)) {
+        watch.expected = "running"
+        return
+      }
+    }
+    const state = options.state ?? outcomeState ?? "completed"
+    const noticeSince = watch.startedAt - NOTICE_TIME_SKEW_MS
     if (watch.mode === "background") {
       // 等原生通知落地；原生已通知过就不重复发。
       await delay(NATIVE_NOTICE_WAIT_MS)
+      if (!isCurrent(childID, watch)) return
       let parentMessages: any[] = []
       try {
         parentMessages = await deps.readMessages(watch.parentID)
       } catch {
         parentMessages = []
       }
-      const seen = terminalNoticeSeen(parentMessages, childID, state)
+      if (!isCurrent(childID, watch)) return
+      const seen = terminalNoticeSeen(parentMessages, childID, state, noticeSince)
       if (!seen) {
         const text = finalAssistantText(messages) || defaultCompletionText(state)
         const sent = await notifyCompletion(childID, watch, state, text)
         if (!sent) return
       }
+      if (!isCurrent(childID, watch)) return
       watch.noticeSeenAt = Date.now()
     } else if (watch.backgroundNotified) {
       // 前台派发：工具结果已经回传；parent 里已有终态通知（原生、插件或工具结果正文）就不再补，只清运行标记。
@@ -948,23 +1069,16 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       } catch {
         parentMessages = []
       }
-      if (!terminalNoticeSeen(parentMessages, childID, state)) {
+      if (!isCurrent(childID, watch)) return
+      if (!terminalNoticeSeen(parentMessages, childID, state, noticeSince)) {
         const sent = await notifyCompletion(childID, watch, state, BACKGROUND_DONE_TEXT)
         if (!sent) return
         watch.noticeSeenAt = Date.now()
       }
     }
-    try {
-      await deps.clearRuntime(childID)
-    } catch (cause) {
-      write({
-        event: "status-notify-failed",
-        decision: "error",
-        phase: "runtime-clear",
-        childSessionID: childID,
-        cause: errorText(cause),
-      })
-    }
+    if (!isCurrent(childID, watch)) return
+    await clearRuntimeBestEffort(childID, "completion")
+    if (!isCurrent(childID, watch)) return
     // 收尾即淘汰：子代理一结束就按上限腾位，不必等下一次派发。
     if (deps.evictExcess) {
       try {
@@ -980,15 +1094,19 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         })
       }
     }
-    watches.delete(childID)
-    if (watches.size === 0) stopReconcileTimer()
+    if (!isCurrent(childID, watch)) return
+    deleteWatch(childID, watch)
   }
 
   /** 排队一次收尾：同一 child 串行，永不阻塞事件消费。 */
   const settle = (childID: string, options: SettleRequest = {}) => {
+    if (stopped) return
+    const watch = watches.get(childID)
+    if (!watch) return
+    const request: SettleRequest = { ...options, watch }
     const previous = settleChains.get(childID) ?? Promise.resolve()
     const next = previous
-      .then(() => settleStatus(childID, options))
+      .then(() => settleStatus(childID, request))
       .catch((cause) =>
         write({
           event: "status-notify-failed",
@@ -1006,20 +1124,22 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
 
   /** 周期对账：兜底检查「子代理停了但没人收到完成确认」。 */
   const reconcile = async () => {
-    if (watches.size === 0) {
-      stopReconcileTimer()
+    if (stopped || watches.size === 0) {
+      cleanupReminderState()
       return
     }
     const now = Date.now()
     for (const [childID, watch] of [...watches.entries()]) {
+      if (!isCurrent(childID, watch)) continue
       if (now - watch.startedAt > WATCH_TTL_MS) {
-        watches.delete(childID)
+        if (deleteWatch(childID, watch)) await clearRuntimeBestEffort(childID, "watch-ttl")
         continue
       }
       if (!(await watchEnabledFor(watch.rootID, watch.parentID))) {
-        watches.delete(childID)
+        if (isCurrent(childID, watch)) deleteWatch(childID, watch)
         continue
       }
+      if (!isCurrent(childID, watch)) continue
       // 兜底两类看护项：后台派发（回合结束还要等通知），以及收尾事件撞上
       // 忙碌读、快速重试也没赶上的前台/steer（expected 仍是 running）。
       if (watch.expected !== "running") continue
@@ -1029,7 +1149,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       } catch {
         continue
       }
-      if (!info) continue
+      if (!isCurrent(childID, watch) || !info) continue
       if (isSessionBusy(info)) continue
       // 回合停了但后台任务还在跑：这不是“没人收到完成确认”，先补后台通知，
       // 不能发“已停止，请验收”的提醒去误导主会话。
@@ -1039,10 +1159,13 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       } catch {
         childMessages = []
       }
+      if (!isCurrent(childID, watch)) continue
       if (collectBackgroundJobs(childMessages).length > 0) {
         settle(childID, { force: true })
         continue
       }
+      // busy 消失但 idle/outcome 都未落库不是终态；留给后续事件与下一拍对账。
+      if (!hasSessionTerminalEvidence(info)) continue
       const state = completionState(info.outcome) ?? "completed"
       // 前台/steer 的看护项只是错过了收尾：强制收尾一次，走正常判重与通知链路。
       if (watch.mode !== "background") {
@@ -1057,11 +1180,13 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       } catch {
         continue
       }
+      if (!isCurrent(childID, watch)) continue
       const activity = await parentActivity(watch.parentID)
+      if (!isCurrent(childID, watch)) continue
       // parent 自上次提醒之后动过：它已经在处理，不再打扰。
       const baseline = parentReminderBaseline.get(watch.parentID)
       if (baseline !== undefined && activity > baseline) continue
-      const noticed = terminalNoticeSeen(parentMessages, childID, state)
+      const noticed = terminalNoticeSeen(parentMessages, childID, state, watch.startedAt - NOTICE_TIME_SKEW_MS)
       if (noticed && watch.noticeSeenAt === undefined) watch.noticeSeenAt = now
       // 第一次发现子代理停了：只 arm 不提醒，给 parent 一个反应窗口，下一拍再决定。
       if (watch.reminderArmedAt === undefined) {
@@ -1085,18 +1210,20 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       } catch {
         continue
       }
+      if (!isCurrent(childID, watch)) continue
       if (parentInfo && isSessionBusy(parentInfo)) continue
       const sent = await notifyReminder(childID, watch, state)
-      if (!sent) continue
+      if (!sent || !isCurrent(childID, watch)) continue
       watch.remindedStates.push(state)
       watch.noticeSeenAt = watch.noticeSeenAt ?? now
       reminderTotal += 1
-      parentReminderBaseline.set(watch.parentID, await parentActivity(watch.parentID))
+      const baselineAfter = await parentActivity(watch.parentID)
+      if (isCurrent(childID, watch)) parentReminderBaseline.set(watch.parentID, baselineAfter)
     }
-    if (watches.size === 0) stopReconcileTimer()
+    if (watches.size === 0) cleanupReminderState()
   }
 
-  /** 登记看护项：同一 childID 的 steer 更新而不是重复登记。 */
+  /** 每次登记都是新轮（含 steer）：只继承描述字段，所有通知与重试状态重新计数。 */
   const register = async (input: StatusWatchInput) => {
     if (stopped) return
     if (!(await watchEnabledFor(input.rootID, input.parentID))) {
@@ -1108,25 +1235,27 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       })
       return
     }
+    if (stopped) return
     const existing = watches.get(input.childID)
-    const watch: StatusWatch = existing ?? {
+    cancelBusyRetry(input.childID)
+    const watch: StatusWatch = {
       parentID: input.parentID,
-      description: input.description,
-      agent: input.agent,
-      mode: "foreground",
-      expected: "stopped",
+      rootID: input.rootID ?? existing?.rootID,
+      description: input.description || existing?.description || "",
+      agent: input.agent || existing?.agent || "",
+      mode: input.background ? "background" : "foreground",
+      expected: input.background ? "running" : "stopped",
       backgroundNotified: false,
       startedAt: Date.now(),
       remindedStates: [],
+      busyRetries: 0,
+      busyRetryPending: false,
     }
-    watch.parentID = input.parentID
-    watch.rootID = input.rootID ?? watch.rootID
-    watch.description = input.description || watch.description
-    watch.agent = input.agent || watch.agent
-    watch.mode = input.background ? "background" : "foreground"
-    watch.expected = input.background ? "running" : "stopped"
     watches.set(input.childID, watch)
-    // 看护项上限：超出后淘汰最旧的一条。
+    // 新轮不能沿用旧轮提醒基线，否则 parent 的正常活动会永久压制本轮提醒。
+    parentReminderBaseline.delete(input.parentID)
+    cleanupReminderState()
+    // 看护项上限：超出后淘汰最旧的一条，并清掉它遗留的运行标记。
     while (watches.size > WATCH_LIMIT) {
       let oldestKey: string | undefined
       let oldestAt = Number.POSITIVE_INFINITY
@@ -1137,8 +1266,10 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         }
       }
       if (oldestKey === undefined) break
-      watches.delete(oldestKey)
+      const oldest = watches.get(oldestKey)
+      if (deleteWatch(oldestKey, oldest)) await clearRuntimeBestEffort(oldestKey, "watch-limit")
     }
+    if (!isCurrent(input.childID, watch)) return
     ensureReconcileTimer()
     // 前台派发时工具已经返回，回合已结束；后台派发等子会话自己的结束事件。
     settle(input.childID, { force: !input.background })
@@ -1147,10 +1278,13 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   const stop = () => {
     stopped = true
     stopReconcileTimer()
-    for (const timer of busyRetryTimers) clearTimeout(timer)
+    for (const timer of busyRetryTimers.values()) clearTimeout(timer)
     busyRetryTimers.clear()
+    busyRetryRequests.clear()
     watches.clear()
     settleChains.clear()
+    parentReminderBaseline.clear()
+    reminderTotal = 0
   }
 
   return { register, settle, reconcile, stop, size: () => watches.size }

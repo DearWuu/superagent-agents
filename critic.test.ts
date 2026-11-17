@@ -157,6 +157,24 @@ describe("critic review", () => {
     expect(mock.calls.removed).toEqual(["critic-1"])
   })
 
+  test("abort stops the completion poll and still removes the critic session", async () => {
+    const auditDir = await tempDir()
+    const mock = mockClient({ neverFinishes: true })
+    const controller = new AbortController()
+    const started = Date.now()
+    const review = criticReview(
+      { client: mock.client, childSessionID: "child-1", rootID: "root-1", reportText: "报告" },
+      { auditDir, timeoutMs: 500, pollIntervalMs: 10, signal: controller.signal },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    controller.abort(new Error("plugin disposed"))
+    const result = await review
+
+    expect(result.verdict).toBe("证据不足")
+    expect(Date.now() - started).toBeLessThan(400)
+    expect(mock.calls.removed).toEqual(["critic-1"])
+  })
+
   test("the audit row carries the child session, the verdict and the duration", async () => {
     const auditDir = await tempDir()
     const mock = mockClient({ answer: "verdict: 严重不一致\ndifferences:\n- 报告造假" })

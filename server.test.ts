@@ -536,6 +536,20 @@ describe("createQuotaFallback", () => {
     controller.dispose()
   })
 
+  test("中断保留已切标记，会话删除才彻底遗忘", async () => {
+    const { controller, calls } = fallbackHarness()
+    await failTimes(controller, 1)
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
+    controller.cancel("ses_root")
+    expect(controller.hasSwitched("ses_root")).toBe(true)
+    controller.forget("ses_root")
+    expect(controller.hasSwitched("ses_root")).toBe(false)
+    expect(controller.failuresOf("ses_root")).toBe(0)
+    await failTimes(controller, 1)
+    expect(controller.isArmed("ses_root")).toBe(true)
+    controller.dispose()
+  })
+
   test("非限额错误：不计时", async () => {
     const { controller, calls } = fallbackHarness()
     await failTimes(controller, 3, { error: { type: "provider.timeout", message: "timed out" } })
@@ -638,6 +652,18 @@ describe("createQuotaFallback", () => {
     expect(logs.filter((record) => record.event === "fallback-switch-failed")).toHaveLength(1)
     expect(logs.some((record) => record.event === "fallback-retry-armed")).toBe(false)
     expect(calls).toHaveLength(0)
+    expect(controller.isArmed("ses_root")).toBe(false)
+  })
+
+  test("切换执行中 dispose：已发起的切换可完成，但不再降档写配置", async () => {
+    let controllerRef: ReturnType<typeof createQuotaFallback> | undefined
+    const { controller, calls, writes } = fallbackHarness({
+      onSwitch: () => controllerRef?.dispose(),
+    })
+    controllerRef = controller
+    await failTimes(controller, 1)
+    expect(await waitFor(() => calls.length === 1)).toBe(true)
+    expect(writes).toEqual([])
     expect(controller.isArmed("ses_root")).toBe(false)
   })
 

@@ -1124,6 +1124,23 @@ describe("槽位归还与淘汰保护", () => {
     // 第一次：collab 读成功，readLimit 抛错 → lookup-failed，放行且还槽。
     await h.hooks["tool:execute.before"](call("c1", { model: "acme/flagship#high" }))
     expect(hookLog().some((record) => record.event === "lookup-failed")).toBe(true)
+    // fail-open 只放弃本次准入判定，不应丢掉成功调用的显式模型委派身份。
+    h.sessions.set("ses_lookup", {
+      id: "ses_lookup",
+      parentID: "ses_root",
+      model: ROOT_MODEL,
+      outcome: "succeeded",
+      time: { created: NOW },
+    })
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "c1",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_lookup" } },
+    })
+    expect(h.sessions.get("ses_lookup")?.metadata?.[MODEL_DELEGATION_METADATA_KEY]).toMatchObject({
+      source: MODEL_DELEGATION_MARKER_SOURCE,
+    })
     // 第二次：如果第一次泄漏了旗舰槽，这里会被拒绝。
     await h.hooks["tool:execute.before"](call("c2", { model: "acme/flagship#high" }))
     await h.hooks["tool:execute.after"]({ tool: "subagent", id: "c2" })
@@ -1458,6 +1475,122 @@ describe("淘汰并发竞态", () => {
 
     await h.hooks["tool:execute.after"]({ tool: "subagent", id: "flag1" })
     await h.hooks["tool:execute.after"]({ tool: "subagent", id: "flag2" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("同一目标的并发 steer 必须等最后一笔结束后才解除淘汰保护", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([plainSameModel("ses_target", 1)]),
+      entries: { ses_root: [{ key: "superagent.max-subagents", value: 1 }] },
+    })
+    await h.hooks["tool:execute.before"](call("steer-a", { sessionID: "ses_target" }))
+    await h.hooks["tool:execute.before"](call("steer-b", { sessionID: "ses_target" }))
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer-a", status: "error" })
+
+    // 另一笔 steer 仍在飞：new 不能把它的目标当作可淘汰的已完成会话。
+    const error = await denied(h.hooks["tool:execute.before"](call("new-while-steered")))
+    expect(String(error.message)).toContain("Subagent 存在上限已满")
+    expect(h.removed).toEqual([])
+
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "steer-b", status: "error" })
+    await h.hooks["tool:execute.before"](call("new-after-steered"))
+    expect(h.removed).toEqual(["ses_target"])
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: "new-after-steered", status: "error" })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("淘汰后刷新失败走 fail-open：成功 after 仍写旗舰与委派标记", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions([plainSameModel("ses_old", 1)]),
+      entries: { ses_root: [{ key: "superagent.max-subagents", value: 1 }] },
+    })
+    const originalList = h.ctx.session.list
+    let listCalls = 0
+    h.ctx.session.list = async (...args: any[]) => {
+      listCalls++
+      if (listCalls === 2) throw new Error("refresh down")
+      return originalList(...args)
+    }
+    await h.hooks["tool:execute.before"](call("fail-refresh", { model: "acme/flagship#high" }))
+    h.sessions.set("ses_fail_refresh", {
+      id: "ses_fail_refresh",
+      parentID: "ses_root",
+      model: ROOT_MODEL,
+      outcome: "succeeded",
+      time: { created: NOW },
+    })
+    await h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "fail-refresh",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_fail_refresh" } },
+    })
+    expect(h.removed).toEqual(["ses_old"])
+    expect(h.sessions.get("ses_fail_refresh")?.metadata?.[FLAGSHIP_METADATA_KEY]).toMatchObject({
+      source: FLAGSHIP_MARKER_SOURCE,
+    })
+    expect(h.sessions.get("ses_fail_refresh")?.metadata?.[MODEL_DELEGATION_METADATA_KEY]).toMatchObject({
+      source: MODEL_DELEGATION_MARKER_SOURCE,
+    })
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("旗舰 after 在标记落盘前保留在途槽，并发新派发不能穿过空窗", async () => {
+    tempState()
+    const h = await setup({
+      sessions: baseSessions(),
+      entries: { ses_root: rootEntries([{ key: MAX_FLAGSHIP_SUBAGENTS_KEY, value: 1 }]) },
+    })
+    await h.hooks["tool:execute.before"](call("flag-before-mark", { model: "acme/flagship#high" }))
+    h.sessions.set("ses_new_flagship", {
+      id: "ses_new_flagship",
+      parentID: "ses_root",
+      model: ROOT_MODEL,
+      outcome: "succeeded",
+      time: { created: NOW },
+    })
+
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    let releaseMark!: () => void
+    const gate = new Promise<void>((resolve) => {
+      releaseMark = resolve
+    })
+    const originalUpdate = h.ctx.session.update
+    h.ctx.session.update = async (input) => {
+      if (input.sessionID === "ses_new_flagship") {
+        markStarted()
+        await gate
+      }
+      await originalUpdate(input)
+    }
+
+    const after = h.hooks["tool:execute.after"]({
+      tool: "subagent",
+      id: "flag-before-mark",
+      status: "completed",
+      result: { metadata: { sessionID: "ses_new_flagship" } },
+    })
+    await started
+    try {
+      const error = await denied(
+        h.hooks["tool:execute.before"](call("flag-during-mark", { model: "acme/flagship#high" })),
+      )
+      expect(String(error.message)).toContain("旗舰子代理上限已满")
+    } finally {
+      releaseMark()
+      await after
+    }
+    expect(h.sessions.get("ses_new_flagship")?.metadata?.[FLAGSHIP_METADATA_KEY]).toMatchObject({
+      source: FLAGSHIP_MARKER_SOURCE,
+    })
     await h.dispose()
     h.events.close()
   })

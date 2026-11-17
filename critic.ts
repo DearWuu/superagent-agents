@@ -92,6 +92,8 @@ export type CriticReviewOptions = {
   readonly auditDir?: string
   /** Receives the failure trail; the audit row always carries it too. */
   readonly log?: (entry: Record<string, unknown>) => void
+  /** 插件卸载时中止轮询，并阻止后续复核副作用。 */
+  readonly signal?: AbortSignal
 }
 
 export type CriticReviewResult = {
@@ -336,22 +338,27 @@ export async function criticReview(
   let note: string | undefined
 
   try {
+    throwIfAborted(options.signal)
     const child = await getSession(input.client, input.childSessionID)
+    throwIfAborted(options.signal)
     if (isCriticSession(child)) {
       skipped = true
       note = "跳过：子会话本身是复核会话，避免递归复核"
     } else {
       const childMessages = await listMessages(input.client, input.childSessionID)
+      throwIfAborted(options.signal)
       const record = summarizeSessionRecord(childMessages)
       const files = collectRecordFiles(childMessages)
       const title = `${CRITIC_TITLE_PREFIX}${child?.title?.trim() || input.childSessionID}`
 
+      throwIfAborted(options.signal)
       const created = await input.client.session.create({
         parentID: input.rootID,
         agent: options.agent ?? CRITIC_AGENT,
         title,
       })
       criticSessionID = created.id
+      throwIfAborted(options.signal)
 
       // The marker is written after creation, so the critic session keeps the
       // metadata it inherited from its parent and the title already identifies
@@ -364,13 +371,15 @@ export async function criticReview(
           [CRITIC_TARGET_KEY]: input.childSessionID,
         },
       })
+      throwIfAborted(options.signal)
 
       await input.client.session.prompt({
         sessionID: created.id,
         text: buildCriticPrompt({ reportText: input.reportText, record, files }),
       })
 
-      const finished = await waitForCompletion(input.client, created.id, timeoutMs, pollIntervalMs)
+      throwIfAborted(options.signal)
+      const finished = await waitForCompletion(input.client, created.id, timeoutMs, pollIntervalMs, options.signal)
       if (!finished.ok) {
         note = finished.reason
         differences = [finished.reason]
@@ -451,11 +460,14 @@ async function waitForCompletion(
   sessionID: string,
   timeoutMs: number,
   pollIntervalMs: number,
+  signal?: AbortSignal,
 ): Promise<WaitResult> {
   const deadline = Date.now() + timeoutMs
   let failures = 0
   for (;;) {
+    throwIfAborted(signal)
     const info = await getSession(client, sessionID)
+    throwIfAborted(signal)
     if (!info) {
       failures++
       if (failures >= 3) return { ok: false, reason: "复核会话无法读取，判定为证据不足" }
@@ -464,7 +476,7 @@ async function waitForCompletion(
       if (isFinished(info)) return { ok: true }
     }
     if (Date.now() >= deadline) return { ok: false, reason: `复核超时（${timeoutMs}ms），判定为证据不足` }
-    await sleep(pollIntervalMs)
+    await sleep(pollIntervalMs, signal)
   }
 }
 
@@ -476,8 +488,29 @@ function isFinished(session: CriticSessionInfo): boolean {
   return idle >= busy
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function throwIfAborted(signal?: AbortSignal) {
+  if (!signal?.aborted) return
+  throw signal.reason instanceof Error ? signal.reason : new Error("复核已取消")
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("复核已取消"))
+      return
+    }
+    const done = () => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("复核已取消"))
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 function errorText(cause: unknown): string {

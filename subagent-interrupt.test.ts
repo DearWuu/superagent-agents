@@ -9,7 +9,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { Schema } from "effect"
 
-import plugin, { interruptBeforeSubagentSteer } from "./server"
+import plugin, { executeSubagentWithInterrupt, interruptBeforeSubagentSteer } from "./server"
 
 const cleanups: string[] = []
 
@@ -351,6 +351,52 @@ describe("subagent 续跑默认排队", () => {
     expect(String(error.message)).toContain("续跑投递已取消")
     expect(h.executions).toEqual([])
     await h.dispose()
+  })
+})
+
+describe("派发与 reload 生命周期", () => {
+  test("看护登记挂起时不阻塞原生 subagent 工具结果", async () => {
+    const gate = deferred()
+    const dispatch = executeSubagentWithInterrupt(
+      {},
+      async () => ({ output: "done", metadata: { sessionID: "ses_child", status: "completed" } }),
+      { agent: "worker", prompt: "go" },
+      { id: "call-nonblocking", sessionID: "ses_root", signal: new AbortController().signal },
+      undefined,
+      async () => gate.promise,
+    )
+    const outcome = await Promise.race([
+      dispatch.then(() => "returned" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+    ])
+    gate.resolve()
+    await dispatch
+    expect(outcome).toBe("returned")
+  })
+
+  test("dispose 后在同一宿主工具上重新 setup：执行包装绑定新台账", async () => {
+    tempState()
+    const h = harness({ sessions: [{ id: "ses_root" }] })
+    const firstDispose = await (plugin as any).setup(h.ctx)
+    await firstDispose()
+    const secondDispose = await (plugin as any).setup(h.ctx)
+
+    const event = {
+      tool: "subagent",
+      sessionID: "ses_root",
+      id: "call-after-reload",
+      agent: "superagent",
+      input: { agent: "worker", prompt: "go" },
+    }
+    await h.hooks["tool:execute.before"](event)
+    const result = await h.tool.execute(event.input, {
+      id: event.id,
+      sessionID: "ses_root",
+      signal: new AbortController().signal,
+    })
+    expect(String(result.output)).toContain("[superagent] dispatch=ok")
+    await h.hooks["tool:execute.after"]({ tool: "subagent", id: event.id, status: "error" })
+    await secondDispose()
   })
 })
 

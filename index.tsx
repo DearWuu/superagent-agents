@@ -36,6 +36,7 @@ import {
   effectiveFlagshipLimit,
 } from "./flagship"
 import { isExplicitModelDelegation } from "./model-delegation"
+import { isCriticSession } from "./critic"
 import { pickerKey, type PickerGroup } from "./model-picker"
 import { AgentPanelView } from "./panel-view"
 import { createInstructionActions } from "./panel-instructions"
@@ -217,7 +218,11 @@ export function SidebarAgents(props: {
   /** The direct, non-archived children of the family root. */
   const directSubagents = createMemo(() => {
     const family = new Set(props.context.data.session.family(rootSessionID()))
-    return sessions().filter((item) => item.parentID === rootSessionID() && family.has(item.id))
+    // 复核会话挂在 root 下但不是子代理：不占名额、不参与淘汰，
+    // 否则一次复核期间会把正常子代理顶掉（与服务端 listChildren 同口径）。
+    return sessions().filter(
+      (item) => item.parentID === rootSessionID() && family.has(item.id) && !isCriticSession(item),
+    )
   })
   /** How many of those children are running right now. */
   const runningSubagents = createMemo(
@@ -711,6 +716,8 @@ export function SidebarAgents(props: {
         (item) =>
           item.id !== rootID &&
           family.has(item.id) &&
+          // 复核会话不是子代理：不在批量改模型的目标里（它随时会被删）。
+          !isCriticSession(item) &&
           !kept[item.id] &&
           policies[item.id] !== "auto" &&
           policies[item.id] !== "fixed" &&
