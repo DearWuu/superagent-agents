@@ -484,6 +484,91 @@ describe("后台任务状态回传", () => {
     h.events.close()
   })
 
+  test("仅 enqueued 未 delivered 且父闲：对账补发完整完成卡并显式 steer 投递", async () => {
+    tempState()
+    process.env.SUPERAGENT_STATUS_RECONCILE_MS = "80"
+    const h = await setup({
+      sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
+      result: { output: "done", metadata: { sessionID: "ses_child", status: "running" } },
+    })
+    await dispatch(h, { background: true })
+    const child = h.sessions.get("ses_child")!
+    child.outcome = "succeeded"
+    child.time = { created: 1, busy: 2, idle: 3 }
+    h.events.push({ type: "session.execution.succeeded", data: { sessionID: "ses_child" } })
+    // 原生完成卡只入队、未投递：不算 seen，不能压掉对账补发。
+    h.events.push({
+      id: "evt_native_enqueued_only",
+      type: "session.inbox.enqueued",
+      created: Date.now(),
+      data: {
+        sessionID: "ses_root",
+        inboxID: "msg_native_queued",
+        item: {
+          type: "synthetic",
+          delivery: "queue",
+          payload: {
+            text: '<subagent sessionID="ses_child" state="completed">done</subagent>',
+            metadata: { source: "subagent", childID: "ses_child", state: "completed" },
+          },
+        },
+      },
+    })
+    expect(await waitFor(() => h.synthetics.length === 1, 6000)).toBe(true)
+    const notice = h.synthetics[0]
+    expect(notice.metadata).toEqual({ source: "superagent-agents", childID: "ses_child", state: "completed" })
+    expect(notice.delivery).toBe("steer")
+    expect(hookLog().some((record) => record.event === "status-completion-fallback")).toBe(true)
+    expect(hookLog().some((record) => record.event === "status-completion-blocked")).toBe(false)
+    await h.dispose()
+    h.events.close()
+  })
+
+  test("仅 enqueued 未 delivered 且父忙：不补发，blocked 日志每 state 一次，父闲后补发", async () => {
+    tempState()
+    process.env.SUPERAGENT_STATUS_RECONCILE_MS = "80"
+    const h = await setup({
+      sessions: [rootSession, childSession({ outcome: null, time: { created: 1, busy: 2 } })],
+      result: { output: "done", metadata: { sessionID: "ses_child", status: "running" } },
+    })
+    await dispatch(h, { background: true })
+    const child = h.sessions.get("ses_child")!
+    child.outcome = "succeeded"
+    child.time = { created: 1, busy: 2, idle: 3 }
+    // 父会话只有 busy：视为忙。
+    h.sessions.get("ses_root")!.time = { created: 1, busy: Date.now() }
+    h.events.push({ type: "session.execution.succeeded", data: { sessionID: "ses_child" } })
+    h.events.push({
+      id: "evt_native_enqueued_busy",
+      type: "session.inbox.enqueued",
+      created: Date.now(),
+      data: {
+        sessionID: "ses_root",
+        inboxID: "msg_native_busy",
+        item: {
+          type: "synthetic",
+          delivery: "queue",
+          payload: {
+            text: '<subagent sessionID="ses_child" state="completed">done</subagent>',
+            metadata: { source: "subagent", childID: "ses_child", state: "completed" },
+          },
+        },
+      },
+    })
+    expect(await waitFor(() => hookLog().some((record) => record.event === "status-completion-blocked"), 6000)).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(h.synthetics).toEqual([])
+    const blocked = hookLog().filter((record) => record.event === "status-completion-blocked")
+    expect(blocked).toHaveLength(1)
+    expect(blocked[0]).toMatchObject({ childSessionID: "ses_child", parentID: "ses_root", state: "completed" })
+    // 父会话空闲：下一拍补发并显式 steer。
+    h.sessions.get("ses_root")!.time = { created: 1, busy: 1, idle: Date.now() }
+    expect(await waitFor(() => h.synthetics.length === 1, 4000)).toBe(true)
+    expect(h.synthetics[0].delivery).toBe("steer")
+    await h.dispose()
+    h.events.close()
+  })
+
   test("原生已经通知过：不重复发完成通知", async () => {
     tempState()
     const h = await setup({

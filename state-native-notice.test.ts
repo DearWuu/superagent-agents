@@ -42,12 +42,13 @@ function harness(overrides: Record<string, unknown> = {}) {
   let childMessages: any[] = []
   let childReads = 0
   let child: any = { id: CHILD, outcome: null, time: { busy: 10 } }
+  let parent: any = { id: PARENT, time: { busy: 1, idle: 2 } }
   const deps = {
     nativeNoticeWaitMs: 5,
     reconcileIntervalMs: 60_000,
     settleRetryLimit: 0,
     readSession: async (sessionID: string) => {
-      if (sessionID !== CHILD) return { id: sessionID, time: { busy: 1, idle: 2 } }
+      if (sessionID !== CHILD) return structuredClone(parent)
       childReads += 1
       return structuredClone(child)
     },
@@ -77,6 +78,9 @@ function harness(overrides: Record<string, unknown> = {}) {
     marked,
     evicted,
     childReads: () => childReads,
+    setParent(next: any) {
+      parent = next
+    },
     setMessages(messages: any[]) {
       childMessages = messages
     },
@@ -108,7 +112,7 @@ async function waitPending(h: ReturnType<typeof harness>, count = 1) {
 }
 
 describe("原生通知观察与终态兜底", () => {
-  test("native 已观察但 parent context 不可见：零插件卡并正常收尾淘汰", async () => {
+  test("enqueued 且 delivered：零插件卡并正常收尾淘汰", async () => {
     const h = harness()
     const watcher = createStatusWatcher(h.deps)
     try {
@@ -118,7 +122,9 @@ describe("原生通知观察与终态兜底", () => {
         state: "completed",
         text: `<subagent sessionID="${CHILD}" state="completed">done</subagent>`,
         time: Date.now(),
+        inboxID: "inbox_done",
       })).toBe(true)
+      expect(watcher.observeNativeDelivery({ inboxID: "inbox_done", time: Date.now() })).toBe(true)
       h.complete()
       watcher.settle(CHILD, { state: "completed" })
       await waitFor(() => watcher.size() === 0)
@@ -162,7 +168,7 @@ describe("原生通知观察与终态兜底", () => {
     }
   })
 
-  test("pending 后 native 才入队：下一拍只收尾，不补插件卡", async () => {
+  test("pending 后 native 才入队并投递：下一拍只收尾，不补插件卡", async () => {
     const h = harness()
     const watcher = createStatusWatcher(h.deps)
     try {
@@ -170,7 +176,8 @@ describe("原生通知观察与终态兜底", () => {
       h.complete()
       watcher.settle(CHILD, { state: "completed" })
       await waitPending(h)
-      watcher.observeNativeNotice({ childID: CHILD, state: "succeeded", text: "done", time: Date.now() })
+      watcher.observeNativeNotice({ childID: CHILD, state: "succeeded", text: "done", time: Date.now(), inboxID: "inbox_late" })
+      watcher.observeNativeDelivery({ inboxID: "inbox_late", time: Date.now() })
       await watcher.reconcile()
       expect(h.notices).toEqual([])
       expect(watcher.size()).toBe(0)
@@ -184,7 +191,8 @@ describe("原生通知观察与终态兜底", () => {
     const watcher = createStatusWatcher(h.deps)
     try {
       await register(watcher, h)
-      expect(watcher.observeNativeNotice({ childID: CHILD, state: "completed", time: Date.now() - 1 })).toBe(false)
+      // 旧轮迟到事件：入队时间早于本轮开始，必须拒绝。
+      expect(watcher.observeNativeNotice({ childID: CHILD, state: "completed", time: Date.now() - 5_000 })).toBe(false)
       expect(watcher.observeNativeNotice({ childID: CHILD, state: "error", text: "failed", time: Date.now() })).toBe(true)
       expect(watcher.observeNativeNotice({
         childID: CHILD,
@@ -263,7 +271,9 @@ describe("原生 background-running 去重", () => {
         state: "completed",
         text: `<subagent sessionID="${CHILD}" state="running">Background work still running</subagent>`,
         time: Date.now(),
+        inboxID: "inbox_bg",
       })).toBe(true)
+      expect(watcher.observeNativeDelivery({ inboxID: "inbox_bg", time: Date.now() })).toBe(true)
       await waitFor(() => h.marked.length === 1)
       expect(h.notices).toEqual([])
       expect(watcher.size()).toBe(1)
@@ -285,6 +295,37 @@ describe("原生 background-running 去重", () => {
       watcher.stop()
     }
   })
+
+  test("原生后台卡仅入队未投递：父忙与父闲都不补发插件后台卡", async () => {
+    const parents = [
+      { id: PARENT, time: { busy: 30 } },
+      { id: PARENT, time: { busy: 1, idle: 40 } },
+    ]
+    for (const parent of parents) {
+      const h = harness()
+      h.complete()
+      h.setMessages([runningShell()])
+      h.setParent(parent)
+      const watcher = createStatusWatcher(h.deps)
+      try {
+        await watcher.register(registration())
+        expect(watcher.observeNativeNotice({
+          childID: CHILD,
+          state: "running",
+          text: `<subagent sessionID="${CHILD}" state="running">Background work still running</subagent>`,
+          time: Date.now(),
+          inboxID: "inbox_bg_queued",
+        })).toBe(true)
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        // 后台卡不承担唤醒：只入队就足以判重，不能等 delivered。
+        expect(h.marked).toHaveLength(1)
+        expect(h.notices).toEqual([])
+        expect(watcher.size()).toBe(1)
+      } finally {
+        watcher.stop()
+      }
+    }
+  })
 })
 
 describe("完成卡长度", () => {
@@ -300,5 +341,210 @@ describe("完成卡长度", () => {
     expect(text.slice(0, text.indexOf("\n"))).toContain('description="')
     expect(text.slice(0, text.indexOf("\n")).endsWith('">')).toBe(true)
     expect(text.endsWith("\n</subagent>")).toBe(true)
+  })
+})
+
+describe("enqueued 与 delivered 回标", () => {
+  test("仅 enqueued 未 delivered：父忙（含读取失败）不补发且 blocked 日志一次，父闲后补发", async () => {
+    const h = harness()
+    let failParentRead = false
+    const originalRead = h.deps.readSession
+    h.deps.readSession = async (sessionID: string) => {
+      if (sessionID === PARENT && failParentRead) throw new Error("parent read failed")
+      return originalRead(sessionID)
+    }
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      await register(watcher, h)
+      watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "completed",
+        text: `<subagent sessionID="${CHILD}" state="completed">done</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_queued",
+      })
+      h.complete()
+      watcher.settle(CHILD, { state: "completed" })
+      await waitPending(h)
+
+      // 读取失败按忙处理：不发卡。
+      failParentRead = true
+      await watcher.reconcile()
+      expect(h.notices).toEqual([])
+      expect(watcher.size()).toBe(1)
+      const blocked = () => h.writes.filter((record) => record.event === "status-completion-blocked")
+      expect(blocked()).toHaveLength(1)
+      expect(blocked()[0]).toMatchObject({ childSessionID: CHILD, parentID: PARENT, state: "completed" })
+
+      // 父会话只有 busy：视为忙，blocked 日志不重复。
+      failParentRead = false
+      h.setParent({ id: PARENT, time: { busy: 30 } })
+      await watcher.reconcile()
+      expect(h.notices).toEqual([])
+      expect(blocked()).toHaveLength(1)
+      expect(watcher.size()).toBe(1)
+
+      // 父会话空闲：走既有补发，pending 收尾。
+      h.setParent({ id: PARENT, time: { busy: 1, idle: 40 } })
+      await watcher.reconcile()
+      expect(h.notices).toHaveLength(1)
+      expect(h.notices[0].metadata.state).toBe("completed")
+      expect(h.writes.some((record) => record.event === "status-completion-fallback")).toBe(true)
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("native 入队后被 cancelled：不算 seen，对账补发并写 status-native-cancelled", async () => {
+    const h = harness()
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      await register(watcher, h)
+      watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "completed",
+        text: `<subagent sessionID="${CHILD}" state="completed">done</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_cancelled",
+      })
+      expect(watcher.observeNativeCancel({ inboxID: "inbox_cancelled", time: Date.now() })).toBe(true)
+      expect(h.writes.some((record) => record.event === "status-native-cancelled")).toBe(true)
+      h.complete()
+      watcher.settle(CHILD, { state: "completed" })
+      await waitPending(h)
+      expect(watcher.size()).toBe(1)
+
+      await watcher.reconcile()
+      expect(h.notices).toHaveLength(1)
+      expect(h.notices[0].metadata.state).toBe("completed")
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("inboxID 分别映射 background 与 terminal 两张卡；未知 inboxID 不命中", async () => {
+    const h = harness()
+    h.complete()
+    h.setMessages([runningShell()])
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      await watcher.register(registration(false))
+      watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "completed",
+        text: `<subagent sessionID="${CHILD}" state="running">Background work still running</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_bg",
+      })
+      watcher.observeNativeDelivery({ inboxID: "inbox_bg", time: Date.now() })
+      await waitFor(() => h.marked.length === 1)
+      expect(h.notices).toEqual([])
+
+      // 后台全部结束 + 原生终态卡入队并投递：BACKGROUND_DONE 不再补发。
+      h.setMessages([{ ...runningShell(), status: "exited" }])
+      watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "completed",
+        text: `<subagent sessionID="${CHILD}" state="completed">done</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_term",
+      })
+      watcher.observeNativeDelivery({ inboxID: "inbox_term", time: Date.now() })
+      watcher.settle(CHILD, { state: "completed" })
+      await waitFor(() => watcher.size() === 0)
+      expect(h.notices).toEqual([])
+      expect(h.cleared).toEqual([CHILD])
+
+      expect(watcher.observeNativeDelivery({ inboxID: "inbox_unknown", time: Date.now() })).toBe(false)
+      expect(watcher.observeNativeCancel({ inboxID: "", time: Date.now() })).toBe(false)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("delivered 回标后旧轮观察在新轮不算 seen", async () => {
+    const h = harness()
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      await register(watcher, h)
+      watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "completed",
+        text: "done",
+        time: Date.now(),
+        inboxID: "inbox_old",
+      })
+      watcher.observeNativeDelivery({ inboxID: "inbox_old", time: Date.now() })
+      // 新轮清空旧观察：回标已无命中。
+      await watcher.register(registration())
+      expect(watcher.observeNativeDelivery({ inboxID: "inbox_old", time: Date.now() })).toBe(false)
+      h.complete()
+      watcher.settle(CHILD, { state: "completed" })
+      await waitPending(h)
+      await watcher.reconcile()
+      expect(h.notices).toHaveLength(1)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("终态判重仍要求 delivered：仅 enqueued 不算 seen，父闲时对账补发", async () => {
+    const h = harness()
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      await register(watcher, h)
+      expect(watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "completed",
+        text: `<subagent sessionID="${CHILD}" state="completed">done</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_terminal_queued",
+      })).toBe(true)
+      h.complete()
+      watcher.settle(CHILD, { state: "completed" })
+      await waitPending(h)
+      expect(h.notices).toEqual([])
+
+      // 父闲：仅入队未投递不算 seen，对账补发且只补一张。
+      await watcher.reconcile()
+      expect(h.notices).toHaveLength(1)
+      expect(h.notices[0].metadata).toEqual({ source: "superagent-agents", childID: CHILD, state: "completed" })
+      expect(h.writes.some((record) => record.event === "status-completion-fallback")).toBe(true)
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("已投递的后台卡不能冒充终态：终态未 delivered 时仍补发完成卡", async () => {
+    const h = harness()
+    h.complete()
+    h.setMessages([runningShell()])
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      await watcher.register(registration(false))
+      expect(watcher.observeNativeNotice({
+        childID: CHILD,
+        state: "running",
+        text: `<subagent sessionID="${CHILD}" state="running">Background work still running</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_bg_delivered",
+      })).toBe(true)
+      expect(watcher.observeNativeDelivery({ inboxID: "inbox_bg_delivered", time: Date.now() })).toBe(true)
+      await waitFor(() => h.marked.length === 1)
+      expect(h.notices).toEqual([])
+
+      // 后台任务结束、回合终态：后台卡已投递也不能算终态已通知，仍要走 BACKGROUND_DONE。
+      h.setMessages([{ ...runningShell(), status: "exited" }])
+      watcher.settle(CHILD, { state: "completed" })
+      await waitFor(() => h.notices.length === 1)
+      expect(h.notices[0].metadata.state).toBe("completed")
+      expect(h.notices[0].text).toContain("子代理的后台任务已全部结束。")
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
   })
 })

@@ -733,7 +733,19 @@ export default {
       readEntries: async (sessionID) => asArray(await ctx.session.instructions.entry.list({ sessionID })),
       notifyParent: async (input) => {
         if (typeof ctx.session?.synthetic !== "function") throw new Error("宿主不支持 session.synthetic")
-        await ctx.session.synthetic(input)
+        try {
+          // 完成通知必须可靠唤醒父会话：显式用 steer 投递，不进静默 queue。
+          await ctx.session.synthetic({ ...input, delivery: "steer" })
+        } catch (cause) {
+          // 老宿主不认 delivery 字段：降级重试不带 delivery；两败才走既有失败路径。
+          log({
+            event: "status-notify-steer-fallback",
+            decision: "allow",
+            sessionID: input.sessionID,
+            cause: errorText(cause),
+          })
+          await ctx.session.synthetic(input)
+        }
       },
       markRuntime: async (sessionID, background) => {
         await markRuntimeBackground(ctx, { sessionID, background })

@@ -464,6 +464,8 @@ describe("server 事件订阅接线", () => {
       "session.model.selected",
       "session.deleted",
       "session.inbox.enqueued",
+      "session.inbox.delivered",
+      "session.inbox.cancelled",
     ])
     expect(subscription.signal.aborted).toBe(false)
     await dispose()
@@ -537,6 +539,13 @@ describe("server 事件订阅接线", () => {
           },
         },
       })
+      // 仅 enqueued 不算已通知：投递回标到达后 pending 分支才认 seen 并收尾。
+      h.events.push({
+        id: "evt_durable_native_delivered",
+        type: "session.inbox.delivered",
+        created: created + 5,
+        data: { sessionID: "ses_root", inboxID: "msg_native" },
+      })
       expect(await waitFor(() => h.updated.some((item) =>
         item.sessionID === "ses_child" && item.metadata && !("superagent.runtime" in item.metadata),
       ))).toBe(true)
@@ -552,6 +561,69 @@ describe("server 事件订阅接线", () => {
       expect(logs.some((record) => record.event === "status-completion-fallback")).toBe(false)
       expect(logs.some((record) => record.event === "status-completed")).toBe(false)
       expect(h.synthetics).toEqual([])
+    } finally {
+      await dispose()
+      h.events.close()
+    }
+  })
+
+  test("notifyParent 显式 steer 投递；老宿主不认 delivery 时降级重试并记日志", async () => {
+    tempState()
+    const h = harness({
+      sessions: [
+        { id: "ses_root", title: "root" },
+        { id: "ses_child", parentID: "ses_root", title: "后台任务" },
+      ],
+    })
+    const realSynthetic = h.ctx.session.synthetic.bind(h.ctx.session)
+    let rejectDelivery = true
+    h.ctx.session.synthetic = async (input: any) => {
+      if (rejectDelivery && input.delivery !== undefined) throw new Error("unknown field: delivery")
+      return realSynthetic(input)
+    }
+    const dispose = await (plugin as any).setup(h.ctx)
+    try {
+      // 前台派发留下后台任务：notifyBackground 走同一 notifyParent 接线。
+      h.sessions.get("ses_child")!.outcome = "succeeded"
+      h.ctx.session.context = async ({ sessionID }: { sessionID: string }) =>
+        sessionID === "ses_child"
+          ? [{ id: "msg_shell", type: "shell", shellID: "sh_1", command: "npm run dev", status: "running", metadata: { background: true } }]
+          : []
+      const input = { agent: "worker", description: "任务", prompt: "go" }
+      const callID = "call-steer"
+      await h.hooks["tool:execute.before"]({
+        tool: "subagent",
+        sessionID: "ses_root",
+        id: callID,
+        agent: "superagent",
+        input,
+      })
+      await h.tool.execute(input, { id: callID, sessionID: "ses_root", signal: new AbortController().signal })
+      await h.hooks["tool:execute.after"]({ tool: "subagent", id: callID })
+      expect(await waitFor(() => h.synthetics.length === 1)).toBe(true)
+      // 首次投递带 steer 被拒后降级：落地的卡不带 delivery，但记录了降级日志。
+      expect(h.synthetics[0].delivery).toBeUndefined()
+      expect(readJsonl(process.env.SUPERAGENT_HOOK_LOG!).some(
+        (record) => record.event === "status-notify-steer-fallback",
+      )).toBe(true)
+
+      // 新宿主认 delivery：直接以 steer 落地，不再降级。
+      rejectDelivery = false
+      const callID2 = "call-steer-2"
+      await h.hooks["tool:execute.before"]({
+        tool: "subagent",
+        sessionID: "ses_root",
+        id: callID2,
+        agent: "superagent",
+        input,
+      })
+      await h.tool.execute(input, { id: callID2, sessionID: "ses_root", signal: new AbortController().signal })
+      await h.hooks["tool:execute.after"]({ tool: "subagent", id: callID2 })
+      expect(await waitFor(() => h.synthetics.length === 2)).toBe(true)
+      expect(h.synthetics[1].delivery).toBe("steer")
+      expect(readJsonl(process.env.SUPERAGENT_HOOK_LOG!).filter(
+        (record) => record.event === "status-notify-steer-fallback",
+      )).toHaveLength(1)
     } finally {
       await dispose()
       h.events.close()

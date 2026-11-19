@@ -656,6 +656,14 @@ export type NativeNoticeInput = {
   state: string
   text?: string
   time?: number | string | Date
+  /** 入队消息 ID：delivered/cancelled 事件按它回标；缺失则永远无法确认投递。 */
+  inboxID?: string
+}
+
+/** 原生 inbox.delivered / cancelled 事件回标；time 取事件 created。 */
+export type NativeDeliveryInput = {
+  inboxID: string
+  time?: number | string | Date
 }
 
 type NativeNoticeObservation = {
@@ -664,6 +672,11 @@ type NativeNoticeObservation = {
   text: string
   observedAt: number
   enqueuedAt: number
+  inboxID?: string
+  /** enqueued ≠ 已通知：只有 delivered 回标后才算 parent 真的能看见。 */
+  delivered?: boolean
+  deliveredAt?: number
+  cancelled?: boolean
 }
 
 type PendingCompletion = {
@@ -693,6 +706,8 @@ export type StatusWatch = {
   /** 首次发现子代理停掉的时间：只 arm，提醒要等下一个对账周期。 */
   reminderArmedAt?: number
   remindedStates: string[]
+  /** 对账补发被父会话忙阻塞时，每 state 只记一次 blocked 日志。 */
+  completionBlockedLogged?: string[]
   /** busy 竞态已经快速重试过几次；收尾成功或换一轮后归零。 */
   busyRetries?: number
   /** 是否已经挂着一个待触发的 busy 快速重试：同一看护项同时只留一个。 */
@@ -752,6 +767,10 @@ export type StatusWatcher = {
   settle: (childID: string, options?: SettleOptions) => void
   /** 观察当前轮原生 inbox.enqueued；返回 false 表示无 watch、旧轮或状态不可识别。 */
   observeNativeNotice: (input: NativeNoticeInput) => boolean
+  /** inbox.delivered 回标：按 inboxID 命中观察记录并标记 delivered。 */
+  observeNativeDelivery: (input: NativeDeliveryInput) => boolean
+  /** inbox.cancelled 回标：按 inboxID 命中观察记录并标记 cancelled。 */
+  observeNativeCancel: (input: NativeDeliveryInput) => boolean
   /** 周期对账：兜底检查「子代理停了但没人收到完成确认」。 */
   reconcile: () => Promise<void>
   /** 停表并清空看护项。 */
@@ -790,9 +809,20 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
   /** 停止或换轮后，旧异步收尾不得再操作当前 watch。 */
   const isCurrent = (childID: string, watch: StatusWatch) => !stopped && watches.get(childID) === watch
 
-  const hasNativeNotice = (watch: StatusWatch, kind: "terminal" | "background", state?: CompletionState) =>
+  /**
+   * 后台类判重：观察到原生后台卡入队即算 seen。
+   * 后台卡是信息性通知、不承担唤醒职责，只入队未投递（父忙时很常见）也不该再发同代插件卡。
+   */
+  const hasNativeEnqueued = (watch: StatusWatch) =>
+    (watch.nativeNotices ?? []).some((notice) => notice.kind === "background")
+
+  /** 终态类判重：只有 delivered 回标过才算 seen；仅 enqueued 或已取消不算。 */
+  const hasNativeDelivered = (watch: StatusWatch, state: CompletionState) =>
     (watch.nativeNotices ?? []).some(
-      (notice) => notice.kind === kind && (kind === "background" || notice.state === state),
+      (notice) =>
+        notice.delivered === true &&
+        notice.kind === "terminal" &&
+        notice.state === state,
     )
 
   /**
@@ -809,7 +839,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     const observedAt = Date.now()
     const enqueuedAt = nativeNoticeTime(input.time) ?? observedAt
     if (enqueuedAt < watch.startedAt) return false
-    const observation: NativeNoticeObservation = { ...classified, text, observedAt, enqueuedAt }
+    const observation: NativeNoticeObservation = { ...classified, text, observedAt, enqueuedAt, inboxID: input.inboxID }
     const notices = [...(watch.nativeNotices ?? [])]
     const duplicate = notices.findIndex(
       (notice) => notice.kind === observation.kind && notice.state === observation.state,
@@ -825,6 +855,51 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
       state: observation.state ?? RUNTIME_STATE_BACKGROUND,
       enqueuedAt: observation.enqueuedAt,
     })
+    return true
+  }
+
+  /**
+   * inbox.delivered / cancelled 的回标：按 inboxID 扫描各 watch 的观察记录。
+   * 字段缺失或无命中只返回 false，不影响其他事件。
+   */
+  const markNativeDelivery = (input: NativeDeliveryInput, cancelled: boolean) => {
+    const matched: Array<{ childID: string; watch: StatusWatch }> = []
+    if (stopped) return matched
+    const inboxID = input.inboxID
+    if (!inboxID) return matched
+    const at = nativeNoticeTime(input.time) ?? Date.now()
+    for (const [childID, watch] of watches.entries()) {
+      let touched = false
+      for (const notice of watch.nativeNotices ?? []) {
+        if (notice.inboxID !== inboxID) continue
+        if (cancelled) notice.cancelled = true
+        else {
+          notice.delivered = true
+          notice.deliveredAt = at
+        }
+        touched = true
+      }
+      if (touched) matched.push({ childID, watch })
+    }
+    return matched
+  }
+
+  const observeNativeDelivery = (input: NativeDeliveryInput): boolean => markNativeDelivery(input, false).length > 0
+
+  const observeNativeCancel = (input: NativeDeliveryInput): boolean => {
+    const matched = markNativeDelivery(input, true)
+    if (matched.length === 0) return false
+    const at = nativeNoticeTime(input.time) ?? Date.now()
+    for (const { childID, watch } of matched) {
+      write({
+        event: "status-native-cancelled",
+        decision: "allow",
+        inboxID: input.inboxID,
+        childSessionID: childID,
+        parentID: watch.parentID,
+        cancelledAt: at,
+      })
+    }
     return true
   }
 
@@ -1154,7 +1229,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     const jobs = collectBackgroundJobs(messages)
     if (jobs.length > 0) {
       const signature = jobSignature(jobs)
-      if (hasNativeNotice(watch, "background") && !watch.backgroundNotified) {
+      if (hasNativeEnqueued(watch) && !watch.backgroundNotified) {
         // 原生 background-running 已入队：只跟踪任务与运行标记，不再发同代插件卡。
         watch.backgroundNotified = true
         watch.backgroundSignature = signature
@@ -1203,7 +1278,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         parentMessages = []
       }
       if (!isCurrent(childID, watch)) return
-      const seen = hasNativeNotice(watch, "terminal", state) ||
+      const seen = hasNativeDelivered(watch, state) ||
         terminalNoticeSeen(parentMessages, childID, state, noticeSince)
       if (!seen) {
         // 原生通知可能仍在 pending，也可能异常未入队。这里只挂起，不立即补发；
@@ -1233,7 +1308,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         parentMessages = []
       }
       if (!isCurrent(childID, watch)) return
-      const seen = hasNativeNotice(watch, "terminal", state) ||
+      const seen = hasNativeDelivered(watch, state) ||
         terminalNoticeSeen(parentMessages, childID, state, noticeSince)
       if (!seen) {
         const sent = await notifyCompletion(childID, watch, state, BACKGROUND_DONE_TEXT)
@@ -1296,7 +1371,7 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
           continue
         }
         if (!isCurrent(childID, watch)) continue
-        const noticed = hasNativeNotice(watch, "terminal", pending.state) ||
+        const noticed = hasNativeDelivered(watch, pending.state) ||
           terminalNoticeSeen(parentMessages, childID, pending.state, watch.startedAt - NOTICE_TIME_SKEW_MS)
         if (noticed) {
           watch.noticeSeenAt = now
@@ -1304,6 +1379,28 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
           continue
         }
         if (watch.remindedStates.includes(pending.state)) continue
+        // 原生通知仅入队未投递：父会话忙时不补发（宁可不发也不与排队卡重复），
+        // 保留 pending 下拍再查；读取失败同样按忙处理。每 child 每 state 只记一次 blocked。
+        let parentInfo: Record<string, any> | undefined
+        try {
+          parentInfo = sessionInfo(await deps.readSession(watch.parentID))
+        } catch {
+          parentInfo = undefined
+        }
+        if (!isCurrent(childID, watch)) continue
+        if (!parentInfo || isSessionBusy(parentInfo)) {
+          if (!(watch.completionBlockedLogged ?? []).includes(pending.state)) {
+            watch.completionBlockedLogged = [...(watch.completionBlockedLogged ?? []), pending.state]
+            write({
+              event: "status-completion-blocked",
+              decision: "allow",
+              childSessionID: childID,
+              parentID: watch.parentID,
+              state: pending.state,
+            })
+          }
+          continue
+        }
         if (reminderTotal >= MAX_REMINDERS) break
         // 首个兜底 tick 直接发完整完成卡；失败不写 remindedStates，下一拍重试。
         const sent = await notifyCompletion(childID, watch, pending.state, pending.text)
@@ -1470,5 +1567,14 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     reminderTotal = 0
   }
 
-  return { register, settle, observeNativeNotice, reconcile, stop, size: () => watches.size }
+  return {
+    register,
+    settle,
+    observeNativeNotice,
+    observeNativeDelivery,
+    observeNativeCancel,
+    reconcile,
+    stop,
+    size: () => watches.size,
+  }
 }

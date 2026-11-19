@@ -29,7 +29,7 @@ function inboxEvent(options: Record<string, unknown> = {}) {
     created: "created" in options ? options.created : 1_800_000_000_123,
     data: {
       sessionID: "ses_parent",
-      inboxID: "msg_inbox",
+      inboxID: "inboxID" in options ? options.inboxID : "msg_inbox",
       item: {
         type: options.itemType ?? "synthetic",
         delivery: "queue",
@@ -39,6 +39,17 @@ function inboxEvent(options: Record<string, unknown> = {}) {
         },
       },
     },
+  }
+}
+
+function inboxLifecycleEvent(type: "session.inbox.delivered" | "session.inbox.cancelled", options: Record<string, unknown> = {}) {
+  const data: Record<string, unknown> = { sessionID: "ses_parent" }
+  if ("inboxID" in options) data.inboxID = options.inboxID
+  return {
+    id: options.id ?? `evt_${type}`,
+    type,
+    created: "created" in options ? options.created : 1_800_000_000_456,
+    data,
   }
 }
 
@@ -107,8 +118,11 @@ function harness(
   const cancels: string[] = []
   const forgets: string[] = []
   const reviews: Array<{ sessionID: string; claimID?: string }> = []
-  const nativeNotices: Array<{ childID: string; state: string; text?: string; time?: number | string | Date }> = []
+  const nativeNotices: Array<{ childID: string; state: string; text?: string; time?: number | string | Date; inboxID?: string }> = []
   let nativeNoticeResult = true
+  const inboxDeliveries: Array<{ inboxID: string; time?: number }> = []
+  const inboxCancels: Array<{ inboxID: string; time?: number }> = []
+  let inboxResult = true
   const fallbacks: Array<{ sessionID: string; error: unknown; model?: unknown }> = []
   const deps: ServerEventDeps = {
     signal: controller.signal,
@@ -122,6 +136,16 @@ function harness(
         nativeNotices.push(input)
         actions.push(`native:${input.childID}:${input.state}`)
         return nativeNoticeResult
+      },
+      observeNativeDelivery(input) {
+        inboxDeliveries.push(input)
+        actions.push(`delivered:${input.inboxID}`)
+        return inboxResult
+      },
+      observeNativeCancel(input) {
+        inboxCancels.push(input)
+        actions.push(`cancelled:${input.inboxID}`)
+        return inboxResult
       },
     },
     quotaFallback: {
@@ -174,6 +198,11 @@ function harness(
     nativeNotices,
     setNativeNoticeResult(value: boolean) {
       nativeNoticeResult = value
+    },
+    inboxDeliveries,
+    inboxCancels,
+    setInboxResult(value: boolean) {
+      inboxResult = value
     },
     fallbacks,
   }
@@ -371,6 +400,7 @@ describe("原生 inbox 通知接线", () => {
     expect(h.nativeNotices.map((notice) => notice.time)).toEqual(events.map((item) => item.created))
     expect(h.nativeNotices.map((notice) => notice.text)).toEqual(events.map((item) => item.data.item.payload.text))
     expect(h.nativeNotices.every((notice) => notice.childID === "ses_child")).toBe(true)
+    expect(h.nativeNotices.every((notice) => notice.inboxID === "msg_inbox")).toBe(true)
     expect(h.settles).toEqual([])
     h.controller.abort()
     await running
@@ -412,9 +442,64 @@ describe("原生 inbox 通知接线", () => {
       state: "succeeded",
       text: '<subagent sessionID="ses_child" state="succeeded">done</subagent>',
       time: 1_800_000_003_000,
+      inboxID: "msg_inbox",
     }])
     expect(h.settles).toEqual([])
     expect(h.reviews).toEqual([])
+    expect(h.logs).toEqual([])
+    h.controller.abort()
+    await running
+  })
+})
+
+describe("原生 inbox 投递回标接线", () => {
+  test("delivered 与 cancelled 按 data.inboxID 转发，时间取 event.created", async () => {
+    const events = [
+      inboxLifecycleEvent("session.inbox.delivered", { id: "evt_d1", inboxID: "msg_a", created: 1_800_000_010_000 }),
+      inboxLifecycleEvent("session.inbox.cancelled", { id: "evt_c1", inboxID: "msg_b", created: 1_800_000_011_000 }),
+      event("session.step.ended", "ses_after", { finish: "stop" }),
+    ]
+    const h = harness((options) => eventSource(options.signal, events))
+    const running = startServerEventSubscription(h.deps)
+    expect(await waitFor(() => h.resets.includes("ses_after"))).toBe(true)
+    expect(h.inboxDeliveries).toEqual([{ inboxID: "msg_a", time: 1_800_000_010_000 }])
+    expect(h.inboxCancels).toEqual([{ inboxID: "msg_b", time: 1_800_000_011_000 }])
+    expect(h.settles).toEqual([])
+    expect(h.nativeNotices).toEqual([])
+    expect(h.logs).toEqual([])
+    h.controller.abort()
+    await running
+  })
+
+  test("缺 inboxID 或 created 非法时不调用 watcher，也不影响后续事件", async () => {
+    const events = [
+      inboxLifecycleEvent("session.inbox.delivered", { id: "evt_no_id" }),
+      { id: "evt_bad_created", type: "session.inbox.cancelled", created: "not-a-number", data: { sessionID: "ses_parent", inboxID: "msg_b" } },
+      event("session.step.ended", "ses_after", { finish: "stop" }),
+    ]
+    const h = harness((options) => eventSource(options.signal, events))
+    const running = startServerEventSubscription(h.deps)
+    expect(await waitFor(() => h.resets.includes("ses_after"))).toBe(true)
+    // 缺 inboxID 跳过；created 非法仍回标（时间缺省由 watcher 按观察时刻计）。
+    expect(h.inboxDeliveries).toEqual([])
+    expect(h.inboxCancels).toEqual([{ inboxID: "msg_b", time: undefined }])
+    expect(h.logs).toEqual([])
+    h.controller.abort()
+    await running
+  })
+
+  test("回标返回 false（无命中）不阻塞后续事件", async () => {
+    const events = [
+      inboxLifecycleEvent("session.inbox.delivered", { id: "evt_miss", inboxID: "msg_miss" }),
+      inboxLifecycleEvent("session.inbox.cancelled", { id: "evt_miss_c", inboxID: "msg_miss_c" }),
+      event("session.step.ended", "ses_after", { finish: "stop" }),
+    ]
+    const h = harness((options) => eventSource(options.signal, events))
+    h.setInboxResult(false)
+    const running = startServerEventSubscription(h.deps)
+    expect(await waitFor(() => h.resets.includes("ses_after"))).toBe(true)
+    expect(h.inboxDeliveries).toHaveLength(1)
+    expect(h.inboxCancels).toHaveLength(1)
     expect(h.logs).toEqual([])
     h.controller.abort()
     await running

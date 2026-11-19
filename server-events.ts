@@ -23,6 +23,8 @@ export const SERVER_EVENT_TYPES = [
   "session.model.selected",
   "session.deleted",
   "session.inbox.enqueued",
+  "session.inbox.delivered",
+  "session.inbox.cancelled",
 ] as const
 
 export const EVENT_SUBSCRIPTION_INITIAL_DELAY_MS = 250
@@ -37,7 +39,7 @@ export type ServerEventSubscribeOptions = {
 export type ServerEventDeps = {
   signal: AbortSignal
   subscribe: (options: ServerEventSubscribeOptions) => AsyncIterable<any>
-  watcher: Pick<StatusWatcher, "settle" | "observeNativeNotice">
+  watcher: Pick<StatusWatcher, "settle" | "observeNativeNotice" | "observeNativeDelivery" | "observeNativeCancel">
   quotaFallback: {
     reset: (sessionID: string) => void
     cancel: (sessionID: string) => void
@@ -89,7 +91,8 @@ function settle(watcher: Pick<StatusWatcher, "settle">, sessionID: string, optio
 
 /** core InboxEnqueued：入队时间在 event.created，通知字段在 data.item.payload。 */
 function observeNativeInboxNotice(event: any, deps: ServerEventDeps): boolean {
-  const item = eventData(event).item
+  const data = eventData(event)
+  const item = data.item
   if (!isObject(item) || item.type !== "synthetic" || !isObject(item.payload)) return false
   const payload = item.payload
   const metadata = isObject(payload.metadata) ? payload.metadata : undefined
@@ -98,14 +101,37 @@ function observeNativeInboxNotice(event: any, deps: ServerEventDeps): boolean {
   const state = typeof metadata.state === "string" && metadata.state ? metadata.state : undefined
   const text = typeof payload.text === "string" ? payload.text : undefined
   const time = typeof event?.created === "number" && Number.isFinite(event.created) ? event.created : undefined
+  const inboxID = typeof data.inboxID === "string" && data.inboxID ? data.inboxID : undefined
   if (!childID || !state || text === undefined || time === undefined) return false
-  return deps.watcher.observeNativeNotice({ childID, state, text, time })
+  return deps.watcher.observeNativeNotice({ childID, state, text, time, inboxID })
+}
+
+/**
+ * core InboxDelivered / InboxCancelled：data 只带 sessionID 与 inboxID，
+ * 时间取 event.created；字段缺失或无命中 fail-open，不影响其他事件。
+ */
+function observeNativeInboxDelivery(event: any, deps: ServerEventDeps, cancelled: boolean): boolean {
+  const data = eventData(event)
+  const inboxID = typeof data.inboxID === "string" && data.inboxID ? data.inboxID : undefined
+  if (!inboxID) return false
+  const time = typeof event?.created === "number" && Number.isFinite(event.created) ? event.created : undefined
+  return cancelled
+    ? deps.watcher.observeNativeCancel({ inboxID, time })
+    : deps.watcher.observeNativeDelivery({ inboxID, time })
 }
 
 /** 保持原有逐事件分支顺序；每次迭代 await 完处理后才取下一条事件。 */
 async function handleServerEvent(event: any, deps: ServerEventDeps) {
   if (event?.type === "session.inbox.enqueued") {
     observeNativeInboxNotice(event, deps)
+    return
+  }
+  if (event?.type === "session.inbox.delivered") {
+    observeNativeInboxDelivery(event, deps, false)
+    return
+  }
+  if (event?.type === "session.inbox.cancelled") {
+    observeNativeInboxDelivery(event, deps, true)
     return
   }
   if (event?.type === "session.created") {
