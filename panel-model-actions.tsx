@@ -8,7 +8,7 @@
 
 import type { Plugin } from "@opencode/plugin/tui"
 import type { AgentNode } from "./agent-tree"
-import { modelKey, sameModel, type ModelRef } from "./model-policy"
+import { modelKey, sameModel, writeChildModelPolicy, type ModelRef } from "./model-policy"
 import { pickFlagshipOverflow } from "./flagship"
 import { ModelPicker } from "./model-picker"
 import { INSTRUCTION_KEYS } from "./panel-defaults"
@@ -39,8 +39,10 @@ export function createModelActions(deps: {
   pickerFavorites: () => Set<string>
   pickerKey: (model: { providerID: string; id: string }) => string
   putInstruction: (key: string, value: string | number) => Promise<unknown>
+  removeInstruction: (key: string) => Promise<unknown>
   notifyModelChange: (input: { childID?: string; childTitle?: string; value: string }) => Promise<void>
   notifyDefaultPolicy: (input: { policy: "auto" | "inherit" | "fixed"; value?: string }) => Promise<void>
+  notifyChildPolicy: (input: { childID: string; childTitle?: string; policy: "auto" | "inherit" | "fixed" }) => Promise<void>
 }) {
   const {
     context,
@@ -63,8 +65,10 @@ export function createModelActions(deps: {
     pickerFavorites,
     pickerKey,
     putInstruction,
+    removeInstruction,
     notifyModelChange,
     notifyDefaultPolicy,
+    notifyChildPolicy,
   } = deps
 
   const policyChoice = (node: AgentNode): ModelChoice | undefined => {
@@ -173,7 +177,12 @@ export function createModelActions(deps: {
       draft.defaultModel = { providerID: model.providerID, id: model.id, ...(variant ? { variant } : {}) }
       draft.defaultSetAt = Date.now()
     })
-    await putInstruction(INSTRUCTION_KEYS.defaultModel, `${model.providerID}/${model.id}`)
+    await putInstruction(INSTRUCTION_KEYS.defaultPolicy, "fixed")
+    // 条目带上 variant，与 draft.defaultModel 保持一致，服务端派工时才能复现同一选择。
+    await putInstruction(
+      INSTRUCTION_KEYS.defaultModel,
+      `${model.providerID}/${model.id}${variant ? `#${variant}` : ""}`,
+    )
     await rememberRecent(model)
     const label = model.name || model.id
     context.ui.toast.show({
@@ -225,6 +234,8 @@ export function createModelActions(deps: {
         draft.defaultModel = undefined
         draft.defaultSetAt = undefined
       })
+      await putInstruction(INSTRUCTION_KEYS.defaultPolicy, "auto")
+      await removeInstruction(INSTRUCTION_KEYS.defaultModel)
       context.ui.toast.show({ message: "子代理默认模型已设为自动。" })
       // 自动只影响下次分配，没有唯一目标：不声称现有子代理已切模型。
       await notifyDefaultPolicy({ policy: "auto" })
@@ -236,6 +247,8 @@ export function createModelActions(deps: {
         draft.defaultModel = undefined
         draft.defaultSetAt = undefined
       })
+      await putInstruction(INSTRUCTION_KEYS.defaultPolicy, "inherit")
+      await removeInstruction(INSTRUCTION_KEYS.defaultModel)
       context.ui.toast.show({ message: "子代理默认模型已设为跟随会话。" })
       // 策略已保存，后续批量同步由默认模型生效流程执行。
       await notifyDefaultPolicy({ policy: "inherit" })
@@ -387,9 +400,10 @@ export function createModelActions(deps: {
       await updateRoot((draft) => {
         draft.policies = { ...draft.policies, [node.sessionID!]: "auto" }
       })
+      await writeChildModelPolicy(context, node.sessionID!, "auto")
       context.ui.toast.show({ message: `${node.title} 已设为自动；下次分配时由 Superagent 重新选择。` })
-      // 自动只表示后续分配策略，不声称模型已生效。
-      await notifyDefaultPolicy({ policy: "auto" })
+      // 自动只表示该子代理后续分配策略，不是全局默认策略变更。
+      await notifyChildPolicy({ childID: node.sessionID!, childTitle: node.title, policy: "auto" })
       return
     }
     if (selected.kind === "inherit") {
@@ -398,21 +412,26 @@ export function createModelActions(deps: {
       await updateRoot((draft) => {
         draft.policies = { ...draft.policies, [node.sessionID!]: "inherit" }
       })
+      await writeChildModelPolicy(context, node.sessionID!, "inherit")
       const parent = tree()?.model?.actual
       const label = parent ? (names().get(modelKey(parent)) ?? parent.id) : "跟随会话"
-      if (parent && node.sessionID) {
-        await applyModelSwitch(
-          node.sessionID,
-          {
-            providerID: parent.providerID,
-            id: parent.id,
-            ...(parent.variant ? { variant: parent.variant } : {}),
-          },
-          label,
-        )
+      const outcome =
+        parent && node.sessionID
+          ? await applyModelSwitch(
+              node.sessionID,
+              {
+                providerID: parent.providerID,
+                id: parent.id,
+                ...(parent.variant ? { variant: parent.variant } : {}),
+              },
+              label,
+            )
+          : undefined
+      await notifyChildPolicy({ childID: node.sessionID!, childTitle: node.title, policy: "inherit" })
+      // 真实切换成功才回传模型变更；策略通知只说明该子代理后续分配。
+      if (outcome && !outcome.error) {
+        await notifyModelChange({ childID: node.sessionID, childTitle: node.title, value: label })
       }
-      // 策略已保存；单个子代理的切换结果由 toast 呈现，通知只说明策略。
-      await notifyDefaultPolicy({ policy: "inherit" })
       return
     }
     const picked = await pickModel(`设置 ${node.title} 的模型`, node.model?.actual)
@@ -426,8 +445,10 @@ export function createModelActions(deps: {
     await updateRoot((draft) => {
       draft.policies = { ...draft.policies, [node.sessionID!]: "fixed" }
     })
+    await writeChildModelPolicy(context, node.sessionID!, "fixed")
     const label = picked.model.name || picked.model.id
     const outcome = await applyModelSwitch(node.sessionID!, modelRef, label)
+    await notifyChildPolicy({ childID: node.sessionID!, childTitle: node.title, policy: "fixed" })
     // 只有模型真的切成功才通知；失败不通知。
     if (!outcome.error) await notifyModelChange({ childID: node.sessionID, childTitle: node.title, value: label })
     await rememberRecent(picked.model)

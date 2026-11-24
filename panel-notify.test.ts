@@ -7,18 +7,27 @@ import { MAX_MANUAL_OP_LENGTH, createManualNotifier, manualOpText, notifyManualO
 
 const DETAIL = { childID: "ses_x", childTitle: "实现侧栏标记" }
 
-function fakeContext(options: { missing?: boolean; throws?: boolean } = {}) {
+function fakeContext(options: { missing?: boolean; throws?: boolean; delayMs?: number } = {}) {
   const calls: any[] = []
+  const stats = { maxInFlight: 0 }
+  let inFlight = 0
   const session: any = options.missing
     ? {}
     : {
         synthetic: async (input: any) => {
           calls.push(input)
-          if (options.throws) throw new Error("synthetic failed")
-          return { id: "syn_1" }
+          inFlight += 1
+          stats.maxInFlight = Math.max(stats.maxInFlight, inFlight)
+          try {
+            if (options.delayMs) await new Promise((resolve) => setTimeout(resolve, options.delayMs))
+            if (options.throws) throw new Error("synthetic failed")
+            return { id: "syn_1" }
+          } finally {
+            inFlight -= 1
+          }
         },
       }
-  return { context: { client: { session } }, calls }
+  return { context: { client: { session } }, calls, stats }
 }
 
 describe("manualOpText", () => {
@@ -93,6 +102,15 @@ describe("manualOpText", () => {
     expect(text).toContain("用户")
     expect(text).toContain("停用")
     expect(text).toContain("全部停止")
+  })
+
+  test("每子代理策略文案说清只影响该子代理，不冒充全局默认策略", () => {
+    for (const policy of ["auto", "inherit", "fixed"] as const) {
+      const text = manualOpText("child-policy", { ...DETAIL, policy })
+      expect(text).toContain("实现侧栏标记（ses_x）")
+      expect(text).toContain("只影响该子代理后续分配")
+      expect(text).not.toContain("默认模型设为")
+    }
   })
 
   test("没有标题时只写会话 ID", () => {
@@ -249,6 +267,24 @@ describe("createManualNotifier", () => {
     expect(String(calls[0].text)).not.toContain("上限改为2")
     expect(String(calls[0].text)).toContain("报告风格")
     expect(calls[0].metadata.actions).toEqual(["max-flagship", "setting"])
+    notifier.dispose()
+  })
+
+  test("两个立即操作串行投递：先点的先发，且不与窗口冲刷交错", async () => {
+    const { context, calls, stats } = fakeContext({ delayMs: 30 })
+    const notifier = createManualNotifier(context, {
+      rootID: () => "ses_root",
+      delayMs: 500,
+    })
+    const pending = notifier.notify({ action: "keep", childID: "ses_x" })
+    const first = notifier.notify({ action: "delete", childID: "ses_a" })
+    const second = notifier.notify({ action: "delete", childID: "ses_b" })
+    expect(await Promise.all([pending, first, second])).toEqual([true, true, true])
+    expect(calls.map((call: any) => call.metadata.action)).toEqual(["keep", "delete", "delete"])
+    expect(calls[1].metadata.childID).toBe("ses_a")
+    expect(calls[2].metadata.childID).toBe("ses_b")
+    // 任何时刻只有一条通知在投递：两个立即操作不会并发入队。
+    expect(stats.maxInFlight).toBe(1)
     notifier.dispose()
   })
 

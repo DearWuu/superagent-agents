@@ -464,13 +464,13 @@ describe("createQuotaFallback", () => {
     controller.dispose()
   })
 
-  test("超时前连续多次失败：不重复计时，也不提前切", async () => {
-    const { controller, calls, logs } = fallbackHarness()
+  test("窗口内失败达到阈值：立即切换一次，不重复计时", async () => {
+    // 窗口拉长到不会到期：这里只验证「阈值到达即切」这条路径。
+    const { controller, calls, logs } = fallbackHarness({ timeoutMs: 10_000 })
     await failTimes(controller, 3)
-    expect(calls).toHaveLength(0)
-    expect(logs.filter((record) => record.event === "fallback-armed")).toHaveLength(1)
-    expect(await waitFor(() => calls.length === 1)).toBe(true)
     expect(calls).toHaveLength(1)
+    expect(logs.filter((record) => record.event === "fallback-armed")).toHaveLength(1)
+    expect(logs.filter((record) => record.event === "fallback-threshold-reached")).toHaveLength(1)
     controller.dispose()
   })
 
@@ -756,9 +756,10 @@ describe("critic 触发判定", () => {
     expect(shouldCriticReview({ ...base, entries: [{ key: "superagent.critic-enabled", value: "false" }] })).toBe(false)
   })
 
-  test("critic 会话不递归复核：标题前缀与 metadata 标记都算", () => {
-    expect(shouldCriticReview({ ...base, child: { title: `${CRITIC_TITLE_PREFIX}修复登录` } })).toBe(false)
-    expect(shouldCriticReview({ ...base, child: { title: "[critic] 修复登录" } })).toBe(false)
+  test("critic 身份只认 metadata 标记：标题前缀不再作为依据", () => {
+    // 标题带前缀的普通子代理照常复核；只有 metadata 标记才是 critic。
+    expect(shouldCriticReview({ ...base, child: { title: `${CRITIC_TITLE_PREFIX}修复登录` } })).toBe(true)
+    expect(shouldCriticReview({ ...base, child: { title: "[critic] 修复登录" } })).toBe(true)
     expect(shouldCriticReview({ ...base, child: { metadata: { "superagent.critic": true } } })).toBe(false)
   })
 
@@ -777,16 +778,22 @@ describe("超时探针判定", () => {
     expect(shouldProbe(busyAt(PROBE_AFTER_MS - 1), NOW, new Set())).toBe(false)
   })
 
-  test("没有开工、已有 idle、已有 outcome 或已探过都不探", () => {
+  test("没有开工、回合已结束或已探过都不探；残留 idle/outcome 不再排除", () => {
     expect(shouldProbe({ id: "ses_child" }, NOW, new Set())).toBe(false)
+    // idle 不早于 busy：当前回合已结束。
     expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), idle: NOW - 1000 }, NOW, new Set())).toBe(false)
-    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), outcome: "succeeded" }, NOW, new Set())).toBe(false)
-    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), outcome: "failed" }, NOW, new Set())).toBe(false)
+    // 残留的 idle 早于 busy、残留 outcome 都不再排除：忙碌周期仍开着就要探。
+    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), idle: NOW - PROBE_AFTER_MS - 1 }, NOW, new Set())).toBe(true)
+    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), outcome: "succeeded" }, NOW, new Set())).toBe(true)
+    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), outcome: "failed" }, NOW, new Set())).toBe(true)
     expect(shouldProbe(busyAt(PROBE_AFTER_MS), NOW, new Set(["ses_child"]))).toBe(false)
+    // 忙碌周期变了要允许再探一次；同一个 busy 才跳过。
+    expect(shouldProbe(busyAt(PROBE_AFTER_MS), NOW, new Map([["ses_child", NOW - PROBE_AFTER_MS]]))).toBe(false)
+    expect(shouldProbe(busyAt(PROBE_AFTER_MS), NOW, new Map([["ses_child", NOW]]))).toBe(true)
   })
 
-  test("critic 会话不探：标题前缀与 metadata 标记都算", () => {
-    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), title: `${CRITIC_TITLE_PREFIX}x` }, NOW, new Set())).toBe(false)
+  test("critic 会话不探：只认 metadata 标记，标题前缀不再排除", () => {
+    expect(shouldProbe({ ...busyAt(PROBE_AFTER_MS), title: `${CRITIC_TITLE_PREFIX}x` }, NOW, new Set())).toBe(true)
     expect(
       shouldProbe({ ...busyAt(PROBE_AFTER_MS), metadata: { "superagent.critic": true } }, NOW, new Set()),
     ).toBe(false)
@@ -861,11 +868,12 @@ describe("createProbeScanner", () => {
     expect(logs.filter((record) => record.event === "probe-failed")).toHaveLength(1)
   })
 
-  test("没到阈值、已结束与 critic 会话都不发", async () => {
+  test("没到阈值、回合已结束与 critic 会话都不发", async () => {
     const { scanner, sent } = harness([
       { id: "ses_young", busy: NOW - 1000 },
-      { id: "ses_done", busy: NOW - PROBE_AFTER_MS - 1000, outcome: "succeeded" },
-      { id: "ses_critic", busy: NOW - PROBE_AFTER_MS - 1000, title: `${CRITIC_TITLE_PREFIX}x` },
+      // idle 不早于 busy：当前忙碌周期已经结束；残留 outcome 不单独作为排除依据。
+      { id: "ses_done", busy: NOW - PROBE_AFTER_MS - 1000, idle: NOW - 500, outcome: "succeeded" },
+      { id: "ses_critic", busy: NOW - PROBE_AFTER_MS - 1000, metadata: { "superagent.critic": true } },
     ])
     expect(await scanner.scan()).toBe(0)
     expect(sent).toHaveLength(0)

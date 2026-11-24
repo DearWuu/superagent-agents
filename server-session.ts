@@ -116,15 +116,53 @@ export function eventData(event: any): Record<string, any> {
   return isObject(event?.data) ? event.data : {}
 }
 
+/** sessionID → 上一条 metadata 写入链；链尾自清理，失败不阻塞后续链。 */
+const metadataChains = new Map<string, Promise<unknown>>()
+
+/**
+ * 按 sessionID 串行的 metadata 读-改-写：链内重读最新值再提交，
+ * 避免 after 钩子、`session.created` 与完成通知互相覆盖。
+ */
+export function updateSessionMetadata(
+  ctx: any,
+  sessionID: string,
+  mutate: (current: Record<string, unknown> | undefined) => Record<string, unknown> | undefined,
+): Promise<boolean> {
+  const previous = metadataChains.get(sessionID) ?? Promise.resolve()
+  const run = previous.then(async () => {
+    // 读失败按「无既有 metadata」继续：标记本身不能因此丢掉。
+    let current: Record<string, unknown> | undefined
+    try {
+      const info = await ctx.session.get({ sessionID })
+      current = isObject(info) && isObject(info.metadata) ? info.metadata : undefined
+    } catch {
+      current = undefined
+    }
+    const next = mutate(current)
+    if (!next) return false
+    await ctx.session.update({ sessionID, metadata: next })
+    return true
+  })
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  metadataChains.set(sessionID, tail)
+  void tail.then(() => {
+    if (metadataChains.get(sessionID) === tail) metadataChains.delete(sessionID)
+  })
+  return run
+}
+
 /** 把旗舰标记写到 child 自身；保留原有 metadata，不写 root。 */
 export async function markFlagshipSession(
   ctx: any,
   input: { sessionID: string; parentID?: string; model: unknown; metadata?: Record<string, unknown> },
 ): Promise<boolean> {
-  const existing = input.metadata ?? (await readSessionMetadata(ctx, input.sessionID))
-  const next = withFlagshipMarker(existing, input.model, Date.now())
-  if (!next) return false
-  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  const marked = await updateSessionMetadata(ctx, input.sessionID, (current) =>
+    withFlagshipMarker(current ?? input.metadata, input.model, Date.now()),
+  )
+  if (!marked) return false
   log({
     event: "flagship-marked",
     decision: "allow",
@@ -146,10 +184,10 @@ export async function markModelDelegationSession(
     phase?: "created" | "completed"
   },
 ): Promise<boolean> {
-  const existing = input.metadata ?? (await readSessionMetadata(ctx, input.sessionID))
-  const next = withModelDelegationMarker(existing, input.model, Date.now())
-  if (!next) return false
-  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  const marked = await updateSessionMetadata(ctx, input.sessionID, (current) =>
+    withModelDelegationMarker(current ?? input.metadata, input.model, Date.now()),
+  )
+  if (!marked) return false
   log({
     event: "model-delegation-marked",
     decision: "allow",
@@ -169,16 +207,15 @@ export async function markRuntimeBackground(
   ctx: any,
   input: { sessionID: string; background: unknown; at?: number },
 ): Promise<boolean> {
-  const existing = await readSessionMetadata(ctx, input.sessionID)
-  const next = {
-    ...(existing ?? {}),
+  const marked = await updateSessionMetadata(ctx, input.sessionID, (current) => ({
+    ...(current ?? {}),
     [RUNTIME_METADATA_KEY]: {
       state: RUNTIME_STATE_BACKGROUND,
       at: input.at ?? Date.now(),
       background: input.background,
     },
-  }
-  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  }))
+  if (!marked) return false
   log({
     event: "runtime-marked",
     decision: "allow",
@@ -190,21 +227,23 @@ export async function markRuntimeBackground(
 
 /** 清掉运行状态标记：后台任务结束或通知送达后调用；其余标记原样保留。 */
 export async function clearRuntimeState(ctx: any, sessionID: string): Promise<boolean> {
-  const existing = await readSessionMetadata(ctx, sessionID)
-  if (!existing || !(RUNTIME_METADATA_KEY in existing)) return false
-  const next = { ...existing }
-  delete next[RUNTIME_METADATA_KEY]
-  await ctx.session.update({ sessionID, metadata: next })
+  const cleared = await updateSessionMetadata(ctx, sessionID, (current) => {
+    if (!current || !(RUNTIME_METADATA_KEY in current)) return undefined
+    const next = { ...current }
+    delete next[RUNTIME_METADATA_KEY]
+    return next
+  })
+  if (!cleared) return false
   log({ event: "runtime-cleared", decision: "allow", sessionID })
   return true
 }
 
 async function clearFlagshipSession(ctx: any, input: { sessionID: string; parentID?: string; reason: string }) {
-  const existing = await readSessionMetadata(ctx, input.sessionID)
-  if (!hasFlagshipMarker(existing)) return false
-  const next = withoutFlagshipMarker(existing)
-  if (!next) return false
-  await ctx.session.update({ sessionID: input.sessionID, metadata: next })
+  const cleared = await updateSessionMetadata(ctx, input.sessionID, (current) => {
+    if (!hasFlagshipMarker(current)) return undefined
+    return withoutFlagshipMarker(current)
+  })
+  if (!cleared) return false
   log({
     event: "flagship-cleared",
     decision: "allow",
@@ -249,8 +288,9 @@ export async function findRoot(ctx: any, sessionID: string): Promise<string> {
 }
 
 /**
- * 读上限：从 caller 向上找第一个带任意 `superagent.*` 指令条目的会话，
- * 取其 `superagent.max-subagents`；缺省 5，非法值回退 5。
+ * 读上限：从 caller 向上找最近一个带 `superagent.max-subagents` 条目的会话，
+ * 取其值（缺省 5，非法值回退 5）；链到顶仍未命中则按缺省值放行。
+ * 只带其它 `superagent.*` 条目的会话不下拉上限，继续向上继承。
  */
 export async function readLimit(
   ctx: any,
@@ -258,14 +298,11 @@ export async function readLimit(
   rootID: string,
 ): Promise<{ limit: number; source?: string; entries?: any[] }> {
   let current = callerID
+  let entries: any[] = []
   const seen = new Set<string>([callerID])
   for (;;) {
-    const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: current }))
-    if (
-      entries.some(
-        (entry) => typeof entry?.key === "string" && entry.key.startsWith("superagent."),
-      )
-    ) {
+    entries = asArray(await ctx.session.instructions.entry.list({ sessionID: current }))
+    if (entries.some((entry) => entry?.key === MAX_SUBAGENTS_KEY)) {
       const raw = entries.find((entry) => entry?.key === MAX_SUBAGENTS_KEY)?.value
       const parsed = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN
       return {
@@ -281,7 +318,7 @@ export async function readLimit(
     seen.add(parentID)
     current = parentID
   }
-  return { limit: DEFAULT_MAX_SUBAGENTS }
+  return { limit: DEFAULT_MAX_SUBAGENTS, source: current, entries }
 }
 
 /**

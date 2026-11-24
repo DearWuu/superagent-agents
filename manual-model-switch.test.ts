@@ -44,6 +44,8 @@ function panelHarness(options: HarnessOptions = {}) {
   const instructionRemovals: string[] = []
   const notices: Array<{ childID?: string; childTitle?: string; value: string }> = []
   const policyNotices: Array<{ policy: "auto" | "inherit" | "fixed"; value?: string }> = []
+  const childPolicyNotices: Array<{ childID: string; childTitle?: string; policy: string }> = []
+  const metadataUpdates: Array<{ sessionID: string; metadata: Record<string, unknown> }> = []
   const toasts: string[] = []
   const policies: Record<string, string> = {}
   const selections = [...(options.selections ?? [])]
@@ -90,6 +92,9 @@ function panelHarness(options: HarnessOptions = {}) {
         },
       },
       session: {
+        update: async (input: { sessionID: string; metadata: Record<string, unknown> }) => {
+          metadataUpdates.push(input)
+        },
         interrupt: async ({ sessionID }: { sessionID: string }) => {
           calls.push(`interrupt:${sessionID}`)
         },
@@ -191,11 +196,15 @@ function panelHarness(options: HarnessOptions = {}) {
     pickerFavorites: () => new Set(),
     pickerKey: () => "",
     putInstruction: async () => undefined,
+    removeInstruction: async () => undefined,
     notifyModelChange: async (input) => {
       notices.push(input)
     },
     notifyDefaultPolicy: async (input) => {
       policyNotices.push(input)
+    },
+    notifyChildPolicy: async (input) => {
+      childPolicyNotices.push(input)
     },
   })
 
@@ -209,7 +218,19 @@ function panelHarness(options: HarnessOptions = {}) {
     children: [],
   }
 
-  return { actions, node, calls, switched, instructionWrites, instructionRemovals, notices, policyNotices, toasts }
+  return {
+    actions,
+    node,
+    calls,
+    switched,
+    instructionWrites,
+    instructionRemovals,
+    notices,
+    policyNotices,
+    childPolicyNotices,
+    metadataUpdates,
+    toasts,
+  }
 }
 
 describe("TUI 切换模型：直接 switchModel", () => {
@@ -255,25 +276,57 @@ describe("TUI 切换模型：直接 switchModel", () => {
     expect(h.toasts).toContain("已切换模型 Kong")
   })
 
-  test("auto/inherit 只发策略通知；inherit 直接切换且失败不补发模型通知", async () => {
+  test("每子代理 auto/inherit/fixed 写策略元数据并发该子代理通知，不发全局默认策略通知", async () => {
     const auto = panelHarness({ selections: [{ kind: "auto" }] })
     await auto.actions.openModel(auto.node as never)
     expect(auto.calls).toEqual([])
     expect(auto.notices).toEqual([])
-    expect(auto.policyNotices).toEqual([{ policy: "auto" }])
+    expect(auto.policyNotices).toEqual([])
+    expect(auto.childPolicyNotices).toEqual([
+      { childID: "ses_child", childTitle: "实现接口", policy: "auto" },
+    ])
+    expect(auto.metadataUpdates.at(-1)).toEqual({
+      sessionID: "ses_child",
+      metadata: { "superagent.model-policy": "auto" },
+    })
 
     const inherit = panelHarness({ selections: [{ kind: "inherit" }] })
     await inherit.actions.openModel(inherit.node as never)
     expect(inherit.calls).toEqual(["switch:ses_child"])
     expect(inherit.switched[0]!.model).toEqual(rootModel)
-    expect(inherit.notices).toEqual([])
-    expect(inherit.policyNotices).toEqual([{ policy: "inherit" }])
+    // inherit 真实切换成功后同样回传模型变更。
+    expect(inherit.notices).toEqual([{ childID: "ses_child", childTitle: "实现接口", value: "Root 模型" }])
+    expect(inherit.policyNotices).toEqual([])
+    expect(inherit.childPolicyNotices).toEqual([
+      { childID: "ses_child", childTitle: "实现接口", policy: "inherit" },
+    ])
 
     const failed = panelHarness({ failSwitch: true, selections: [{ kind: "inherit" }] })
     await failed.actions.openModel(failed.node as never)
     expect(failed.calls).toEqual(["switch:ses_child"])
     expect(failed.notices).toEqual([])
-    expect(failed.policyNotices).toEqual([{ policy: "inherit" }])
+    expect(failed.policyNotices).toEqual([])
+    expect(failed.childPolicyNotices).toEqual([
+      { childID: "ses_child", childTitle: "实现接口", policy: "inherit" },
+    ])
+  })
+
+  test("每子代理 fixed 写策略元数据且保留其他 metadata 键", async () => {
+    const h = panelHarness({
+      flagship: true,
+      selections: [{ kind: "choose" }, { providerID: "acme", modelID: "kong" }],
+    })
+    await h.actions.openModel(h.node as never)
+    expect(h.childPolicyNotices).toEqual([
+      { childID: "ses_child", childTitle: "实现接口", policy: "fixed" },
+    ])
+    const update = h.metadataUpdates.at(-1)!
+    expect(update.sessionID).toBe("ses_child")
+    expect(update.metadata["superagent.model-policy"]).toBe("fixed")
+    expect(update.metadata["superagent.flagship"]).toEqual({
+      source: "explicit-subagent-delegation",
+      model: flash,
+    })
   })
 
   test("共享路径：运行中的直接 switchModelCore 只切一次，无中断/续跑/标记", async () => {

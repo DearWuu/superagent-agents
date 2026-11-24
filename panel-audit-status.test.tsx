@@ -44,6 +44,7 @@ type Session = {
   title?: string
   agent?: string
   model?: { providerID: string; id: string; variant?: string }
+  metadata?: Record<string, unknown>
   outcome?: "succeeded" | "failed" | "interrupted"
   time?: { created: number; updated: number; archived?: number; busy?: number; idle?: number }
 }
@@ -322,7 +323,15 @@ test("critic 复核会话不占子代理名额：计数与淘汰都不算它", a
     instructions: { "superagent.max-subagents": "1" },
     children: [
       { id: "child", parentID: "root", title: "正常子代理", agent: "executor", model: rootModel, time: { created: 2, updated: 400 } },
-      { id: "critic", parentID: "root", title: "Critic: 复核 正常子代理", agent: "explore", model: rootModel, time: { created: 3, updated: 300 } },
+      {
+        id: "critic",
+        parentID: "root",
+        title: "Critic: 复核 正常子代理",
+        agent: "explore",
+        model: rootModel,
+        metadata: { "superagent.critic": true },
+        time: { created: 3, updated: 300 },
+      },
     ],
   })
   try {

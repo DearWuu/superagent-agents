@@ -312,6 +312,7 @@ export function SidebarAgents(props: {
     saveInstructionText,
     initializeInstructions,
     restoreDefaults,
+    ensureFallbackQuotaDefaults,
     writeKeptEntry,
   } = createInstructionActions({
     context: props.context,
@@ -428,11 +429,11 @@ export function SidebarAgents(props: {
     if (!value) return SUPERAGENT_DEFAULTS.statusWatch
     return value !== "false"
   })
-  /** `GLM-5.3 · 60 秒未恢复自动切换 · 已启用`; `未设置` without a model. */
+  /** `GLM-5.3 · 60 秒窗口内累计失败达阈值即切换 · 已启用`; `未设置` without a model. */
   const fallbackSummary = createMemo(() => {
     const label = modelEntryLabel(INSTRUCTION_KEYS.fallbackModel)
     const status = fallbackEnabled() ? "已启用" : "已停用"
-    return `${label || "未设置"}${SEPARATOR}60 秒未恢复自动切换${SEPARATOR}${status}`
+    return `${label || "未设置"}${SEPARATOR}60 秒窗口内累计失败达阈值即切换${SEPARATOR}${status}`
   })
   const subagentFallbackSummary = createMemo(() => {
     const label = modelEntryLabel(INSTRUCTION_KEYS.subagentFallbackModel)
@@ -528,43 +529,46 @@ export function SidebarAgents(props: {
    * update unpinned children; a pinned child is written only when created or
    * when its own pin changes.
    */
+  type OversightDesired = { sessionID: string; level: number; pinned: boolean; assignment: string }
   const oversightSynced = new Map<string, { level: number; pinned: boolean; assignment: string }>()
   let syncingOversight = false
-  async function syncChildOversightEntries(
-    rootID: string,
-    desired: Array<{
-      sessionID: string
-      level: number
-      pinned: boolean
-      assignment: string
-    }>,
-  ) {
-    if (syncingOversight) return
+  let pendingOversight: { rootID: string; desired: OversightDesired[] } | undefined
+  async function syncChildOversightEntries(rootID: string, desired: OversightDesired[]) {
+    if (syncingOversight) {
+      // 同步中又收到新的 desired：只记最新一批，本轮结束后接着跑，不丢弃。
+      pendingOversight = { rootID, desired }
+      return
+    }
     syncingOversight = true
     try {
-      for (const child of desired) {
-        const previous = oversightSynced.get(child.sessionID)
-        const changed =
-          !previous ||
-          previous.level !== child.level ||
-          previous.pinned !== child.pinned ||
-          (!child.pinned && previous.assignment !== child.assignment)
-        if (!changed) continue
-        try {
-          if (previous?.level !== child.level || !previous) {
-            await putSessionInstruction(child.sessionID, INSTRUCTION_KEYS.oversightLevel, child.level)
+      let job: { rootID: string; desired: OversightDesired[] } | undefined = { rootID, desired }
+      while (job) {
+        pendingOversight = undefined
+        for (const child of job.desired) {
+          const previous = oversightSynced.get(child.sessionID)
+          const changed =
+            !previous ||
+            previous.level !== child.level ||
+            previous.pinned !== child.pinned ||
+            (!child.pinned && previous.assignment !== child.assignment)
+          if (!changed) continue
+          try {
+            if (previous?.level !== child.level || !previous) {
+              await putSessionInstruction(child.sessionID, INSTRUCTION_KEYS.oversightLevel, child.level)
+            }
+            if (!child.pinned || !previous || previous.pinned !== child.pinned || previous.assignment !== child.assignment) {
+              await putSessionInstruction(child.sessionID, INSTRUCTION_KEYS.assignmentPrompt, child.assignment)
+            }
+            oversightSynced.set(child.sessionID, {
+              level: child.level,
+              pinned: child.pinned,
+              assignment: child.assignment,
+            })
+          } catch {
+            // A child that cannot be written keeps its previous entries; retry on the next change.
           }
-          if (!child.pinned || !previous || previous.pinned !== child.pinned || previous.assignment !== child.assignment) {
-            await putSessionInstruction(child.sessionID, INSTRUCTION_KEYS.assignmentPrompt, child.assignment)
-          }
-          oversightSynced.set(child.sessionID, {
-            level: child.level,
-            pinned: child.pinned,
-            assignment: child.assignment,
-          })
-        } catch {
-          // A child that cannot be written keeps its previous entries; retry on the next change.
         }
+        job = pendingOversight
       }
     } finally {
       syncingOversight = false
@@ -691,7 +695,15 @@ export function SidebarAgents(props: {
         : scoped.defaultPolicy === "inherit"
           ? rootModelRef
           : undefined
-    if (!target) return
+    if (!target) {
+      // 没有唯一目标（auto/未配置）：清掉本 root 的同步状态，正在跑的批次
+      // 也不会在结束后把子代理切到已放弃的旧目标。
+      const idle = defaultSyncState(current.id)
+      idle.lastKey = undefined
+      idle.appliedKey = undefined
+      idle.pending = undefined
+      return
+    }
     const key = `${scoped.defaultPolicy}|${modelKey(target)}`
     const state = defaultSyncState(current.id)
     if (key === state.lastKey) return
@@ -939,11 +951,15 @@ export function SidebarAgents(props: {
     pickerFavorites,
     pickerKey,
     putInstruction,
+    removeInstruction,
     notifyModelChange: async ({ childID, childTitle, value }) => {
       await notifyManual({ action: "model", childID, childTitle, detail: { value } })
     },
     notifyDefaultPolicy: async ({ policy, value }) => {
       await notifyManual({ action: "default-policy", detail: { policy, value } })
+    },
+    notifyChildPolicy: async ({ childID, childTitle, policy }) => {
+      await notifyManual({ action: "child-policy", childID, childTitle, detail: { policy } })
     },
   })
 
@@ -1150,6 +1166,8 @@ export function SidebarAgents(props: {
     const picked = await pickModel(title, current)
     if (!picked) return
     await putInstruction(entryKey, `${picked.providerID}/${picked.id}`)
+    // 配置了备用模型才需要限额切换：缺省的阈值与启用开关在这里补齐。
+    await ensureFallbackQuotaDefaults()
     const label = picked.model.name || picked.model.id
     props.context.ui.toast.show({ message: `${title}已设为 ${label}。` })
     await notifySetting(title, label)
@@ -1159,7 +1177,11 @@ export function SidebarAgents(props: {
     const selected = await props.context.ui.dialog.select<FallbackAction>({
       title: "限额自动切换备用模型",
       options: [
-        { value: { kind: "on" }, title: "已启用", description: "首次限额失败后 60 秒内没恢复就切到备用模型" },
+        {
+          value: { kind: "on" },
+          title: "已启用",
+          description: "60 秒窗口内累计限额失败达到阈值立即切换备用模型；未达阈值则窗口到期切换；窗口内任一成功即取消",
+        },
         { value: { kind: "off" }, title: "已停用", description: "限额错误只报错，不切换模型" },
       ],
       current: fallbackEnabled() ? { kind: "on" } : { kind: "off" },
@@ -1357,7 +1379,7 @@ export function SidebarAgents(props: {
   }
 
   async function openSettings() {
-    await initializeInstructions()
+    await initializeInstructions().catch(() => {})
     const current = policy()
     const selected = await props.context.ui.dialog.select<SettingsAction>({
       title: "agents协作设置",
@@ -1420,7 +1442,7 @@ export function SidebarAgents(props: {
         {
           value: { kind: "fallbackEnabled" },
           title: "限额自动切换备用模型",
-          description: fallbackEnabled() ? `已启用${SEPARATOR}60 秒未恢复自动切换` : "已停用",
+          description: fallbackEnabled() ? `已启用${SEPARATOR}60 秒窗口内累计失败达阈值即切换` : "已停用",
         },
         {
           value: { kind: "criticEnabled" },
@@ -1510,10 +1532,20 @@ export function SidebarAgents(props: {
     const next = { ...root().keptSubagents }
     if (kept) delete next[sessionID]
     else next[sessionID] = true
+    const previous = { ...root().keptSubagents }
     await updateRoot((draft) => {
       draft.keptSubagents = next
     })
-    await writeKeptEntry(next).catch(() => {})
+    try {
+      await writeKeptEntry(next)
+    } catch (error) {
+      // 服务端只认条目：写失败时回滚本地保护，明说未生效，不发成功通知。
+      await updateRoot((draft) => {
+        draft.keptSubagents = previous
+      })
+      props.context.ui.toast.show({ message: `${title} 的保护状态未生效：${errorText(error)}` })
+      return
+    }
     props.context.ui.toast.show({
       message: kept
         ? `${node.title} 已取消保护，可被自动淘汰，模型也可以被修改。`

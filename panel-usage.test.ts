@@ -156,8 +156,11 @@ describe("SUPERAGENT_DEFAULTS 提示词", () => {
   test("assignment 合并范围、歧义与升级规则，task 默认不再重复", () => {
     const assignment = tui.SUPERAGENT_DEFAULTS.assignmentPrompt
     expect(assignment).toContain("按任务书执行，不扩大范围")
-    expect(assignment).toContain("需求不清先提问")
+    expect(assignment).toContain("需求不清不得向用户提问")
+    expect(assignment).toContain("把问题与建议写进报告由 Superagent 裁决")
+    expect(assignment).toContain("不得派发子代理")
     expect(assignment).toContain("遇到能力升级先报告")
+    expect(assignment).not.toContain("需求不清先提问")
     expect(tui.SUPERAGENT_DEFAULTS.taskPrompt).toBe("")
   })
 })

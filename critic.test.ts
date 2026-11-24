@@ -242,10 +242,12 @@ describe("critic prompt evidence rules", () => {
 })
 
 describe("critic session identity", () => {
-  test("a marker identifies a critic session", () => {
+  test("只有 marker 才是复核身份，标题前缀不作依据", () => {
     expect(isCriticSession({ metadata: { "superagent.critic": true } })).toBe(true)
-    expect(isCriticSession({ title: `${CRITIC_TITLE_PREFIX}x` })).toBe(true)
+    expect(isCriticSession({ title: `${CRITIC_TITLE_PREFIX}x` })).toBe(false)
     expect(isCriticSession({ title: "普通会话" })).toBe(false)
+    expect(isCriticSession({ metadata: { "superagent.critic": "true" } })).toBe(false)
+    expect(isCriticSession(undefined)).toBe(false)
   })
 })
 
@@ -269,7 +271,9 @@ describe("critic review", () => {
 
   test("a critic session is never reviewed again", async () => {
     const auditDir = await tempDir()
-    const mock = mockClient({ childSession: { id: "child-1", title: `${CRITIC_TITLE_PREFIX}修复登录` } })
+    const mock = mockClient({
+      childSession: { id: "child-1", title: "修复登录", metadata: { "superagent.critic": true } },
+    })
 
     const result = await criticReview(
       { client: mock.client, childSessionID: "child-1", rootID: "root-1", reportText: "报告" },
@@ -338,5 +342,26 @@ describe("critic review", () => {
     expect(row.verdict).toBe("严重不一致")
     expect(row.differences).toEqual(["报告造假"])
     expect(typeof row.durationMs).toBe("number")
+  })
+
+  test("审计目录认 SUPERERAGENT_STATE_DIR：与监管审计、面板读取同一份状态根", async () => {
+    const stateDir = await tempDir()
+    const previous = process.env.SUPERAGENT_STATE_DIR
+    process.env.SUPERAGENT_STATE_DIR = stateDir
+    try {
+      const mock = mockClient()
+
+      const result = await criticReview(
+        { client: mock.client, childSessionID: "child-1", rootID: "root-1", reportText: "报告" },
+      )
+
+      expect(path.dirname(result.auditPath)).toBe(path.join(stateDir, "critic"))
+      expect(path.basename(result.auditPath)).toBe(`${new Date().toISOString().slice(0, 10)}.jsonl`)
+      const raw = await readFile(result.auditPath, "utf8")
+      expect(raw.trim().length).toBeGreaterThan(0)
+    } finally {
+      if (previous === undefined) delete process.env.SUPERAGENT_STATE_DIR
+      else process.env.SUPERAGENT_STATE_DIR = previous
+    }
   })
 })

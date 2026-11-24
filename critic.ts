@@ -11,13 +11,15 @@
  * a failed delete degrades to `证据不足` instead of throwing.
  */
 
+import { stateRoot } from "./server-state"
+
 export const CRITIC_VERDICTS = ["一致", "部分不一致", "严重不一致", "证据不足"] as const
 export type CriticVerdict = (typeof CRITIC_VERDICTS)[number]
 
 /** The read-only agent the critic runs as. */
 export const CRITIC_AGENT = "explore"
 
-/** Title prefix of a critic session; also used to recognise one. */
+/** Title prefix of a critic session; display name only, not an identity. */
 export const CRITIC_TITLE_PREFIX = "Critic: 复核 "
 
 /** Metadata key that marks a session as a critic session. */
@@ -118,14 +120,9 @@ export type CriticAuditRow = {
   readonly note?: string
 }
 
-/** True when a session is a critic session and must not be reviewed again. */
-export function isCriticSession(
-  session: { readonly title?: string; readonly metadata?: Record<string, unknown> } | undefined,
-): boolean {
-  if (!session) return false
-  if (session.metadata?.[CRITIC_MARKER_KEY] === true) return true
-  const title = session.title ?? ""
-  return title.startsWith(CRITIC_TITLE_PREFIX) || title.startsWith("[critic]")
+/** True when a session carries the critic marker and must not be reviewed again. */
+export function isCriticSession(session: { readonly metadata?: Record<string, unknown> } | undefined): boolean {
+  return session?.metadata?.[CRITIC_MARKER_KEY] === true
 }
 
 /**
@@ -454,9 +451,8 @@ export async function criticReview(
       criticSessionID = created.id
       throwIfAborted(options.signal)
 
-      // The marker is written after creation, so the critic session keeps the
-      // metadata it inherited from its parent and the title already identifies
-      // it even when this patch fails.
+      // 身份只认 marker：这一步写失败，本会话不会被当成复核会话（它随后仍会被删除，
+      // 但期间可能被计数或再次复核）。
       await input.client.session.update({
         sessionID: created.id,
         metadata: {
@@ -612,11 +608,10 @@ function errorText(cause: unknown): string {
   return String(cause)
 }
 
+/** 审计目录与监管审计、面板读取同一份状态根：`SUPERAGENT_STATE_DIR` 优先。 */
 async function defaultAuditDir(): Promise<string> {
-  const os = await import("node:os")
   const path = await import("node:path")
-  const state = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
-  return path.join(state, "opencode", "superagent", "critic")
+  return path.join(stateRoot(), "critic")
 }
 
 async function auditPathFor(auditDir: string, at: Date): Promise<string> {

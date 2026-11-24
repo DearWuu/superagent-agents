@@ -46,6 +46,8 @@ export type ServerEventDeps = {
     forget: (sessionID: string) => void
   }
   markDelegationOnSessionCreated: (event: any) => Promise<void>
+  /** 新子会话实体化一条待处理派工；缺失时只跳过，不影响事件循环。 */
+  materializePendingCall?: (event: any) => Promise<void> | void
   handleSessionModelSelected: (event: any) => Promise<void>
   reviewAfterSuccess: (sessionID: string, claimID?: string) => Promise<void> | void
   triggerQuotaFallback: (sessionID: string, error: unknown, model?: unknown) => Promise<unknown>
@@ -140,6 +142,19 @@ async function handleServerEvent(event: any, deps: ServerEventDeps) {
     } catch (cause) {
       deps.log({
         event: "model-delegation-mark-failed",
+        decision: "error",
+        phase: "created",
+        type: event.type,
+        childSessionID: eventSessionID(event),
+        cause: errorText(cause),
+      })
+    }
+    // 实体化消费在途条目：失败只记日志，不影响后续事件与派工。
+    try {
+      await deps.materializePendingCall?.(event)
+    } catch (cause) {
+      deps.log({
+        event: "dispatch-materialize-failed",
         decision: "error",
         phase: "created",
         type: event.type,

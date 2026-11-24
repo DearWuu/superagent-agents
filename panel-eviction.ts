@@ -9,7 +9,7 @@ import type { Plugin } from "@opencode/plugin/tui"
 import type { AgentNode } from "./agent-tree"
 import { isFlagshipSession } from "./flagship"
 import { appendOversightEvent } from "./panel-critic"
-import { subagentTitle } from "./panel-utils"
+import { errorText, subagentTitle } from "./panel-utils"
 import type { RootSettings } from "./session-scope"
 import type { SessionInfo } from "./panel-types"
 import { planEviction, type SubagentChild } from "./subagent-limit"
@@ -111,6 +111,13 @@ export function createEvictionActions(deps: {
       })
       const victims = plan.victims.filter((victim) => !evicting.has(victim.id))
       if (victims.length > 0) await removeEvictionVictims(victims, { limit, label: "超出旗舰上限" })
+    } catch (error) {
+      // 顶层异常不能变成未处理的 rejection：记录一次并提示，下一轮照常重试。
+      void appendOversightEvent("evict-error", {
+        rootSessionID: rootSessionID(),
+        error: errorText(error),
+      }).catch(() => {})
+      context.ui.toast.show({ message: `自动淘汰失败：${errorText(error)}` })
     } finally {
       pruning = false
     }

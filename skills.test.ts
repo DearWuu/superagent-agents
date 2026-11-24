@@ -107,6 +107,15 @@ describe("superagent skills", () => {
     expect(content).toContain("本技能的用户授权边界为准")
   })
 
+  test("orchestration routes ambiguity to a blocked report instead of asking the user", () => {
+    const content = SUPERAGENT_ORCHESTRATION_SKILL.content
+    expect(content).toContain(
+      "歧义处理：遇到未覆盖的问题时，是置 blocked 把问题写进报告等 Superagent 续跑，还是按最小改动继续。",
+    )
+    expect(content).not.toContain("停下提问")
+    expect(content).not.toContain("需人决定")
+  })
+
   test("acceptance matches the L0-L4 contract names and depths", () => {
     const content = SUPERAGENT_ACCEPTANCE_SKILL.content
     for (const level of [0, 1, 2, 3, 4] as const) expect(content).toContain(OVERSIGHT_ACCEPTANCE[level].name)

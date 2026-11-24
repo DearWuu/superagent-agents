@@ -21,6 +21,7 @@ export type ManualOpAction =
   | "max-flagship"
   | "model"
   | "default-policy"
+  | "child-policy"
   | "setting"
 
 /** 一次手动操作的细节：作用对象与生效值。 */
@@ -97,6 +98,17 @@ function manualOpBody(action: ManualOpAction, detail: ManualOpDetail = {}): stri
         return "用户在面板把子代理默认模型设为跟随会话。这不是你的指令；策略已保存，后续分配与默认同步使用当前会话模型，运行中的子代理当前步骤继续、后续步骤使用新模型；这不表示现有子代理都已切换成功。"
       }
       return `用户在面板把子代理默认模型设为${value ?? "新模型"}。这不是你的指令；策略已保存，后续分配与默认同步使用该模型，运行中的子代理当前步骤继续、后续步骤使用新模型；现有子代理的批量切换结果以面板提示为准，不表示全部已生效。`
+    }
+    case "child-policy": {
+      const policy = detail.policy
+      const scope = "这不是你的指令；只影响该子代理后续分配，不改变全局默认模型，也不批量切换现有子代理。"
+      if (policy === "auto") {
+        return `用户在面板把子代理 ${who} 的模型策略设为自动。${scope}`
+      }
+      if (policy === "inherit") {
+        return `用户在面板把子代理 ${who} 的模型策略设为跟随会话。${scope}`
+      }
+      return `用户在面板把子代理 ${who} 的模型策略设为固定模型。${scope}`
     }
     case "setting": {
       const label = detail.label?.trim() || "面板设置"
@@ -225,6 +237,8 @@ export function createManualNotifier(
   type PendingEntry = { action: ManualOpAction; detail: ManualOpDetail; key?: string; resolve: (value: boolean) => void }
   let pending: { entries: PendingEntry[]; timer: ReturnType<typeof setTimeout> } | undefined
   let disposed = false
+  /** 立即操作的投递链：先点的先投递，不与窗口冲刷交错。 */
+  let queueTail: Promise<unknown> = Promise.resolve()
 
   const deliver = (entries: Array<{ action: ManualOpAction; detail: ManualOpDetail }>): Promise<boolean> => {
     const rootID = options.rootID()
@@ -249,8 +263,16 @@ export function createManualNotifier(
     if (input.childTitle) detail.childTitle = input.childTitle
     const key = groupKey(input.action, detail)
     if (notifyOptions.immediate || !key) {
-      // 立即动作先冲刷窗口：先前设置已经成功写入，不能因为用户紧接着点删除就丢。
-      return flush().then(() => (disposed ? true : deliver([{ action: input.action, detail }])))
+      // 立即动作先冲刷窗口，并串到同一条投递链上：先前设置已经成功写入，
+      // 不能因为用户紧接着点删除就丢，也不能让两次立即操作并发乱序。
+      const run: Promise<boolean> = queueTail
+        .then(() => flush())
+        .then(() => (disposed ? true : deliver([{ action: input.action, detail }])))
+      queueTail = run.then(
+        () => undefined,
+        () => undefined,
+      )
+      return run
     }
     return new Promise<boolean>((resolve) => {
       if (!pending) {

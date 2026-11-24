@@ -36,6 +36,16 @@ describe("oversight acceptance", () => {
     for (const level of [0, 1, 2, 3, 4] as const) expect(oversightLevelForPin(level)).toBe(level)
   })
 
+  test("legacy score boundary never drops an L4 pin to L0", () => {
+    expect(oversightLevelForPin(4)).toBe(4)
+    expect(oversightLevelForPin(4.1)).toBe(4)
+    expect(oversightLevelForPin(4.6)).toBe(4)
+    expect(oversightLevelForPin(5)).toBe(0)
+    expect(oversightLevelForPin(58)).toBe(2)
+    expect(oversightLevelForPin(70)).toBe(3)
+    expect(oversightLevelForPin(Number.NaN)).toBe(2)
+  })
+
   test("the protocol shows the same acceptance semantics to root and child", () => {
     const root = resolveOversight({ pins: { global: 4 } })
     const child = resolveOversight({ pins: { sessions: { child: 4 } }, rootSessionID: "root", sessionID: "child" })
@@ -52,6 +62,37 @@ describe("oversight acceptance", () => {
     expect(text).toContain("真实输出指针")
     expect(text).toContain("真实截图")
     expect(text).toContain("复核方式：critic 复核遵循 root 的 critic 开关")
+  })
+})
+
+describe("subagent reporting boundary", () => {
+  test("the header asks for a Superagent decision instead of a human question", () => {
+    const text = renderReportOnlyProtocol(resolveOversight({}))
+    expect(text).toContain("待 Superagent 裁决：blocked 时必填，写清问题与你的建议")
+    expect(text).toContain("blocked=等 Superagent 裁决或等外部条件")
+    expect(text).not.toContain("需人决定")
+    expect(text).not.toContain("等人或等外部条件")
+  })
+
+  test("every level carries the communication boundary and the heartbeat resume rule", () => {
+    for (const level of [0, 1, 2, 3, 4] as const) {
+      const text = renderReportOnlyProtocol(pinned(level), "detailed")
+      expect(text).toContain("沟通边界：你是 Subagent，只向 Superagent 汇报")
+      expect(text).toContain("不得用 question 等任何方式向用户提问（会被拒绝）")
+      expect(text).toContain("不得派发子代理")
+      expect(text).toContain("不得据此断言工具不可用")
+      expect(text).toContain(
+        "收到 Superagent 的续跑或[状态探针]时先一行报状态再立刻继续剩余工作，不得停在简报",
+      )
+    }
+  })
+
+  test("acceptance tells the Superagent to rule on blocked reports", () => {
+    for (const level of [0, 1, 2, 3, 4] as const) {
+      expect(renderAcceptanceOnlyProtocol(pinned(level))).toContain(
+        "子代理置 blocked 并提请裁决时，由 Superagent 裁决后用续跑下达；子代理不会也无法向用户提问。",
+      )
+    }
   })
 })
 

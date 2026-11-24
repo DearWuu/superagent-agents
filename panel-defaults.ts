@@ -15,6 +15,7 @@ export const INSTRUCTION_KEYS = {
   oversight: "superagent.oversight",
   oversightLevel: "superagent.oversight-level",
   assignmentPrompt: "superagent.assignment-prompt",
+  defaultPolicy: "superagent.default-policy",
   defaultModel: "superagent.default-model",
   fallbackModel: "superagent.fallback-model",
   subagentFallbackModel: "superagent.subagent-fallback-model",
@@ -75,6 +76,7 @@ export const LEGACY_SESSION_PROMPTS = [
 
 export const LEGACY_ASSIGNMENT_PROMPTS = [
   "按任务书执行，不扩大范围；修改后运行约定验证；报告修改文件、测试命令与结果、未解决风险；报告时间取真实工具输出或通知时间，取不到写「未知」，不估写；需求不清先提问，不自行决定。",
+  "按任务书执行，不扩大范围；需求不清先提问，不自行决定；遇到能力升级先报告，不自行切换模型；报告时间取真实工具输出或通知时间，取不到写「未知」，不估写。",
 ]
 
 export const LEGACY_TASK_PROMPT = ""
@@ -105,7 +107,7 @@ export const SUPERAGENT_DEFAULTS = {
     "派工前使用 superagent-orchestration 技能，验收前使用 superagent-acceptance 技能，compact 或删除 Subagent 前使用 superagent-context 技能；详细规则见对应技能。",
   ].join("\n"),
   assignmentPrompt:
-    "按任务书执行，不扩大范围；需求不清先提问，不自行决定；遇到能力升级先报告，不自行切换模型；报告时间取真实工具输出或通知时间，取不到写「未知」，不估写。",
+    "按任务书执行，不扩大范围；需求不清不得向用户提问，把问题与建议写进报告由 Superagent 裁决；不得派发子代理；遇到能力升级先报告，不自行切换模型；报告时间取真实工具输出或通知时间，取不到写「未知」，不估写。",
   taskPrompt: "",
 } as const
 

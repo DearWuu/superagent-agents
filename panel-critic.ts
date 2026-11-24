@@ -1,14 +1,15 @@
 /** TUI 面板的 critic 记录与监管审计事件读取。 */
 
 import { appendFile, mkdir, readFile, readdir } from "node:fs/promises"
-import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+
+import { stateRoot } from "./server-state"
 
 export type CriticRecord = { verdict: string; differences: string[]; ts: string }
 
+/** 与 critic 审计同一份状态根：`SUPERAGENT_STATE_DIR` 优先，缺省 `~/.local/state/opencode/superagent`。 */
 export function criticDirectory() {
-  const state = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")
-  return join(state, "opencode", "superagent", "critic")
+  return join(stateRoot(), "critic")
 }
 
 /** Latest critic audit row per reviewed child session. */
@@ -49,8 +50,7 @@ export function criticView(verdict: string) {
 }
 
 export function oversightAuditPath(date = new Date()) {
-  const state = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")
-  return join(state, "opencode", "superagent", "oversight", `${date.toISOString().slice(0, 10)}.jsonl`)
+  return join(stateRoot(), "oversight", `${date.toISOString().slice(0, 10)}.jsonl`)
 }
 
 export async function appendOversightEvent(type: string, payload: Record<string, unknown>) {

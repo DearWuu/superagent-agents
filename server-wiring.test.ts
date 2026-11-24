@@ -228,7 +228,8 @@ describe("critic 自动接线（真实 setup + 假 ctx）", () => {
     const dispose = await (plugin as any).setup(h.ctx)
     h.events.push({ id: "evt_1", type: "session.execution.succeeded", data: { sessionID: "ses_child" } })
 
-    const auditFile = path.join(process.env.XDG_STATE_HOME!, "opencode", "superagent", "critic", `${new Date().toISOString().slice(0, 10)}.jsonl`)
+    // 复核审计落在状态根下（SUPERAGENT_STATE_DIR 优先，与监管审计同根）。
+    const auditFile = path.join(process.env.SUPERAGENT_STATE_DIR!, "critic", `${new Date().toISOString().slice(0, 10)}.jsonl`)
     expect(await waitFor(() => readJsonl(auditFile).length > 0)).toBe(true)
 
     // 复核会话按 root 挂载、用 explore、标题带前缀
@@ -387,16 +388,17 @@ describe("超时探针（真实 ctx 接线 + 注入时间）", () => {
     expect(h.prompts).toHaveLength(1)
   })
 
-  test("critic 会话与已完成会话不发", async () => {
+  test("critic 会话与回合已结束的会话不发", async () => {
     const critic = probeHarness(NOW - 31 * 60 * 1000, { title: "Critic: 复核 x", metadata: { "superagent.critic": true } })
     expect(await critic.scanner.scan()).toBe(0)
-    const done = probeHarness(NOW - 31 * 60 * 1000, { outcome: "succeeded" })
+    // 回合已结束要看 idle 不早于 busy；残留 outcome 不再单独排除（T1c 语义）。
+    const done = probeHarness(NOW - 31 * 60 * 1000, { time: { created: NOW - 31 * 60 * 1000, busy: NOW - 31 * 60 * 1000, idle: NOW - 1000 }, outcome: "succeeded" })
     expect(await done.scanner.scan()).toBe(0)
   })
 })
 
 describe("critic 会话不占子代理名额", () => {
-  test("listChildren 过滤掉挂在 root 下的 critic 复核会话", async () => {
+  test("listChildren 按 metadata 标记过滤 critic 会话，标题前缀不再作为依据", async () => {
     const { listChildren } = await import("./server")
     const now = Date.now()
     const ctx = {
@@ -411,7 +413,8 @@ describe("critic 会话不占子代理名额", () => {
       },
     }
     const children = await listChildren(ctx, "ses_root", now)
-    expect(children.map((child) => child.id)).toEqual(["ses_child"])
+    // 标题带 Critic 前缀但没有 metadata 标记：普通子代理，照常占名额。
+    expect(children.map((child) => child.id)).toEqual(["ses_child", "ses_critic"])
   })
 })
 

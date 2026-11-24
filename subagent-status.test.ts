@@ -149,6 +149,27 @@ describe("派发回执", () => {
     expect(text).not.toContain("完成后自动通知")
   })
 
+  test("background 且回执没有 state：按 running 算，也承诺完成后自动通知", () => {
+    const text = formatDispatchReceipt(record({ childID: "ses_x", background: true }))
+    expect(text).toContain("state=running")
+    expect(text).toContain("完成后自动通知")
+  })
+
+  test("前台派发没有 state：不承诺后续通知", () => {
+    const text = formatDispatchReceipt(record({ childID: "ses_x" }))
+    expect(text).toContain("state=completed")
+    expect(text).not.toContain("完成后自动通知")
+  })
+
+  test("background 但回执写明已完成：不承诺后续通知", () => {
+    const text = formatDispatchReceipt(record({ childID: "ses_x", background: true }), {
+      ok: true,
+      state: "completed",
+    })
+    expect(text).toContain("state=completed")
+    expect(text).not.toContain("完成后自动通知")
+  })
+
   test("告警追加 warning 段", () => {
     const text = formatDispatchReceipt(record({ warnings: ["查询失败，已放行：boom"] }))
     expect(text).toContain("warning=查询失败，已放行：boom")
@@ -295,6 +316,41 @@ describe("通知与提醒文案", () => {
     expect(formatWatchReminder({ childID: "ses_x", state: "error" })).toBe(
       "[superagent] 监测到子代理 ses_x 已停止（error），此前没有收到完成确认；如已知晓可忽略。",
     )
+  })
+})
+
+describe("卡片属性转义", () => {
+  test("description 含引号与换行：标签结构完整，读取侧仍按 indexOf(\">\") 判重", () => {
+    const description = '第一行 "quoted"\n第二行 state="running"'
+    const text = formatCompletionNotice({ childID: "ses_x", description, state: "completed", text: "报告正文" })
+    const opening = text.slice(0, text.indexOf("\n"))
+    // 开头标签仍然只有一行，且属性值已转义。
+    expect(opening.startsWith('<subagent sessionID="ses_x" state="completed" description="')).toBe(true)
+    expect(opening.endsWith('">')).toBe(true)
+    expect(opening).toContain("&quot;")
+    expect(opening).not.toContain('"quoted"')
+    expect(text).not.toContain("\n第二行")
+    // 读取侧按 indexOf(">") 截取标签：state 属性在 description 之前，仍能判重。
+    expect(noticeSaysStillRunning({ text }, "ses_x")).toBe(false)
+    expect(terminalNoticeSeen([{ text }], "ses_x", "completed")).toBe(true)
+  })
+
+  test("转义后的属性值不撑破 4000 字预算", () => {
+    const text = formatCompletionNotice({
+      childID: "ses_x",
+      description: '"'.repeat(5000),
+      state: "completed",
+      text: "b".repeat(5000),
+    })
+    expect(text.length).toBeLessThanOrEqual(MAX_NOTICE_TEXT_LENGTH)
+    expect(text.startsWith('<subagent sessionID="ses_x" state="completed" description="')).toBe(true)
+    expect(text.endsWith("\n</subagent>")).toBe(true)
+    // 结尾不能留下半截实体。
+    const opening = text.slice(0, text.indexOf("\n"))
+    expect(opening.endsWith('">')).toBe(true)
+    const value = opening.slice(opening.indexOf('description="') + 'description="'.length, -2)
+    expect(value.endsWith("&quot;")).toBe(true)
+    expect(value).not.toMatch(/&(q|qu|quo|quot)$/)
   })
 })
 
@@ -677,5 +733,139 @@ describe("收尾撞上忙碌读的兜底", () => {
     watcher.stop()
     await new Promise((resolve) => setTimeout(resolve, 40))
     expect(notices).toEqual([])
+  })
+})
+
+describe("对账预算、开关与收尾防御", () => {
+  /** 多子会话的看护器：每个 child 有独立的会话与消息。 */
+  function multiHarness(sessions: Map<string, any>, messages: Map<string, any[]>) {
+    const notices: any[] = []
+    const evicted: string[] = []
+    const cleared: string[] = []
+    const deps = {
+      nativeNoticeWaitMs: 5,
+      reconcileIntervalMs: 60_000,
+      settleRetryMs: 10_000,
+      settleRetryLimit: 0,
+      readSession: async (sessionID: string) => sessions.get(sessionID),
+      readMessages: async (sessionID: string) => messages.get(sessionID) ?? [],
+      readEntries: async () => [],
+      notifyParent: async (input: any) => {
+        notices.push(input)
+      },
+      markRuntime: async () => {},
+      clearRuntime: async (sessionID: string) => {
+        cleared.push(sessionID)
+      },
+      write: () => {},
+      evictExcess: async (input: { childID: string }) => {
+        evicted.push(input.childID)
+      },
+    }
+    return { deps, notices, evicted, cleared }
+  }
+
+  test("提醒预算用尽只跳过提醒本身，其他 watch 的收尾与淘汰仍推进", async () => {
+    const now = Date.now()
+    const stopped = { outcome: "succeeded", time: { busy: now, idle: now + 1 } }
+    const sessions = new Map<string, any>([
+      ["ses_parent", { id: "ses_parent", time: { busy: 1, idle: 2 } }],
+      ["ses_a", { id: "ses_a", ...stopped }],
+      ["ses_b", { id: "ses_b", ...stopped }],
+      ["ses_c", { id: "ses_c", ...stopped }],
+      ["ses_d", { id: "ses_d", ...stopped }],
+    ])
+    const { deps, notices, evicted } = multiHarness(sessions, new Map())
+    const watcher = createStatusWatcher(deps)
+    try {
+      // A、B、C 都要兜底完成通知（吃掉 2 次提醒预算），D 的原生终态卡已投递。
+      for (const childID of ["ses_a", "ses_b", "ses_c", "ses_d"]) {
+        await watcher.register({
+          childID,
+          parentID: "ses_parent",
+          rootID: "ses_root",
+          description: "任务",
+          agent: "worker",
+          background: true,
+        })
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      expect(watcher.size()).toBe(4)
+      expect(watcher.observeNativeNotice({
+        childID: "ses_d",
+        state: "completed",
+        text: `<subagent sessionID="ses_d" state="completed">done</subagent>`,
+        time: Date.now(),
+        inboxID: "inbox_d",
+      })).toBe(true)
+      expect(watcher.observeNativeDelivery({ inboxID: "inbox_d", time: Date.now() })).toBe(true)
+
+      await watcher.reconcile()
+      // A、B 走兜底完成卡；预算用尽后 C 只跳过提醒本身。
+      const completed = notices.filter((notice) => notice.metadata?.state === "completed")
+      expect(completed.map((notice) => notice.metadata.childID)).toEqual(["ses_a", "ses_b"])
+      // D 的原生终态卡已投递：预算用尽也不能挡住它的收尾与淘汰。
+      expect(evicted).toContain("ses_d")
+      expect(evicted).toEqual(["ses_a", "ses_b", "ses_d"])
+      expect(watcher.size()).toBe(1)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("关掉状态监测：删 watch 前先清运行标记", async () => {
+    const runningShell = {
+      type: "shell",
+      shellID: "sh_1",
+      command: "npm run dev",
+      status: "running",
+      metadata: { background: true },
+    }
+    let enabled = true
+    const { deps, cleared } = watcherHarness({
+      readEntries: async () => (enabled ? [] : [{ key: STATUS_WATCH_KEY, value: "false" }]),
+      readMessages: async () => [runningShell],
+    })
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: true,
+      })
+      await waitFor(() => watcher.size() === 1)
+      enabled = false
+      await watcher.reconcile()
+      expect(cleared).toEqual(["ses_child"])
+      expect(watcher.size()).toBe(0)
+    } finally {
+      watcher.stop()
+    }
+  })
+
+  test("busy 且无终态证据：不被 force 判完成，看护项留给对账", async () => {
+    const { deps, notices, evictCalls } = watcherHarness({
+      readSession: async (sessionID: string) => ({ id: sessionID, time: { busy: 10 } }),
+    })
+    const watcher = createStatusWatcher(deps)
+    try {
+      await watcher.register({
+        childID: "ses_child",
+        parentID: "ses_parent",
+        rootID: "ses_root",
+        description: "任务",
+        agent: "worker",
+        background: false,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      expect(notices).toEqual([])
+      expect(evictCalls).toEqual([])
+      expect(watcher.size()).toBe(1)
+    } finally {
+      watcher.stop()
+    }
   })
 })

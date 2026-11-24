@@ -28,6 +28,7 @@
     "server-models.ts",
     "server-scanners.ts",
     "server-session.ts",
+    "server-default-model.ts",
     "agent-tree.ts",
     "context-policy.ts",
     "flagship.ts",

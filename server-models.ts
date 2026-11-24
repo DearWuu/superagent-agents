@@ -63,6 +63,13 @@ const QUOTA_ERROR_TYPES = new Set([
   "provider.model-budget-limit",
   "provider.go-limit",
 ])
+/** 类型存在但不提供信息（服务端错误、传输错误等）：仍按文本兜底判定。 */
+const QUOTA_UNINFORMATIVE_TYPES = new Set([
+  "unknown",
+  "provider.unknown",
+  "provider.server-error",
+  "provider.transport",
+])
 const QUOTA_TEXT =
   /rate[\s_-]?limit|too many requests|quota|insufficient[\s_-]?(quota|balance|credits?|funds)|balance is (?:too )?low|usage limit|out of credits?/i
 
@@ -77,6 +84,8 @@ export function isQuotaFailure(error: unknown): boolean {
     if (isObject(error.reason) && error.reason._tag === "RateLimit") return true
     if (typeof error._tag === "string" && /rate-?limit/i.test(error._tag)) return true
     if (error.status === 429) return true
+    // 类型明确是其他类别（鉴权、无效请求、中断等）：换模型救不回来，不做文本兜底。
+    if (typeof error.type === "string" && !QUOTA_UNINFORMATIVE_TYPES.has(error.type)) return false
     const body = isObject(error.response) && typeof error.response.body === "string" ? error.response.body : undefined
     const text = [typeof error.message === "string" ? error.message : undefined, body].filter(Boolean).join(" ")
     if (text.length > 0) return QUOTA_TEXT.test(text)
@@ -92,23 +101,23 @@ export type FallbackConfig = {
   subModel?: ModelRef
 }
 
+/** 阈值只认正整数（number 或可解析为正整数的字符串）；其余一律回退缺省值。 */
+function parseFallbackThreshold(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isInteger(value) && value >= 1 ? value : undefined
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value)
+    return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined
+  }
+  return undefined
+}
+
 /** 从指令条目读限额切换配置；缺省启用、阈值 3、未配置模型即不切换。 */
 export function readFallbackConfig(entries: any[]): FallbackConfig {
   const entryValue = (key: string) => entries.find((entry) => entry?.key === key)?.value
-  const enabledRaw = entryValue(FALLBACK_ENABLED_KEY)
-  const enabled =
-    typeof enabledRaw === "boolean"
-      ? enabledRaw
-      : typeof enabledRaw === "number"
-        ? enabledRaw !== 0
-        : typeof enabledRaw === "string"
-          ? enabledRaw.trim().toLowerCase() !== "false" && enabledRaw.trim() !== "0"
-          : true
-  const thresholdRaw = entryValue(FALLBACK_THRESHOLD_KEY)
-  const threshold = typeof thresholdRaw === "number" ? thresholdRaw : Number(thresholdRaw)
+  const enabledEntry = entries.find((entry) => entry?.key === FALLBACK_ENABLED_KEY)
   return {
-    enabled,
-    threshold: Number.isInteger(threshold) && threshold >= 1 ? threshold : DEFAULT_FALLBACK_THRESHOLD,
+    enabled: enabledEntry === undefined ? true : isEnabledValue(enabledEntry.value),
+    threshold: parseFallbackThreshold(entryValue(FALLBACK_THRESHOLD_KEY)) ?? DEFAULT_FALLBACK_THRESHOLD,
     rootModel: parseModelRef(entryValue(FALLBACK_MODEL_KEY)),
     subModel: parseModelRef(entryValue(SUBAGENT_FALLBACK_MODEL_KEY)),
   }
@@ -235,6 +244,8 @@ type PendingFallback = {
   armedAt: number
   /** 最近一次累计到的失败次数。 */
   failures: number
+  /** 本窗口内累计的限额失败次数：达到阈值立即切，切换失败重 arm 时清零。 */
+  failuresInWindow: number
   /** 最近一次失败的重试次数（宿主侧 attempt）。 */
   lastAttempt?: number
   /** 正在切换：避免定时器与同步到期路径同时切。 */
@@ -270,6 +281,8 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
   /** 启动（或重启）计时：只负责定时器本身。dispose 之后不再起计时。 */
   const arm = (sessionID: string, entry: PendingFallback) => {
     if (disposed) return
+    // 每次（重）启动计时都复位窗口起点：切换失败后的重试也要等满一个窗口。
+    entry.armedAt = now()
     const timer = setTimeout(() => {
       void runTimeout(sessionID, entry).catch((cause) =>
         deps.log({
@@ -286,13 +299,26 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
     pending.set(sessionID, entry)
   }
 
-  /** 切换成功后把 root 的上限降一档。 */
-  const tierDownLimit = async (input: {
-    rootID: string
-    entries: any[]
-    failures: number
-  }) => {
-    const current = readMaxSubagents(input.entries)
+  /** root → 降档串行链：同 root 的并发降档排队，后一个必须看到前一个写入后的上限。 */
+  const tierChains = new Map<string, Promise<unknown>>()
+
+  /** 真正执行一次降档：链内重读该 root 的最新条目，读不到才用调用方快照。 */
+  const performTierDown = async (input: { rootID: string; entries: any[] }) => {
+    let entries = input.entries
+    if (deps.readEntries) {
+      try {
+        entries = await deps.readEntries({ sessionID: input.rootID, rootID: input.rootID })
+      } catch (cause) {
+        deps.log({
+          event: "quota-tier-down-read-failed",
+          decision: "error",
+          root: input.rootID,
+          note: "读取最新上限失败，沿用切换时的快照",
+          cause: errorText(cause),
+        })
+      }
+    }
+    const current = readMaxSubagents(entries)
     const next = downgradeLimit(current)
     if (next === undefined) {
       deps.log({ event: "quota-tier-down-skip", decision: "allow", root: input.rootID, limit: current })
@@ -318,6 +344,24 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
         cause: errorText(cause),
       })
     }
+  }
+
+  /** 切换成功后把 root 的上限降一档：按 root 串行，避免并发到期各自读旧值。 */
+  const tierDownLimit = (input: { rootID: string; entries: any[]; failures: number }) => {
+    const previous = tierChains.get(input.rootID) ?? Promise.resolve()
+    const run = previous.then(
+      () => performTierDown(input),
+      () => performTierDown(input),
+    )
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    tierChains.set(input.rootID, tail)
+    void tail.then(() => {
+      if (tierChains.get(input.rootID) === tail) tierChains.delete(input.rootID)
+    })
+    return run
   }
 
   /** 到点处理：判重、读最新配置、切模型。失败最多再试一次。 */
@@ -457,6 +501,8 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
       }
       if (attempt < maxSwitchAttempts) {
         entry.attempts = attempt
+        // 重新计时即开新窗口：失败计数清零，下一次失败不再走「达到阈值立即切」。
+        entry.failuresInWindow = 0
         arm(sessionID, entry)
         deps.log({
           event: "fallback-retry-armed",
@@ -569,13 +615,18 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
 
       const existing = pending.get(input.sessionID)
       if (existing) {
-        // 已经在计时：只更新快照，不重复计时、不切换。
+        // 已经在计时：只更新快照，不重复计时。
         existing.failures = count
+        existing.failuresInWindow += 1
         existing.lastAttempt = input.attempt ?? existing.lastAttempt
         existing.input = { ...existing.input, ...input, entries: input.entries ?? existing.input.entries }
-        // 计时已到期但回调还没排到：当场同步走一次到期逻辑。
-        if (now() - existing.armedAt >= timeoutMs) {
+        // 本窗口内累计失败达到阈值（切换重试等待中的窗口不适用），或窗口已到期：当场走一次到期逻辑。
+        const reached = existing.attempts === 0 && existing.failuresInWindow >= config.threshold
+        if (reached || now() - existing.armedAt >= timeoutMs) {
           if (existing.timer) clearTimeout(existing.timer)
+          if (reached) {
+            deps.log({ event: "fallback-threshold-reached", decision: "allow", ...base, threshold: config.threshold })
+          }
           return runTimeout(input.sessionID, existing)
         }
         return { switched: false }
@@ -586,7 +637,14 @@ export function createQuotaFallback(deps: QuotaFallbackDeps) {
         attempts: 0,
         armedAt: now(),
         failures: count,
+        failuresInWindow: 1,
         lastAttempt: input.attempt,
+      }
+      if (entry.failuresInWindow >= config.threshold) {
+        // 首个失败就达到阈值：不等窗口，登记待办后立即走到期切换。
+        pending.set(input.sessionID, entry)
+        deps.log({ event: "fallback-threshold-reached", decision: "allow", ...base, threshold: config.threshold })
+        return runTimeout(input.sessionID, entry)
       }
       arm(input.sessionID, entry)
       deps.log({

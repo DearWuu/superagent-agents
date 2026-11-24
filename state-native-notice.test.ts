@@ -220,6 +220,21 @@ describe("原生通知观察与终态兜底", () => {
     }
   })
 
+  test("入队门槛容忍 1 秒时钟偏差：本轮开始前刚入队的原生卡仍算本轮", async () => {
+    const h = harness()
+    const watcher = createStatusWatcher(h.deps)
+    try {
+      const before = Date.now()
+      await register(watcher, h)
+      // 入队时间比本轮开始早不到 1 秒：属于时钟偏差，不能当旧轮丢掉。
+      expect(watcher.observeNativeNotice({ childID: CHILD, state: "completed", time: before - 100 })).toBe(true)
+      // 早于偏差容忍窗口：仍然是旧轮事件，必须拒绝。
+      expect(watcher.observeNativeNotice({ childID: CHILD, state: "error", text: "failed", time: before - 5_000 })).toBe(false)
+    } finally {
+      watcher.stop()
+    }
+  })
+
   test("兜底通知失败保留 pending，下一拍成功后只投递一张", async () => {
     let attempts = 0
     let fail = true

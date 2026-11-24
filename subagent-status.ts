@@ -206,13 +206,16 @@ export function formatDispatchReceipt(record: DispatchRecord, outcome: DispatchO
   const ok = outcome.ok !== false && record.decision !== "denied"
   const parts: string[] = [`[superagent] dispatch=${ok ? "ok" : "failed"}`, `mode=${record.mode}`]
   if (record.childID) parts.push(`child=${record.childID}`)
-  parts.push(`state=${outcome.state ?? record.state ?? (record.background ? "running" : "completed")}`)
+  // state 只算一次：展示与“是否承诺后续通知”必须同一口径。
+  const state = outcome.state ?? record.state ?? (record.background ? "running" : "completed")
+  parts.push(`state=${state}`)
   if (record.model) parts.push(`model=${record.model}`)
   parts.push(`interrupt=${record.interrupt}`)
   if (record.evicted.length > 0) parts.push(`evicted=${record.evicted.join(",")}`)
   // 只有仍在运行/等待后台收尾的派发才需要承诺后续通知；前台已完成的调用
   // 工具结果本身就是最终输出，再写“完成后自动通知”会误导模型。
-  if (ok && (outcome.state ?? record.state) === "running") parts.push("完成后自动通知")
+  // background 且回执没写 state 时按 running 算，同样要承诺后续通知。
+  if (ok && state === "running") parts.push("完成后自动通知")
   const warnings = [...record.warnings, ...(outcome.warning ? [outcome.warning] : [])]
   for (const warning of warnings) parts.push(`warning=${warning}`)
   const text = parts.join(" · ")
@@ -348,6 +351,28 @@ export function formatBackgroundNotice(input: {
 }
 
 /**
+ * 卡片属性值转义：引号会截断属性值，换行会把标签拆成两行。
+ * 只转义这两类，其余字符原样保留。
+ */
+function escapeCardAttribute(value: string): string {
+  return value.replace(/"/g, "&quot;").replace(/[\r\n]+/g, " ")
+}
+
+/** 卡片属性值里唯一的实体：截断时不能留下半截。 */
+const CARD_ENTITY = "&quot;"
+
+/** 按预算截断转义后的属性值：结尾不切半截实体。 */
+function clipCardAttribute(value: string, max: number): string {
+  if (value.length <= max) return value
+  const clipped = value.slice(0, max)
+  const amp = clipped.lastIndexOf("&")
+  if (amp < 0) return clipped
+  const tail = clipped.slice(amp)
+  if (tail.length < CARD_ENTITY.length && CARD_ENTITY.startsWith(tail)) return clipped.slice(0, amp)
+  return clipped
+}
+
+/**
  * 生成完整闭合的 subagent 卡：description 与正文共用 4000 字预算。
  * 标签结构优先保留，description 与正文按顺序占用预算，绝不截断闭合标签。
  */
@@ -366,7 +391,8 @@ function formatSubagentCard(input: {
   const closing = "\n</subagent>"
   const fixedLength = opening("").length + 1 + closing.length
   const variableBudget = Math.max(0, MAX_NOTICE_TEXT_LENGTH - fixedLength)
-  const description = (input.description ?? "").slice(0, variableBudget)
+  // 先转义再按预算截断：属性值里的引号与换行不能破坏标签结构。
+  const description = clipCardAttribute(escapeCardAttribute(input.description ?? ""), variableBudget)
   const body = input.text.slice(0, Math.max(0, variableBudget - description.length))
   return `${opening(description)}\n${body}${closing}`
 }
@@ -838,7 +864,8 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     if (!classified) return false
     const observedAt = Date.now()
     const enqueuedAt = nativeNoticeTime(input.time) ?? observedAt
-    if (enqueuedAt < watch.startedAt) return false
+    // 与其他判重同口径：容忍本轮开始前 1 秒的时钟偏差，更早的才算旧轮事件。
+    if (enqueuedAt < watch.startedAt - NOTICE_TIME_SKEW_MS) return false
     const observation: NativeNoticeObservation = { ...classified, text, observedAt, enqueuedAt, inboxID: input.inboxID }
     const notices = [...(watch.nativeNotices ?? [])]
     const duplicate = notices.findIndex(
@@ -1047,8 +1074,11 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     }
   }
 
-  /** runtime 清理永不影响淘汰或收尾；reason 标明是普通收尾还是 watch 淘汰。 */
-  const clearRuntimeBestEffort = async (childID: string, reason: "completion" | "watch-ttl" | "watch-limit") => {
+  /** runtime 清理永不影响淘汰或收尾；reason 标明是普通收尾还是 watch 被清。 */
+  const clearRuntimeBestEffort = async (
+    childID: string,
+    reason: "completion" | "watch-ttl" | "watch-limit" | "watch-disabled",
+  ) => {
     try {
       await deps.clearRuntime(childID)
     } catch (cause) {
@@ -1206,7 +1236,9 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
     const info = sessionInfo(await deps.readSession(childID))
     if (!isCurrent(childID, watch) || !info) return
     // 还在跑就等下一个事件；前台派发时工具已经返回，回合一定结束了。
-    if (isSessionBusy(info) && !options.force) {
+    // force 也不能越过「busy 且无终态证据」：没有终态证据就不能判完成，
+    // 改走 busy 重试，等证据落库再收尾；有终态证据或本来就不忙才允许 force。
+    if (isSessionBusy(info) && !(options.force && hasSessionTerminalEvidence(info))) {
       watch.expected = "running"
       // 结束事件可能早于 idle 落库：稍后重看一次，别把这次收尾丢掉。
       // 新的一次外部收尾算新一轮（重试预算重置）；重试自身不重置，否则永远试不满。
@@ -1357,7 +1389,11 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         continue
       }
       if (!(await watchEnabledFor(watch.rootID, watch.parentID))) {
-        if (isCurrent(childID, watch)) deleteWatch(childID, watch)
+        // 开关关掉：删 watch 前先清运行标记，别把后台任务的标记留在子会话上。
+        if (isCurrent(childID, watch)) {
+          await clearRuntimeBestEffort(childID, "watch-disabled")
+          deleteWatch(childID, watch)
+        }
         continue
       }
       if (!isCurrent(childID, watch)) continue
@@ -1401,7 +1437,9 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
           }
           continue
         }
-        if (reminderTotal >= MAX_REMINDERS) break
+        // 提醒预算用尽只跳过这条提醒本身，不能中止整轮对账：
+        // 其他 watch 的收尾、后台任务识别与淘汰仍要推进。
+        if (reminderTotal >= MAX_REMINDERS) continue
         // 首个兜底 tick 直接发完整完成卡；失败不写 remindedStates，下一拍重试。
         const sent = await notifyCompletion(childID, watch, pending.state, pending.text)
         if (!sent || !isCurrent(childID, watch)) continue
@@ -1452,7 +1490,9 @@ export function createStatusWatcher(deps: StatusWatcherDeps): StatusWatcher {
         continue
       }
       if (watch.remindedStates.includes(state)) continue
-      if (reminderTotal >= MAX_REMINDERS) break
+      // 提醒预算用尽只跳过这条提醒本身，不能中止整轮对账：
+      // 其他 watch 的收尾、后台任务识别与淘汰仍要推进。
+      if (reminderTotal >= MAX_REMINDERS) continue
       let parentMessages: any[] = []
       try {
         parentMessages = await deps.readMessages(watch.parentID)

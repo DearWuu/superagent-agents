@@ -64,8 +64,9 @@ export type OversightModel = {
 }
 
 /**
- * Pins hold levels (0-4). Legacy settings wrote scores (0-100); numeric
- * values above 4 are read through the old score bands.
+ * Pins hold levels (0-4). Legacy settings wrote scores (0-100); values
+ * below 5 are read as levels after rounding, 5 and above through the old
+ * score bands.
  */
 export type OversightPins = {
   global?: number
@@ -207,14 +208,18 @@ const REPORT_HEADER_INTRO =
   "报告头部固定三行（Superagent 只按这三行判断状态，不从自由文本推断是否在等人）："
 
 const REPORT_HEADER_LINES = [
-  `状态：${REPORT_STATUS_VALUES.join(" | ")}（progress=还在推进；blocked=等人或等外部条件；ready=完成待验收；failed=失败）`,
-  "需人决定：blocked 时必填，一个具体问句；非 blocked 写“无”",
+  `状态：${REPORT_STATUS_VALUES.join(" | ")}（progress=还在推进；blocked=等 Superagent 裁决或等外部条件；ready=完成待验收；failed=失败）`,
+  "待 Superagent 裁决：blocked 时必填，写清问题与你的建议（只写在这里，由 Superagent 裁决后续跑）；非 blocked 写“无”",
   "报告时间：ISO 时间戳（如 2026-01-01T00:00:00Z）",
 ] as const
 
 /** Heartbeat cadence that applies to every level; the full report still follows the protocol. */
 const HEARTBEAT_LINE =
-  "长任务心跳：预计超 10 分钟的任务，每约 10 分钟用一行进度（当前步骤/已完成/剩余）向 Superagent 简报一次，完整报告仍按协议交付。"
+  "长任务心跳：预计超 10 分钟的任务，每约 10 分钟用一行进度（当前步骤/已完成/剩余）向 Superagent 简报一次，完整报告仍按协议交付；简报会结束当前回合，之后收到 Superagent 的续跑或[状态探针]时先一行报状态再立刻继续剩余工作，不得停在简报。"
+
+/** Subagent-to-Superagent communication boundary; applies to every level. */
+const COMMUNICATION_LINE =
+  "沟通边界：你是 Subagent，只向 Superagent 汇报。不得用 question 等任何方式向用户提问（会被拒绝）；不得派发子代理；工具调用报错就按报错修正参数后重试，连续失败把报错原文写进报告并置 blocked，不得据此断言工具不可用。"
 
 /** Inline budgets; anything longer travels as a pointer, not as inline text. */
 const BUDGET_LINE = `预算（内联+指针）：派工任务书内联上限 ${TASK_BRIEF_INLINE_LIMIT} 字，超出部分放文件/消息并在任务书里给指针；报告中单条命令输出内联上限 ${COMMAND_OUTPUT_INLINE_LIMIT} 字，超出给 path:行号 或日志文件指针，不整段粘贴。`
@@ -234,10 +239,10 @@ export function oversightLevel(score: number): OversightLevel {
   return clamp(Math.floor(score / 20), 0, 4) as OversightLevel
 }
 
-/** A stored pin is a level (0-4); anything above 4 is a legacy score. */
+/** A stored pin is a level (0-4); 5 and above are legacy scores. */
 export function oversightLevelForPin(value: number): OversightLevel {
   if (!Number.isFinite(value)) return DEFAULT_OVERSIGHT_LEVEL
-  if (value <= 4) return clamp(Math.round(value), 0, 4) as OversightLevel
+  if (value < 5) return clamp(Math.round(value), 0, 4) as OversightLevel
   return oversightLevel(value)
 }
 
@@ -358,6 +363,7 @@ export function renderReportOnlyProtocol(contract: OversightContract, reportStyl
     "说明：行为不受限制；证据必须真实（真实执行输出、真实文件引用）；Superagent 可随时翻查 session 完整记录核查。",
     BUDGET_LINE,
     CONTEXT_DISCIPLINE_LINE,
+    COMMUNICATION_LINE,
   ].join("\n")
 }
 
@@ -370,6 +376,7 @@ export function renderAcceptanceOnlyProtocol(contract: OversightContract) {
     `复核方式：${
       acceptance.critic === "required" ? "独立 critic 强制复核" : "critic 复核遵循 root 的 critic 开关"
     }`,
+    "子代理置 blocked 并提请裁决时，由 Superagent 裁决后用续跑下达；子代理不会也无法向用户提问。",
   ].join("\n")
 }
 

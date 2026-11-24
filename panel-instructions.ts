@@ -14,10 +14,18 @@ import {
   LEGACY_TASK_PROMPTS,
   SUPERAGENT_DEFAULTS,
 } from "./panel-defaults"
+import { MODEL_POLICY_METADATA_KEY, writeChildModelPolicy } from "./model-policy"
 import type { ModelInfo } from "./panel-types"
 import type { RootSettings } from "./session-scope"
 
 type InstructionState = { rootID?: string; values: Record<string, unknown> }
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** `providerID/modelID[#variant]`，与模型条目同一写法。 */
+function entryText(model: { providerID: string; id: string; variant?: string }) {
+  return `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
+}
 
 export function createInstructionActions(deps: {
   context: Plugin.Context
@@ -48,18 +56,12 @@ export function createInstructionActions(deps: {
     setReady,
   } = deps
 
-  async function loadInstructions() {
-    const id = rootSessionID()
-    if (!id) return
-    const entries = await context.client.experimental.session.instructions.entry.list({ sessionID: id })
+  async function loadInstructions(sessionID = rootSessionID()) {
+    if (!sessionID) return
+    const entries = await context.client.experimental.session.instructions.entry.list({ sessionID })
     // A slow response for a root the user already left must not overwrite the current root.
-    if (rootSessionID() !== id) return
-    setInstructions({ rootID: id, values: Object.fromEntries(entries.map((entry) => [entry.key, entry.value])) })
-  }
-  async function putInstruction(key: string, value: string | number) {
-    const id = rootSessionID()
-    if (!id) return
-    await putSessionInstruction(id, key, value)
+    if (rootSessionID() !== sessionID) return
+    setInstructions({ rootID: sessionID, values: Object.fromEntries(entries.map((entry) => [entry.key, entry.value])) })
   }
   async function putSessionInstruction(sessionID: string, key: string, value: string | number) {
     await context.client.experimental.session.instructions.entry.put({
@@ -73,57 +75,108 @@ export function createInstructionActions(deps: {
       values: { ...(current.rootID === sessionID ? current.values : {}), [key]: value },
     }))
   }
-  async function removeInstruction(key: string) {
-    const id = rootSessionID()
-    if (!id) return
+  async function removeSessionInstruction(sessionID: string, key: string) {
     await context.client.experimental.session.instructions.entry.remove({
-      sessionID: id,
+      sessionID,
       key,
     })
     setInstructions((current) => {
-      if (current.rootID !== id) return current
+      if (current.rootID !== sessionID) return current
       const values = { ...current.values }
       delete values[key]
-      return { rootID: id, values }
+      return { rootID: sessionID, values }
     })
+  }
+  async function putInstruction(key: string, value: string | number, sessionID = rootSessionID()) {
+    if (!sessionID) return
+    await putSessionInstruction(sessionID, key, value)
+  }
+  async function removeInstruction(key: string, sessionID = rootSessionID()) {
+    if (!sessionID) return
+    await removeSessionInstruction(sessionID, key)
   }
   async function saveInstructionText(key: string, value: string) {
     const text = value.trim()
     if (!text) return removeInstruction(key)
     return putInstruction(key, text)
   }
+
+  /**
+   * 初始化当前 root 的条目。指令条目读取失败时做一次有界重试，仍失败就按本地
+   * 设置继续；ready 由 finally 保证置真，避免一次瞬时失败让面板永久停摆。
+   * 全程使用捕获的 root id：await 期间用户切走 root 就停止后续写入，也不标记
+   * 已初始化，避免把默认条目写进别的 root。
+   */
   async function initializeInstructions() {
     setReady(false)
-    await loadInstructions()
     const id = rootSessionID()
     if (!id) return
-    // 停用状态只加载开关本身，不初始化/补写其他条目，也不写回开关。
-    if (!collabOn()) {
-      setReady(true)
-      return
-    }
-    mergeKeptEntry()
-    await ensureFallbackDefaults()
-    await migrateDefaultInstructions()
-    if (!root().initialized[id]) {
-      for (const [key, value] of defaultInstructionEntries()) {
-        if (instructionValue(key) !== undefined) continue
-        await putInstruction(key, value)
+    const stale = () => rootSessionID() !== id
+    try {
+      let loaded = false
+      for (let attempt = 0; attempt < 3 && !loaded; attempt += 1) {
+        try {
+          await loadInstructions(id)
+          loaded = true
+        } catch {
+          if (attempt === 2) {
+            context.ui.toast.show({ message: "指令条目加载失败，已按本地设置继续" })
+          } else {
+            await sleep(400)
+          }
+        }
       }
-      await updateRoot((draft) => {
-        draft.initialized = { ...draft.initialized, [id]: true }
-      })
+      if (stale()) return
+      // 停用状态只加载开关本身，不初始化/补写其他条目，也不写回开关。
+      if (!collabOn()) return
+      mergeKeptEntry()
+      await ensureFallbackDefaults(id)
+      if (stale()) return
+      await migrateDefaultInstructions(id)
+      if (stale()) return
+      await ensureDefaultPolicyEntry(id)
+      if (stale()) return
+      if (!root().initialized[id]) {
+        for (const [key, value] of defaultInstructionEntries()) {
+          if (instructionValue(key) !== undefined) continue
+          await putInstruction(key, value, id)
+          if (stale()) return
+        }
+        await updateRoot((draft) => {
+          draft.initialized = { ...draft.initialized, [id]: true }
+        })
+      }
+    } finally {
+      setReady(true)
     }
-    setReady(true)
   }
 
-  /** Backfills the fallback/critic keys for roots initialized before they existed. */
-  async function ensureFallbackDefaults() {
+  /**
+   * Backfills the fallback/critic keys for roots initialized before they existed.
+   * 限额条目只在配置了备用模型时存在：没有任何备用模型就移除它们，避免面板
+   * 显示一个不存在的限额切换配置。
+   */
+  async function ensureFallbackDefaults(sessionID: string) {
+    const hasFallback =
+      instructionPresent(INSTRUCTION_KEYS.fallbackModel) ||
+      instructionPresent(INSTRUCTION_KEYS.subagentFallbackModel)
+    if (hasFallback) {
+      if (instructionValue(INSTRUCTION_KEYS.fallbackThreshold) === undefined) {
+        await putInstruction(INSTRUCTION_KEYS.fallbackThreshold, SUPERAGENT_DEFAULTS.fallbackThreshold, sessionID)
+      }
+      if (instructionValue(INSTRUCTION_KEYS.fallbackEnabled) === undefined) {
+        await putInstruction(
+          INSTRUCTION_KEYS.fallbackEnabled,
+          String(SUPERAGENT_DEFAULTS.fallbackEnabled),
+          sessionID,
+        )
+      }
+    } else {
+      for (const key of [INSTRUCTION_KEYS.fallbackThreshold, INSTRUCTION_KEYS.fallbackEnabled]) {
+        if (instructionValue(key) !== undefined) await removeInstruction(key, sessionID)
+      }
+    }
     const keys = new Set<string>([
-      INSTRUCTION_KEYS.fallbackModel,
-      INSTRUCTION_KEYS.subagentFallbackModel,
-      INSTRUCTION_KEYS.fallbackThreshold,
-      INSTRUCTION_KEYS.fallbackEnabled,
       INSTRUCTION_KEYS.criticEnabled,
       INSTRUCTION_KEYS.statusWatch,
       INSTRUCTION_KEYS.maxFlagshipSubagents,
@@ -131,18 +184,37 @@ export function createInstructionActions(deps: {
     ])
     for (const [key, value] of defaultInstructionEntries()) {
       if (!keys.has(key) || instructionValue(key) !== undefined) continue
-      await putInstruction(key, value)
+      await putInstruction(key, value, sessionID)
     }
   }
+
+  /** 面板刚配置了备用模型：确保限额切换的两项存在（缺才写）。 */
+  async function ensureFallbackQuotaDefaults() {
+    const id = rootSessionID()
+    if (!id) return
+    if (
+      !instructionPresent(INSTRUCTION_KEYS.fallbackModel) &&
+      !instructionPresent(INSTRUCTION_KEYS.subagentFallbackModel)
+    ) {
+      return
+    }
+    if (instructionValue(INSTRUCTION_KEYS.fallbackThreshold) === undefined) {
+      await putInstruction(INSTRUCTION_KEYS.fallbackThreshold, SUPERAGENT_DEFAULTS.fallbackThreshold, id)
+    }
+    if (instructionValue(INSTRUCTION_KEYS.fallbackEnabled) === undefined) {
+      await putInstruction(INSTRUCTION_KEYS.fallbackEnabled, String(SUPERAGENT_DEFAULTS.fallbackEnabled), id)
+    }
+  }
+
   /**
    * Prompt defaults changed: assignment, session and task text that is absent
    * or still exactly a previous default moves to the new text. A user's custom
    * text is untouched; assignment lives on the root, the other two are entries.
    */
-  async function migrateDefaultInstructions() {
+  async function migrateDefaultInstructions(sessionID: string) {
     const session = instructionText(INSTRUCTION_KEYS.sessionPrompt)
     if (!instructionPresent(INSTRUCTION_KEYS.sessionPrompt) || LEGACY_SESSION_PROMPTS.includes(session)) {
-      await putInstruction(INSTRUCTION_KEYS.sessionPrompt, SUPERAGENT_DEFAULTS.sessionPrompt)
+      await putInstruction(INSTRUCTION_KEYS.sessionPrompt, SUPERAGENT_DEFAULTS.sessionPrompt, sessionID)
     }
     const assignment = root().assignmentPrompt
     if (!assignment.trim() || LEGACY_ASSIGNMENT_PROMPTS.includes(assignment)) {
@@ -152,20 +224,55 @@ export function createInstructionActions(deps: {
     }
     const task = instructionText(INSTRUCTION_KEYS.taskPrompt)
     if (!instructionPresent(INSTRUCTION_KEYS.taskPrompt) || LEGACY_TASK_PROMPTS.includes(task)) {
-      await putInstruction(INSTRUCTION_KEYS.taskPrompt, SUPERAGENT_DEFAULTS.taskPrompt)
+      await putInstruction(INSTRUCTION_KEYS.taskPrompt, SUPERAGENT_DEFAULTS.taskPrompt, sessionID)
+    }
+  }
+
+  /**
+   * 面板初始化时对账 root 的默认模型策略：策略条目缺失时补写本地策略，
+   * fixed 的模型条目与本地目标对齐，非 fixed 移除模型条目；每个子代理的
+   * 策略元数据缺失时 best-effort 补写，供服务端派工时读取。
+   */
+  async function ensureDefaultPolicyEntry(sessionID: string) {
+    const scoped = root()
+    const policy = scoped.defaultPolicy ?? "inherit"
+    if (instructionValue(INSTRUCTION_KEYS.defaultPolicy) === undefined) {
+      await putInstruction(INSTRUCTION_KEYS.defaultPolicy, policy, sessionID)
+    }
+    if (rootSessionID() !== sessionID) return
+    const model = scoped.defaultModel
+    if (policy === "fixed" && model) {
+      const expected = entryText(model)
+      if (instructionText(INSTRUCTION_KEYS.defaultModel) !== expected) {
+        await putInstruction(INSTRUCTION_KEYS.defaultModel, expected, sessionID)
+      }
+    } else if (instructionPresent(INSTRUCTION_KEYS.defaultModel)) {
+      await removeInstruction(INSTRUCTION_KEYS.defaultModel, sessionID)
+    }
+    if (rootSessionID() !== sessionID) return
+    for (const [childID, childPolicy] of Object.entries(scoped.policies ?? {})) {
+      const child = context.data.session.get(childID)
+      if (!child) continue
+      if (child.metadata?.[MODEL_POLICY_METADATA_KEY] !== undefined) continue
+      await writeChildModelPolicy(context, childID, childPolicy)
+      if (rootSessionID() !== sessionID) return
     }
   }
 
   async function restoreDefaults() {
+    const id = rootSessionID()
     const entries = defaultInstructionEntries()
-    for (const [key, value] of entries) await putInstruction(key, value)
+    for (const [key, value] of entries) await putInstruction(key, value, id)
     for (const key of [
       INSTRUCTION_KEYS.fallbackModel,
       INSTRUCTION_KEYS.subagentFallbackModel,
+      INSTRUCTION_KEYS.fallbackThreshold,
+      INSTRUCTION_KEYS.fallbackEnabled,
       INSTRUCTION_KEYS.defaultModel,
     ]) {
-      if (!entries.some(([entryKey]) => entryKey === key)) await removeInstruction(key)
+      if (!entries.some(([entryKey]) => entryKey === key)) await removeInstruction(key, id)
     }
+    await putInstruction(INSTRUCTION_KEYS.defaultPolicy, SUPERAGENT_DEFAULTS.defaultPolicy, id)
     await updateRoot((draft) => {
       draft.defaultPolicy = SUPERAGENT_DEFAULTS.defaultPolicy
       draft.defaultModel = SUPERAGENT_DEFAULTS.defaultModel
@@ -186,8 +293,6 @@ export function createInstructionActions(deps: {
       [INSTRUCTION_KEYS.maxFlagshipSubagents, SUPERAGENT_DEFAULTS.maxFlagshipSubagents],
       [INSTRUCTION_KEYS.sessionPrompt, SUPERAGENT_DEFAULTS.sessionPrompt],
       [INSTRUCTION_KEYS.taskPrompt, SUPERAGENT_DEFAULTS.taskPrompt],
-      [INSTRUCTION_KEYS.fallbackThreshold, SUPERAGENT_DEFAULTS.fallbackThreshold],
-      [INSTRUCTION_KEYS.fallbackEnabled, String(SUPERAGENT_DEFAULTS.fallbackEnabled)],
       [INSTRUCTION_KEYS.criticEnabled, String(SUPERAGENT_DEFAULTS.criticEnabled)],
       [INSTRUCTION_KEYS.statusWatch, String(SUPERAGENT_DEFAULTS.statusWatch)],
     ]
@@ -198,7 +303,7 @@ export function createInstructionActions(deps: {
     ] as const) {
       if (!model) continue
       if (models().some((item) => item.providerID === model.providerID && item.id === model.id))
-        entries.push([key, `${model.providerID}/${model.id}`])
+        entries.push([key, entryText(model)])
     }
     return entries
   }
@@ -233,6 +338,7 @@ export function createInstructionActions(deps: {
     saveInstructionText,
     initializeInstructions,
     restoreDefaults,
+    ensureFallbackQuotaDefaults,
     writeKeptEntry,
   }
 }

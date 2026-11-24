@@ -15,6 +15,10 @@ export const PLUGIN_ID = "superagent-agents-hardlimit"
 export const TOOL_NAME = "subagent"
 export const DEFAULT_MAX_SUBAGENTS = 5
 export const MAX_SUBAGENTS_KEY = "superagent.max-subagents"
+/** root 的默认模型策略：`fixed` / `inherit` / `auto`；条目缺失时按 `default-model` 是否存在推断。 */
+export const DEFAULT_POLICY_KEY = "superagent.default-policy"
+/** root 固定默认模型：`providerID/modelID[#variant]`。 */
+export const DEFAULT_MODEL_KEY = "superagent.default-model"
 /** root 链上记录「保护中的子会话」的指令条目，值是逗号分隔的 sessionID 列表。 */
 export const KEPT_SUBAGENTS_KEY = "superagent.kept-subagents"
 /** 限额切换的目标模型：root 会话用前者，子会话用后者，值都是 `providerID/modelID`。 */
@@ -34,9 +38,9 @@ export const OVERSIGHT_LEVEL_KEY = "superagent.oversight-level"
 export const PROBE_INTERVAL_MS = 5 * 60 * 1000
 /** 超时探针阈值：与 TUI `LONG_RUNNING_THRESHOLD_MS`（run-duration.ts）同语义。 */
 export const PROBE_AFTER_MS = 30 * 60 * 1000
-/** 超时探针正文：只要一行状态，避免把子代理从当前任务上带偏。 */
+/** 超时探针正文：先要一行状态，再要求继续剩余工作，避免子代理停在简报上。 */
 export const PROBE_TEXT =
-  "[状态探针] 请只用一行回复当前状态：当前步骤 / 已完成部分 / 剩余与卡点；不要继续执行其他操作。"
+  "[状态探针] 请先用一行回复当前状态：当前步骤 / 已完成部分 / 剩余与卡点；若任务未完成，回复这一行后立刻继续执行剩余工作，不要停在简报。"
 /** 切换模型后第一次重试的等待：模型已经换了，旧 provider 的退避/retry-after 不再适用。 */
 export const FALLBACK_RETRY_DELAY_MS = 1000
 /** 限额切换时是否同步降档 max-subagents。 */

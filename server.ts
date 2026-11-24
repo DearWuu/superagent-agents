@@ -8,11 +8,11 @@
  * 判定口径：
  *  - root：沿 parentID 逐级上溯到没有 parentID 的会话；
  *  - 存在数：root 的非归档直接子会话数；
- *  - 在途数：本 root 上还没跑完的 subagent 调用数（含本次调用自己占的那一个槽）。
- *    本次调用要占的槽就是它在途里的这一份，判定与淘汰都不再另加一份，
- *    所以放行条件是 `存在数 + 在途数 <= 上限`——放行后共存的子代理不会超过上限；
- *  - 上限：caller 沿父链遇到的第一个带 `superagent.*` 指令条目的会话上的
- *    `superagent.max-subagents`（缺省 5，非法值回退 5）；
+ *  - 在途数：本 root 上尚未实体化（`session.created` 还没建出子会话）的调用数。
+ *    条目一旦实体化就改由「存在数」统计，两处不再重复计算同一占用；
+ *    放行条件是 `存在数 + 在途数 <= 上限`——放行后共存的子代理不会超过上限；
+ *  - 上限：caller 沿父链遇到的第一个带 `superagent.max-subagents` 条目的会话上的
+ *    `superagent.max-subagents`（缺省 5，非法值回退 5），到 root 仍无条目时取默认值；
  *  - steer（input.sessionID 非空）：续跑已有子会话，不占新槽，直接放行；
  *  - 超限：先淘汰「已结束、不在运行中、不是正在被 steer、也不在保护名单」里最旧的
  *    子会话；这类候选不够时，再兜底淘汰「开了工却没收尾、且已经僵死超过阈值」的
@@ -116,6 +116,12 @@ import {
   readMaxFlagshipSubagents,
 } from "./flagship-admission"
 import { normalizeModelDelegationModel, sameModelDelegationModel } from "./model-delegation"
+import {
+  collectModelKeys,
+  isModelAvailable,
+  readDefaultPolicy,
+  resolveDispatchModel,
+} from "./server-default-model"
 import { DEFAULT_OVERSIGHT_LEVEL } from "./oversight"
 import {
   createCtxContextCompactionScanner,
@@ -128,6 +134,7 @@ import {
   denyMessage,
   FALLBACK_TIMEOUT_MS,
   forceRetryAfterSwitch,
+  formatModelRef,
   isQuotaFailure,
   readOversightLevel,
   shouldCriticReview,
@@ -425,6 +432,12 @@ function subagentInput(input: unknown): {
 /** execute.before 登记的调用信息；计数字段只在槽位仍被占用时有值。 */
 type PendingSubagentCall = {
   rootID?: string
+  /** 子会话是否已由 `session.created` 实体化；实体化后不再计入在途。 */
+  materialized?: boolean
+  /** 登记时刻；兜底回收超期条目用。 */
+  createdAt?: number
+  /** 本次调用是否仍持着 steer 占位；异常归还后置 false，after 不再重复释放。 */
+  steerHeld?: boolean
   steerTarget?: string
   steerMarkTarget?: string
   flagshipRoot?: string
@@ -446,6 +459,78 @@ export type SubagentDispatchHook = (input: {
   state: string
 }) => Promise<void> | void
 
+/** 兜底回收阈值：pending 条目超过该时长仍未实体化即回收。 */
+export const PENDING_DISPATCH_REAP_MS = 30 * 60 * 1000
+
+/** 本 root 尚未实体化的在途调用数；准入与收尾淘汰共用这一口径。 */
+export function countInflight(
+  entries: Iterable<{ rootID?: string; materialized?: boolean }>,
+  rootID: string,
+): number {
+  let count = 0
+  for (const entry of entries) {
+    if (entry.rootID === rootID && !entry.materialized) count += 1
+  }
+  return count
+}
+
+/** 超期回收：归还旗舰计数与 steer 占位后删除条目；返回被回收的 callID。 */
+export function reapPendingDispatches<T extends {
+  createdAt?: number
+  rootID?: string
+  flagshipRoot?: string
+  steerTarget?: string
+  steerHeld?: boolean
+}>(
+  pending: Map<string, T>,
+  now: number,
+  hooks: {
+    releaseSteerHold: (entry: T) => void
+    bumpFlagship: (rootID: string, delta: number) => void
+    log: (record: Record<string, unknown>) => void
+  },
+  maxAgeMs = PENDING_DISPATCH_REAP_MS,
+): string[] {
+  const reaped: string[] = []
+  for (const [callID, entry] of [...pending.entries()]) {
+    if (now - (entry.createdAt ?? now) < maxAgeMs) continue
+    hooks.releaseSteerHold(entry)
+    if (entry.flagshipRoot) hooks.bumpFlagship(entry.flagshipRoot, -1)
+    pending.delete(callID)
+    hooks.log({ event: "dispatch-pending-reaped", decision: "allow", callID, root: entry.rootID ?? null })
+    reaped.push(callID)
+  }
+  return reaped
+}
+
+/** 为新建子会话挑出要标记实体化的 pending 条目；critic 会话不占名额。 */
+export function pickMaterializedCall(
+  entries: Iterable<[
+    string,
+    { materialized?: boolean; steerTarget?: string; callerSessionID?: string; delegatedTitle?: string },
+  ]>,
+  parentID: string,
+  title: string | undefined,
+  metadata: Record<string, unknown> | undefined,
+): string | undefined {
+  if (metadata?.["superagent.critic"] === true) return undefined
+  const candidates = [...entries].filter(
+    ([, entry]) => !entry.materialized && !entry.steerTarget && entry.callerSessionID === parentID,
+  )
+  if (candidates.length === 0) return undefined
+  if (title !== undefined) {
+    const titled = candidates.filter(([, entry]) => entry.delegatedTitle === title)
+    if (titled.length === 1) return titled[0]![0]
+  }
+  return candidates[0]![0]
+}
+
+/** 无显式 `input.model` 时的默认模型解析；返回 model 才注入，warning 进回执。 */
+export type SubagentModelResolver = (
+  input: unknown,
+  context: any,
+) => Promise<{ model?: string; reason: string; warning?: string } | undefined>
+
 /**
  * 包装原生 subagent 执行：续跑默认排队不抢占，直接把去掉 interrupt 的原生输入
  * 交给宿主（原生 steer 自己排队）；只有显式 interrupt:true 才先中断并等待目标
@@ -461,6 +546,8 @@ export async function executeSubagentWithInterrupt(
   context: any,
   ledger?: DispatchLedger,
   onDispatch?: SubagentDispatchHook,
+  resolveModel?: SubagentModelResolver,
+  onFailed?: (callID: string | undefined) => void,
 ) {
   const parsed = subagentInput(input)
   const callID = typeof context?.id === "string" ? context.id : undefined
@@ -511,7 +598,38 @@ export async function executeSubagentWithInterrupt(
       }
     }
   }
-  const result = await execute(parsed.native, context)
+  // 默认模型只注入到交给宿主的输入；execute.before 已经看过原始 event.input。
+  let nativeInput: any = parsed.native
+  const explicitModel =
+    isObject(parsed.native) && typeof parsed.native.model === "string" && parsed.native.model.trim() !== ""
+  if (!explicitModel && resolveModel) {
+    try {
+      const resolved = await resolveModel(parsed.native, context)
+      if (resolved?.model) {
+        nativeInput = { ...(isObject(parsed.native) ? parsed.native : {}), model: resolved.model }
+        patch({ model: `${resolved.model}（默认策略）` })
+      } else if (resolved?.warning && callID) {
+        ledger?.warn(callID, resolved.warning)
+      }
+    } catch (cause) {
+      log({
+        event: "dispatch-default-model-failed",
+        decision: "error",
+        callID: callID ?? null,
+        cause: errorText(cause),
+      })
+    }
+  }
+  let result: any
+  try {
+    result = await execute(nativeInput, context)
+  } catch (cause) {
+    // 原生执行抛错时 after 未必触发：立即归还计数与 steer 占位，再原样重抛。
+    try {
+      onFailed?.(callID)
+    } catch {}
+    throw cause
+  }
   const metadata = isObject(result?.metadata) ? result.metadata : {}
   const childID =
     typeof metadata.sessionID === "string" && metadata.sessionID ? metadata.sessionID : parsed.sessionID
@@ -610,6 +728,8 @@ export async function registerSubagentInterrupt(
   ledger?: DispatchLedger,
   write: (record: Record<string, unknown>) => void = log,
   onDispatch?: SubagentDispatchHook,
+  resolveModel?: SubagentModelResolver,
+  onFailed?: (callID: string | undefined) => void,
 ) {
   if (typeof ctx?.tool?.transform !== "function") return undefined
   try {
@@ -654,7 +774,16 @@ export async function registerSubagentInterrupt(
           }
           const nativeExecute = wrappedSubagentExecutes.get(execute) ?? execute
           const wrapped = (input: any, context: any) =>
-            executeSubagentWithInterrupt(ctx, nativeExecute, input, context, ledger, onDispatch)
+            executeSubagentWithInterrupt(
+              ctx,
+              nativeExecute,
+              input,
+              context,
+              ledger,
+              onDispatch,
+              resolveModel,
+              onFailed,
+            )
           wrappedSubagentExecutes.set(wrapped, nativeExecute)
           mutable.execute = wrapped
         })
@@ -691,8 +820,6 @@ export default {
     /** 派发台账：回执、告警与中断结果都按 callID 记在这里。 */
     const ledger = createDispatchLedger(DISPATCH_LEDGER_LIMIT)
 
-    /** root → 飞行中（子会话尚未创建）的 subagent 调用数。 */
-    const flying = new Map<string, number>()
     /** root → 飞行中的旗舰 subagent 调用数（含本次调用自己的槽）。 */
     const flyingFlagship = new Map<string, number>()
     /** 正在被 steer 的子会话：淘汰时避开；计数防止并发调用互相提前解保护。 */
@@ -711,6 +838,16 @@ export default {
       }
     }
 
+    /** callID → 本次调用的登记信息；未实体化的 rootID 条目计入在途数。 */
+    const pending = new Map<string, PendingSubagentCall>()
+    /** 在途数由 pending 派生：已实体化的条目改由存在数统计，避免双算。 */
+    const inflightFor = (rootID: string) => countInflight(pending.values(), rootID)
+    const releaseSteerHold = (entry: PendingSubagentCall) => {
+      if (!entry.steerHeld || !entry.steerTarget) return
+      entry.steerHeld = false
+      releaseSteer(entry.steerTarget)
+    }
+
     /** 收尾淘汰器：子代理一结束就按上限腾位，与派发时的淘汰共用同一套判定。 */
     const completionEvictor = createCompletionEvictor({
       listChildren: (rootID, now) => listChildren(ctx, rootID, now),
@@ -721,7 +858,7 @@ export default {
       },
       classify: (rootID, victimID, now) => classifyEvictFailure(ctx, rootID, victimID, now),
       isSteered: (sessionID) => steered.has(sessionID),
-      inflight: (rootID) => flying.get(rootID) ?? 0,
+      inflight: (rootID) => inflightFor(rootID),
       enabled: (rootID) => readRootCollabEnabled(ctx, rootID),
       log,
     })
@@ -790,11 +927,118 @@ export default {
       })
     }
 
-    // 续跑默认排队不抢占；只有显式 interrupt:true 才先中断。schema 无法扩展时不包装。
-    const interruptRegistration = await registerSubagentInterrupt(ctx, ledger, log, onDispatch)
+    /**
+     * 无显式 `input.model` 时的默认模型解析（F1）：读 root 策略与续跑子会话，
+     * 判定目标后用 `ctx.model.list()` 校验可用性；任何异常都 fail-open。
+     */
+    const resolveDefaultDispatchModel = async (nativeInput: any, context: any) => {
+      const callerSessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined
+      if (!callerSessionID) return undefined
+      try {
+        const steerTarget =
+          typeof nativeInput?.sessionID === "string" && nativeInput.sessionID ? nativeInput.sessionID : undefined
+        const rootID = await findRoot(ctx, callerSessionID)
+        const entries = asArray(await ctx.session.instructions.entry.list({ sessionID: rootID }))
+        const policy = readDefaultPolicy(entries)
+        const rootModel = await readSessionModel(ctx, rootID)
+        let child: { model?: unknown; metadata?: Record<string, unknown> } | undefined
+        if (steerTarget) {
+          const info = await ctx.session.get({ sessionID: steerTarget })
+          if (isObject(info)) {
+            child = { model: info.model, metadata: isObject(info.metadata) ? info.metadata : undefined }
+          }
+        }
+        const decision = resolveDispatchModel({
+          policy: policy.policy,
+          defaultModel: policy.model,
+          rootModel,
+          explicitModel: nativeInput?.model,
+          steer: Boolean(steerTarget),
+          child,
+        })
+        const mode = steerTarget ? "steer" : "new"
+        const model = decision.target ? formatModelRef(decision.target) : undefined
+        if (!model) return { reason: decision.reason }
+        let available = false
+        try {
+          available = isModelAvailable(collectModelKeys(await ctx.model.list()), decision.target!)
+        } catch (cause) {
+          log({
+            event: "dispatch-default-model-unavailable",
+            decision: "allow",
+            mode,
+            reason: decision.reason,
+            model,
+            root: rootID,
+            cause: errorText(cause),
+          })
+          return { reason: decision.reason, warning: `默认模型 ${model} 未能确认可用，已按继承模型派工` }
+        }
+        if (!available) {
+          log({
+            event: "dispatch-default-model-unavailable",
+            decision: "allow",
+            mode,
+            reason: decision.reason,
+            model,
+            root: rootID,
+          })
+          return { reason: decision.reason, warning: `默认模型 ${model} 未能确认可用，已按继承模型派工` }
+        }
+        log({
+          event: "dispatch-model-resolved",
+          decision: "allow",
+          mode,
+          reason: decision.reason,
+          model,
+          root: rootID,
+        })
+        return { model, reason: decision.reason }
+      } catch (cause) {
+        log({
+          event: "dispatch-default-model-failed",
+          decision: "error",
+          sessionID: callerSessionID,
+          cause: errorText(cause),
+        })
+        return undefined
+      }
+    }
 
-    /** callID → 本次调用的登记信息；flagshipRoot/steerTarget 是仍占用的计数，标记字段与其分离。 */
-    const pending = new Map<string, PendingSubagentCall>()
+    /** 原生执行抛错：归还计数与 steer 占位，只留 after 写标记所需的字段。 */
+    const failPendingDispatch = (callID: string | undefined) => {
+      if (!callID) return
+      const entry = pending.get(callID)
+      if (!entry) return
+      releaseSteerHold(entry)
+      if (entry.flagshipRoot) bumpFlagship(entry.flagshipRoot, -1)
+      const next: PendingSubagentCall = { createdAt: entry.createdAt }
+      if (entry.delegatedModel !== undefined) {
+        next.delegatedModel = entry.delegatedModel
+        next.callerSessionID = entry.callerSessionID
+      }
+      if (entry.flagshipModel !== undefined) {
+        next.flagshipModel = entry.flagshipModel
+        next.flagshipMarkRoot = entry.flagshipMarkRoot ?? entry.flagshipRoot
+      }
+      if (entry.steerMarkTarget !== undefined) next.steerMarkTarget = entry.steerMarkTarget
+      if (Object.keys(next).length > 1) pending.set(callID, next)
+      else pending.delete(callID)
+    }
+
+    // 续跑默认排队不抢占；只有显式 interrupt:true 才先中断。schema 无法扩展时不包装。
+    const interruptRegistration = await registerSubagentInterrupt(
+      ctx,
+      ledger,
+      log,
+      onDispatch,
+      resolveDefaultDispatchModel,
+      failPendingDispatch,
+    )
+
+    /** 超期未实体化的条目兜底回收：与 5 分钟探针同拍，dispose 时随 pending 清空。 */
+    const reapPendingCalls = () =>
+      reapPendingDispatches(pending, Date.now(), { releaseSteerHold, bumpFlagship, log })
 
     /** 限额备用模型：首次限额失败开始计时，窗口内恢复就取消，每会话只切一次。 */
     const quotaFallback = createQuotaFallback({
@@ -929,24 +1173,48 @@ export default {
       return next
     }
 
-    const bump = (rootID: string, delta: number) => {
-      const next = (flying.get(rootID) ?? 0) + delta
-      if (next <= 0) flying.delete(rootID)
-      else flying.set(rootID, next)
-    }
-
     const bumpFlagship = (rootID: string, delta: number) => {
       const next = (flyingFlagship.get(rootID) ?? 0) + delta
       if (next <= 0) flyingFlagship.delete(rootID)
       else flyingFlagship.set(rootID, next)
     }
 
+    /** 调用会话是否带 parentID（子代理）。读取异常按「不是子会话」放行，不阻断派工。 */
+    const isChildSession = async (sessionID: string | undefined): Promise<boolean> => {
+      if (!sessionID) return false
+      try {
+        const info = await ctx.session.get({ sessionID })
+        return isObject(info) && typeof info.parentID === "string" && info.parentID.length > 0
+      } catch {
+        return false
+      }
+    }
+
+    const QUESTION_DENY_MESSAGE =
+      "子代理不得向用户提问：把需要裁决的问题与你的建议写进报告的「待 Superagent 裁决」栏后结束本轮，Superagent 会裁决并续跑。"
+    const NESTED_DISPATCH_DENY_MESSAGE =
+      "子代理不得再派发子代理：请在当前会话内完成；做不完或需要并行的部分写进报告交给 Superagent。"
+
     const before = await ctx.tool.hook("execute.before", async (event: any) => {
-      // 快路径：不是 subagent 立即返回，不做任何查询。
-      if (event?.tool !== TOOL_NAME) return
+      // 快路径：无关工具立即返回，不做任何查询。
+      if (event?.tool !== TOOL_NAME && event?.tool !== "question") return
       // 总开关按 root 生效：本 root 停用时直接放行，steer 登记等副作用也不发生。
       const callerSessionID = typeof event.sessionID === "string" ? event.sessionID : undefined
       if (!(await collabEnabledForSession(ctx, callerSessionID))) return
+      // 子代理只向 Superagent 汇报：提问与嵌套派发都在任何计数、登记、steer 占位之前拒绝。
+      if (event.tool === "question") {
+        if (await isChildSession(callerSessionID)) {
+          log({ event: "question-denied", decision: "deny", sessionID: callerSessionID, callID: event.id })
+          if (ToolError) throw new ToolError({ message: QUESTION_DENY_MESSAGE })
+          throw new DenyError(QUESTION_DENY_MESSAGE)
+        }
+        return
+      }
+      if (await isChildSession(callerSessionID)) {
+        log({ event: "nested-dispatch-denied", decision: "deny", sessionID: callerSessionID, callID: event.id })
+        if (ToolError) throw new ToolError({ message: NESTED_DISPATCH_DENY_MESSAGE })
+        throw new DenyError(NESTED_DISPATCH_DENY_MESSAGE)
+      }
       const input = isObject(event.input) ? event.input : undefined
       const steerTarget =
         typeof input?.sessionID === "string" && input.sessionID.length > 0 ? input.sessionID : undefined
@@ -965,12 +1233,13 @@ export default {
         decision: "allowed",
         background: input?.background === true,
       })
-      let reserved: string | undefined
       let reservedFlagship: string | undefined
       let steerHeld = false
       const releaseCurrentSteer = () => {
         if (!steerHeld || !steerTarget) return
         steerHeld = false
+        const held = pending.get(event.id)
+        if (held) held.steerHeld = false
         releaseSteer(steerTarget)
       }
 
@@ -987,18 +1256,18 @@ export default {
           next.flagshipMarkRoot = entry.flagshipMarkRoot ?? entry.flagshipRoot
         }
         if (entry.steerMarkTarget !== undefined) next.steerMarkTarget = entry.steerMarkTarget
-        if (Object.keys(next).length > 0) pending.set(event.id, next)
+        if (Object.keys(next).length > 0) {
+          next.createdAt = entry.createdAt
+          pending.set(event.id, next)
+        }
       }
 
       /** 归还本次调用占的槽（总槽与旗舰槽），before 拒绝或异常时用。 */
       const releaseReservation = () => {
         const entry = pending.get(event.id)
         pending.delete(event.id)
-        const root = reserved ?? entry?.rootID
-        if (root) bump(root, -1)
         const flagRoot = reservedFlagship ?? entry?.flagshipRoot
         if (flagRoot) bumpFlagship(flagRoot, -1)
-        reserved = undefined
         reservedFlagship = undefined
       }
       const reserveFlagship = (rootID: string, model: unknown) => {
@@ -1009,15 +1278,29 @@ export default {
           entry.flagshipRoot = rootID
           entry.flagshipMarkRoot = rootID
           entry.flagshipModel = model
-        } else pending.set(event.id, { flagshipRoot: rootID, flagshipMarkRoot: rootID, flagshipModel: model })
+        } else
+          pending.set(event.id, {
+            flagshipRoot: rootID,
+            flagshipMarkRoot: rootID,
+            flagshipModel: model,
+            createdAt: Date.now(),
+          })
       }
 
       try {
         if (steerTarget) {
           // 续跑已有子会话：不占新的总槽。显式 `input.model` 升级成旗舰才占旗舰槽。
-          pending.set(event.id, { steerTarget, steerMarkTarget: steerTarget, delegatedModel, callerSessionID })
+          pending.set(event.id, {
+            steerTarget,
+            steerMarkTarget: steerTarget,
+            delegatedModel,
+            callerSessionID,
+            createdAt: Date.now(),
+          })
           holdSteer(steerTarget)
           steerHeld = true
+          const heldEntry = pending.get(event.id)
+          if (heldEntry) heldEntry.steerHeld = true
           let steerRoot: string | undefined
           let targetFlagship = false
           let alreadyFlagship = false
@@ -1251,11 +1534,10 @@ export default {
         try {
           rootID = await findRoot(ctx, event.sessionID)
           ledger.update(event.id, { rootID })
-          // 先占槽再看子会话：并发调用必须互相看见，否则会同时放行、超发。
-          bump(rootID, 1)
-          reserved = rootID
+          // 先登记待实体化条目再看子会话：并发调用必须互相看见，否则会同时放行、超发。
           pending.set(event.id, {
             rootID,
+            createdAt: Date.now(),
             delegatedModel,
             callerSessionID,
             delegatedTitle:
@@ -1279,7 +1561,7 @@ export default {
           }
         } catch (cause) {
           // 查询异常：fail-open，放行并留 error 日志。已占的槽要还回去。
-          const inflightAtFailure = reserved ? (flying.get(reserved) ?? 0) : 0
+          const inflightAtFailure = inflightFor(rootID)
           const failOpenEntry = pending.get(event.id)
           releaseReservation()
           // 准入查询失败只释放计数；显式模型委派与准入无关，成功后仍要写独立标记。
@@ -1305,7 +1587,7 @@ export default {
         // 存在数 = 已有的非归档直接子会话；在途数 = 本 root 上还在飞的调用（含本次）。
         // 本次调用占的那个槽就是它在途里的这一份，判定与淘汰都不再另加一份，
         // 因此放行条件是 `存在数 + 在途数 <= 上限`。
-        const inflight = () => flying.get(rootID) ?? 0
+        const inflight = () => inflightFor(rootID)
         let exist = children.length
         let count = exist + inflight()
         let evicted = 0
@@ -1613,8 +1895,7 @@ export default {
         entry = pending.get(event.id)
         if (!entry) return
         pending.delete(event.id)
-        if (entry.rootID) bump(entry.rootID, -1)
-        if (entry.steerTarget) releaseSteer(entry.steerTarget)
+        releaseSteerHold(entry)
       } catch {
         // after 钩子抛错会波及工具体本身，这里绝不能抛。
         return
@@ -1751,6 +2032,33 @@ export default {
     }
 
     /**
+     * `session.created` 实体化：带 parentID 的新子会话消费一条本 parent 的
+     * 未实体化 pending 条目，之后在途数不再计入它。critic 会话不占名额。
+     */
+    const markSubagentMaterialized = async (event: any) => {
+      const data = eventData(event)
+      const parentID = typeof data.parentID === "string" && data.parentID ? data.parentID : undefined
+      if (!parentID) return
+      const callID = pickMaterializedCall(
+        pending.entries(),
+        parentID,
+        typeof data.title === "string" ? data.title : undefined,
+        isObject(data.metadata) ? data.metadata : undefined,
+      )
+      if (!callID) return
+      const entry = pending.get(callID)
+      if (!entry) return
+      entry.materialized = true
+      log({
+        event: "dispatch-pending-materialized",
+        decision: "allow",
+        callID,
+        parentID,
+        childSessionID: typeof data.sessionID === "string" ? data.sessionID : null,
+      })
+    }
+
+    /**
      * 触发一次限额备用计时：读 root、协作开关、保护名单与配置条目，
      * 再交给状态机判断（首次失败 arm 计时，已有计时只更新快照）。
      * retry 钩子与 `session.execution.failed` 走同一条路，
@@ -1825,6 +2133,7 @@ export default {
       watcher,
       quotaFallback,
       markDelegationOnSessionCreated,
+      materializePendingCall: markSubagentMaterialized,
       handleSessionModelSelected: (event) => handleSessionModelSelected(ctx, event),
       reviewAfterSuccess,
       triggerQuotaFallback,
@@ -1839,6 +2148,7 @@ export default {
     const ctxScanner = createCtxContextCompactionScanner(ctx, { signal: resetAbort.signal })
     const probeTimer = startProbeTimer(async () => {
       await Promise.allSettled([probeScanner.scan(), ctxScanner.scan()])
+      reapPendingCalls()
     })
 
     pruneClaims()
@@ -1868,6 +2178,7 @@ export default {
       try {
         probeTimer.stop()
       } catch {}
+      pending.clear()
       try {
         watcher.stop()
       } catch {}

@@ -365,13 +365,14 @@ test("changing a child's model policy tells the Superagent without claiming the 
   expect(synthetics).toHaveLength(1)
   expect(synthetics[0].sessionID).toBe("root")
   expect(synthetics[0].delivery).toBe("queue")
-  // 自动只是后续分配策略，不声称现有子代理已切模型。
-  expect(String(synthetics[0].text)).toContain("自动")
-  expect(String(synthetics[0].text)).toContain("现有子代理没有被批量切换")
+  // 单子代理策略只影响该子代理后续分配，不冒充全局默认策略变更。
+  expect(String(synthetics[0].text)).toContain("只影响该子代理后续分配")
+  expect(String(synthetics[0].text)).not.toContain("默认模型设为")
   expect(synthetics[0].metadata).toEqual({
     source: "superagent-agents",
     kind: "manual-op",
-    action: "default-policy",
+    action: "child-policy",
+    childID: "modeler",
   })
 })
 

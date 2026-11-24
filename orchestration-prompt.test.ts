@@ -193,13 +193,17 @@ describe("assignment 与 task 默认提示词迁移", () => {
     expect(SUPERAGENT_DEFAULTS.taskPrompt).toBe("")
   })
 
-  test("831dd95 的 assignment 默认精确升级", async () => {
-    expect(LEGACY_ASSIGNMENT_PROMPTS).toHaveLength(1)
-    const h = harness()
-    h.root.assignmentPrompt = LEGACY_ASSIGNMENT_PROMPTS[0]
-    await h.actions.initializeInstructions()
-    expect(h.root.assignmentPrompt).toBe(SUPERAGENT_DEFAULTS.assignmentPrompt)
-    expect(h.root.assignmentPrompt).toContain("遇到能力升级先报告")
+  test("历代 assignment 默认都精确升级为新默认", async () => {
+    expect(LEGACY_ASSIGNMENT_PROMPTS.length).toBeGreaterThanOrEqual(2)
+    for (const legacy of LEGACY_ASSIGNMENT_PROMPTS) {
+      const h = harness()
+      h.root.assignmentPrompt = legacy
+      await h.actions.initializeInstructions()
+      expect(h.root.assignmentPrompt).toBe(SUPERAGENT_DEFAULTS.assignmentPrompt)
+    }
+    expect(SUPERAGENT_DEFAULTS.assignmentPrompt).toContain("不得派发子代理")
+    expect(SUPERAGENT_DEFAULTS.assignmentPrompt).toContain("不得向用户提问")
+    expect(SUPERAGENT_DEFAULTS.assignmentPrompt).not.toContain("需求不清先提问")
   })
 
   test("831dd95 的 task 默认与更老的空默认都升级为空白补充", async () => {

@@ -4,6 +4,28 @@ export type ModelRef = {
   variant?: string
 }
 
+/** 子会话 metadata 里的每子代理模型策略键；服务端 `server-default-model.ts` 读取同一个键。 */
+export const MODEL_POLICY_METADATA_KEY = "superagent.model-policy"
+
+export type ChildModelPolicy = "auto" | "inherit" | "fixed"
+
+/** 把每子代理策略写入子会话 metadata，保留其他键；拿不到会话或写失败都静默跳过。 */
+export async function writeChildModelPolicy(context: unknown, sessionID: string, policy: ChildModelPolicy) {
+  const ctx = context as {
+    data?: { session?: { get?: (id: string) => { metadata?: Record<string, unknown> } | undefined } }
+    client?: { session?: { update?: (input: { sessionID: string; metadata: Record<string, unknown> }) => Promise<unknown> } }
+  }
+  const session = ctx?.data?.session?.get?.(sessionID)
+  const update = ctx?.client?.session?.update
+  if (!session || typeof update !== "function") return
+  const metadata = { ...(session.metadata ?? {}), [MODEL_POLICY_METADATA_KEY]: policy }
+  try {
+    await update.call(ctx.client!.session, { sessionID, metadata })
+  } catch {
+    // 元数据写失败不回滚本地策略：服务端读不到时按 root 默认策略处理。
+  }
+}
+
 export type TaskModelPolicy = { kind: "auto" } | { kind: "inherit" } | { kind: "fixed"; model: ModelRef }
 
 export type GlobalModelSettings = {

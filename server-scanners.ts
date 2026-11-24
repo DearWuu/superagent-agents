@@ -5,6 +5,9 @@
  * 把它们接到真实 ctx 并启动定时器。
  */
 
+import { existsSync, rmSync } from "node:fs"
+import path from "node:path"
+
 import { isCriticSession } from "./critic"
 import { contextWarnThreshold, modelContextWindow } from "./context-policy"
 import { parseModelRef } from "./server-models"
@@ -23,6 +26,7 @@ import {
   isObject,
   log,
   readContextClaim,
+  stateRoot,
 } from "./server-state"
 
 export type ProbeCandidate = {
@@ -51,15 +55,64 @@ export function toProbeCandidate(item: any): ProbeCandidate {
 }
 
 /**
- * 该子会话是否该探：开工了（有 busy）、没有 idle、没有 outcome，
- * 且开工距今已满阈值。每个会话只探一次，critic 会话跳过。
+ * 该子会话是否该探：当前忙碌周期还开着（有 busy，且 idle 缺省或早于 busy），
+ * 开工距今已满阈值；残留的 idle/outcome 不参与排除（完成看护负责已收尾的会话）。
+ * 每个忙碌周期只探一次：`probed` 记录上次探针对应的 busy，同一个 busy 才跳过；
+ * 旧式只记 sessionID 的集合按已探处理。
  */
-export function shouldProbe(candidate: ProbeCandidate, now: number, probed: ReadonlySet<string>): boolean {
-  if (!candidate.id || probed.has(candidate.id)) return false
+export function shouldProbe(
+  candidate: ProbeCandidate,
+  now: number,
+  probed: ReadonlyMap<string, number> | ReadonlySet<string>,
+): boolean {
+  if (!candidate.id) return false
   if (isCriticSession(candidate)) return false
-  if (candidate.outcome != null) return false
-  if (candidate.busy === undefined || candidate.idle !== undefined) return false
-  return now - candidate.busy >= PROBE_AFTER_MS
+  const busy = candidate.busy
+  if (busy === undefined) return false
+  // 回合已结束（idle 不早于 busy）：不探。
+  if (candidate.idle !== undefined && candidate.idle >= busy) return false
+  if (probed instanceof Map) {
+    if (probed.get(candidate.id) === busy) return false
+  } else if ((probed as ReadonlySet<string>).has(candidate.id)) {
+    return false
+  }
+  return now - busy >= PROBE_AFTER_MS
+}
+
+/** root 配置判定结果的缓存时长：写入的 `superagent.*` 条目最多 60 秒后生效。 */
+const CONFIGURED_TTL_MS = 60_000
+
+type ConfiguredCache = Map<string, { managed: boolean; at: number }>
+
+/** 缓存未过期就用上次结果；过期或缺失返回 undefined（调用方重读）。 */
+function cachedConfigured(cache: ConfiguredCache, rootID: string, at: number): boolean | undefined {
+  const cached = cache.get(rootID)
+  if (!cached) return undefined
+  return at - cached.at < CONFIGURED_TTL_MS ? cached.managed : undefined
+}
+
+/** 跨实例探针声明键：忙碌周期不同就允许再声明一次。 */
+function probeClaimKey(sessionID: string, busy: number): string {
+  return `${sessionID}-busy-${busy}`
+}
+
+/**
+ * 默认跨实例声明：按 sessionID + 忙碌周期占用；旧格式（只按 sessionID）的
+ * 存量声明按已探处理，避免升级后立刻重复探同一批会话。
+ */
+function defaultProbeClaim(sessionID: string, busy: number): boolean {
+  const safe = sessionID.replace(/[^A-Za-z0-9._-]/g, "")
+  const legacy = safe ? path.join(stateRoot(), "probe-claims", safe) : undefined
+  if (legacy && existsSync(legacy)) {
+    // 旧格式只记 sessionID、没有忙碌周期信息：按本周期已探处理；顺手升级成
+    // 「sessionID + busy」新键，后续新的忙碌周期仍可再探。
+    try {
+      rmSync(legacy, { force: true })
+    } catch {}
+    claimProbe(probeClaimKey(sessionID, busy))
+    return false
+  }
+  return claimProbe(probeClaimKey(sessionID, busy))
 }
 
 export type ProbeScannerDeps = {
@@ -72,8 +125,8 @@ export type ProbeScannerDeps = {
   /** 该 root 的协作总开关；缺省视为启用。 */
   rootIsEnabled?: (rootID: string) => Promise<boolean>
   sendProbe: (sessionID: string, text: string) => Promise<void>
-  /** 跨实例去重：返回 false 表示别的实例已经探过这个会话。 */
-  claim?: (sessionID: string) => boolean
+  /** 跨实例去重：返回 false 表示别的实例已经探过这个会话的这个忙碌周期。 */
+  claim?: (sessionID: string, busy: number) => boolean
   /** 插件卸载后，尚未完成的扫描不得再发探针。 */
   signal?: AbortSignal
   log: (record: Record<string, unknown>) => void
@@ -85,10 +138,11 @@ export type ProbeScannerDeps = {
  * 失败一律只记日志：探不到或发不出都不影响会话本身。
  */
 export function createProbeScanner(deps: ProbeScannerDeps) {
-  const probed = new Set<string>()
+  /** sessionID → 已探过的忙碌周期（busy）；同一周期不重复探，新周期可再探。 */
+  const probed = new Map<string, number>()
   const now = deps.now ?? Date.now
-  /** root → 是否带 superagent 配置；一个 root 只查一次。 */
-  const configured = new Map<string, boolean>()
+  /** root → 是否带 superagent 配置及其读取时刻；超过 TTL 重读。 */
+  const configured: ConfiguredCache = new Map()
   return {
     probed,
     async scan(): Promise<number> {
@@ -106,7 +160,8 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
       let sent = 0
       for (const candidate of candidates) {
         if (deps.signal?.aborted) break
-        if (!shouldProbe(candidate, now(), probed)) continue
+        const at = now()
+        if (!shouldProbe(candidate, at, probed)) continue
         let rootID: string | undefined
         try {
           rootID = await deps.resolveRoot(candidate.id)
@@ -127,7 +182,7 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
           enabled.set(rootID, collab)
         }
         if (!collab) continue
-        let managed = configured.get(rootID)
+        let managed = cachedConfigured(configured, rootID, at)
         if (managed === undefined) {
           try {
             managed = await deps.rootIsConfigured(rootID)
@@ -135,14 +190,16 @@ export function createProbeScanner(deps: ProbeScannerDeps) {
             deps.log({ event: "probe-config-failed", decision: "error", root: rootID, cause: errorText(cause) })
             continue
           }
-          configured.set(rootID, managed)
+          configured.set(rootID, { managed, at: now() })
         }
         if (!managed) continue
         if (deps.signal?.aborted) break
-        // 跨实例声明：同一会话只会被一个插件实例发探针。
-        if (deps.claim && !deps.claim(candidate.id)) continue
-        // 先登记再发：发送失败也不在 5 分钟后重复轰炸同一个会话。
-        probed.add(candidate.id)
+        const busy = candidate.busy
+        if (busy === undefined) continue
+        // 跨实例声明：按 sessionID + 忙碌周期去重。
+        if (deps.claim && !deps.claim(candidate.id, busy)) continue
+        // 先登记再发：发送失败也不在同一忙碌周期里重复轰炸。
+        probed.set(candidate.id, busy)
         try {
           await deps.sendProbe(candidate.id, PROBE_TEXT)
           sent++
@@ -169,7 +226,7 @@ export function createCtxProbeScanner(
   ctx: any,
   options: {
     now?: () => number
-    claim?: (sessionID: string) => boolean
+    claim?: (sessionID: string, busy: number) => boolean
     log?: (record: Record<string, unknown>) => void
     limit?: number
     signal?: AbortSignal
@@ -197,7 +254,7 @@ export function createCtxProbeScanner(
     sendProbe: async (sessionID, text) => {
       await ctx.session.prompt({ sessionID, text, delivery: "steer" })
     },
-    claim: options.claim ?? claimProbe,
+    claim: options.claim ?? defaultProbeClaim,
     rootIsEnabled: (rootID) => readRootCollabEnabled(ctx, rootID),
     log: write,
     now: options.now,
@@ -277,8 +334,9 @@ export type CtxCompactionScannerDeps = {
  * 失败一律只记日志：读不到长度或压缩失败都不影响会话本身。
  */
 export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
-  /** root → 是否带 superagent 配置；一个 root 只查一次。 */
-  const configured = new Map<string, boolean>()
+  const now = deps.now ?? Date.now
+  /** root → 是否带 superagent 配置及其读取时刻；超过 TTL 重读。 */
+  const configured: ConfiguredCache = new Map()
   return {
     async scan(): Promise<number> {
       if (deps.signal?.aborted) return 0
@@ -295,6 +353,7 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
       let compacted = 0
       for (const candidate of candidates) {
         if (deps.signal?.aborted) break
+        const at = now()
         if (!shouldCheckContext(candidate)) continue
         let rootID: string | undefined
         try {
@@ -316,7 +375,7 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
           enabled.set(rootID, collab)
         }
         if (!collab) continue
-        let managed = configured.get(rootID)
+        let managed = cachedConfigured(configured, rootID, at)
         if (managed === undefined) {
           try {
             managed = await deps.rootIsConfigured(rootID)
@@ -324,7 +383,7 @@ export function createCtxCompactionScanner(deps: CtxCompactionScannerDeps) {
             deps.log({ event: "ctx-config-failed", decision: "error", root: rootID, cause: errorText(cause) })
             continue
           }
-          configured.set(rootID, managed)
+          configured.set(rootID, { managed, at: now() })
         }
         if (!managed) continue
 
